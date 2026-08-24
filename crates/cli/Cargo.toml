@@ -1,0 +1,21 @@
+[package]
+name = "ag"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+domain = { path = "../domain", version = "0.1.0" }
+app = { path = "../app", version = "0.1.0" }
+infra-llm = { path = "../infra/llm", version = "0.1.0" }
+infra-filesystem = { path = "../infra/filesystem", version = "0.1.0" }
+infra-shell = { path = "../infra/shell", version = "0.1.0" }
+infra-config = { path = "../infra/config", version = "0.1.0" }
+clap = { workspace = true }
+tokio = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+
+[build-dependencies]
+# Build script embeds git SHA + profile; no external deps for Rust 1.80 compat.

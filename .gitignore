@@ -1,0 +1,9 @@
+/target
+**/*.rs.bk
+.env
+.qagent_node_config.env
+ag.toml.local
+.coverage/
+*.profraw
+/logs/
+node.json

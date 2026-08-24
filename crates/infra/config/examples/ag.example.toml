@@ -1,0 +1,20 @@
+# Example QAgent configuration file.
+# Copy to `ag.toml` and adjust as needed.
+# `ag.toml.local` is gitignored for local overrides.
+
+# The LLM model to use for completions.
+# Override at runtime via the AG_MODEL environment variable.
+model = "gpt-4o-mini"
+
+# Working directory for agent operations.
+# Override at runtime via the AG_WORKING_DIR environment variable.
+# working_dir = "."
+
+# Timeout for LLM and shell operations in milliseconds.
+# Override at runtime via the AG_TIMEOUT_MS environment variable.
+timeout_ms = 60000
+
+# Extra environment variables passed to the agent context.
+# Secrets (API keys, etc.) are NEVER read from this file — use env vars.
+# [env]
+# CUSTOM_VAR = "value"

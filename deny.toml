@@ -1,0 +1,11 @@
+[advisories]
+ignore = []
+
+[licenses]
+allow-osi-fsf-free = "either"
+copyleft = "deny"
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "allow"
+wildcards = "allow"
