@@ -78,23 +78,23 @@ mod tests {
     impl LlmPort for NoopLlm {
         fn send(
             &mut self,
-            _system: &str,
-            _prompt: &str,
-        ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-            Ok(String::new())
+            _req: &domain::LlmRequest,
+        ) -> Result<domain::LlmResponse, domain::BoxError> {
+            Ok(domain::LlmResponse {
+                text: String::new(),
+                finish: domain::LlmFinish {
+                    reason: domain::LlmFinishReason::Stop,
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_tokens: 0,
+                },
+                raw: String::new(),
+            })
         }
-        fn stream<'a>(
-            &'a mut self,
-            _system: &'a str,
-            _prompt: &'a str,
-        ) -> Box<
-            dyn Iterator<
-                    Item = Result<
-                        domain::ports::CompletionChunk,
-                        Box<dyn std::error::Error + Send + Sync>,
-                    >,
-                > + 'a,
-        > {
+        fn stream(
+            &mut self,
+            _req: &domain::LlmRequest,
+        ) -> Box<dyn Iterator<Item = Result<domain::LlmEvent, domain::BoxError>> + Send> {
             Box::new(std::iter::empty())
         }
     }

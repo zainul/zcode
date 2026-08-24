@@ -5,6 +5,20 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+# Persistent PTY shell (FR-TOOL-SHELL-02) is deferred to v0.2.1. The `pty`
+# feature gates the future `unsafe` termios code so that, by default, the
+# crate is `forbid(unsafe_code)` (NFR-PORT-02).
+pty = []
+
 [dependencies]
 domain = { path = "../../domain", version = "0.1.0" }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.10"
+
+[lib]
+# Enable `cfg_attr(not(feature="pty"), forbid(unsafe_code))` semantics via the
+# empty `pty` feature above: without it no `unsafe` is reachable.
+name = "infra_shell"

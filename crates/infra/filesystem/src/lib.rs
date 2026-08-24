@@ -115,7 +115,7 @@ mod tests {
     fn watch_returns_error_stub() {
         let dir = tempdir().unwrap();
         let fs = StdFs::new();
-        let result = fs.watch(&dir.path());
+        let result = fs.watch(dir.path());
         assert!(result.is_err());
     }
 }
