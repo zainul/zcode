@@ -1,5 +1,5 @@
 [package]
-name = "infra-llm"
+name = "infra-mcp"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,8 +9,6 @@ license.workspace = true
 domain = { path = "../../domain", version = "0.1.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
-reqwest = { workspace = true }
-thiserror = { workspace = true }
 
 [dev-dependencies]
-tempfile = "3.10"
+assert-json-diff = "2"

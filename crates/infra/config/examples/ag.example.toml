@@ -2,19 +2,63 @@
 # Copy to `ag.toml` and adjust as needed.
 # `ag.toml.local` is gitignored for local overrides.
 
-# The LLM model to use for completions.
-# Override at runtime via the AG_MODEL environment variable.
+# LLM provider + model (FR-CONFIG-02 / FR-MODEL-01..04).
+# Override the model at runtime via AG_MODEL.
+provider = "openai"
 model = "gpt-4o-mini"
 
+# Secrets are resolved BY NAME from env vars — never put keys in this file (NFR-SEC-01).
+# `resolve_api_key()` reads `std::env::var(api_key_env)` at compose time (wire()).
+api_key_env = "AG_OPENAI_API_KEY"
+
+# Optional endpoint override. Defaults per provider (see crate docs):
+#   openai      -> https://api.openai.com/v1/chat/completions
+#   anthropic   -> https://api.anthropic.com/v1/messages
+#   openrouter  -> https://openrouter.ai/api/v1/chat/completions
+#   ollama      -> http://localhost:11434/api/chat
+#   vllm / openai-compatible -> use base_url (required)
+# base_url = "http://localhost:8000/v1"
+
 # Working directory for agent operations.
-# Override at runtime via the AG_WORKING_DIR environment variable.
+# Override at runtime via AG_WORKING_DIR.
 # working_dir = "."
 
-# Timeout for LLM and shell operations in milliseconds.
-# Override at runtime via the AG_TIMEOUT_MS environment variable.
+# Timeout (ms) for LLM/shell operations.
+# Override at runtime via AG_TIMEOUT_MS.
 timeout_ms = 60000
 
+# Loop caps (FR-LOOP-02/03/04).
+max_turns = 20
+max_tokens = 16384
+max_tool_output_chars = 16000
+
+# Agent mode (FR-MODE-01): "planning" (read-only) or "build" (autonomous edits).
+# Override at runtime via AG_MODE.
+mode = "build"
+
+# Directory holding .md skill files (FR-CONFIG-06). Defaults to <working_dir>/.ag/skills.
+# skills_dir = ".ag/skills"
+
+# Shell command allowlist (FR-CONFIG-04/05). Each command segment must match at
+# least one regex. Empty list = deny all (fail-safe). Env override: AG_SHELL_ALLOWED
+# (newline-separated).
+shell_allowed = ["echo .*", "ls .*", "cd .*", "cat .*"]
+
+# MCP servers (FR-MCP-02): spawn via stdio JSON-RPC (DQ6).
+[[mcp.servers]]
+name = "everything"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-everything"]
+# env = [["KEY", "value"]]
+
+# LSP servers (FR-LSP-03): spawn via stdio JSON-RPC (DQ7).
+[[lsp.servers]]
+language = "rust"
+command = "rust-analyzer"
+args = ["--stdio"]
+# env = [["KEY", "value"]]
+
 # Extra environment variables passed to the agent context.
-# Secrets (API keys, etc.) are NEVER read from this file — use env vars.
+# Secrets are NEVER read from this file (FR-CONFIG-03).
 # [env]
 # CUSTOM_VAR = "value"

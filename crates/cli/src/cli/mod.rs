@@ -31,7 +31,11 @@ pub const BUILD_PROFILE: &str = env!("VERGEN_BUILD_PROFILE", "unknown");
 /// Fails fast with a typed `AppError::Port` when a port cannot be resolved,
 /// rather than panicking with a stack trace (NFR-REL-01/02).
 pub fn wire() -> Result<App, AppError> {
-    let llm = Arc::new(OpenAiLlm::new("http://localhost:9999", "gpt-4o-mini"));
+    let llm = Arc::new(OpenAiLlm::new(
+        "http://localhost:9999",
+        "stub",
+        "gpt-4o-mini",
+    ));
     let fs = Arc::new(StdFs::new());
     let shell = Arc::new(StdShell::new());
 
