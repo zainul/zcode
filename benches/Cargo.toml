@@ -1,0 +1,16 @@
+[package]
+name = "ag-benches"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+domain = { path = "../crates/domain", version = "0.1.0" }
+criterion = "0.5"
+
+[[bench]]
+name = "smoke"
+harness = false
+
+[lib]
+bench = false

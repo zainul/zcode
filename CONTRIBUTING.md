@@ -1,0 +1,49 @@
+# Contributing to QAgent
+
+Thanks for your interest in contributing! This guide covers building, testing, and linting.
+
+## Prerequisites
+
+- Rust **1.80.0** (pinned via `rust-toolchain.toml`)
+- Components: `rustfmt`, `clippy` (auto-installed by rustup)
+
+## Quick start
+
+```sh
+cargo build                    # build workspace
+cargo test                     # run all tests
+cargo run -q -- version        # print version + git sha
+```
+
+## Quality gates
+
+All gates are unified under the `Makefile`:
+
+| Command          | Description                              |
+|------------------|------------------------------------------|
+| `make ci`        | `fmt-check` + `clippy` + `test` + `build`|
+| `make fmt`       | Format code                              |
+| `make fmt-check` | Verify formatting                        |
+| `make lint`      | Clippy with `-D warnings`                |
+| `make test`      | Run all tests                            |
+| `make build`     | Build workspace                          |
+| `make bench`     | Run criterion benchmarks                 |
+| `make check-deps`| Verify Domain has zero third-party deps  |
+
+## Layer rules
+
+- **Domain** (`crates/domain`) must have **zero** third-party dependencies (`make check-deps`).
+- **App** (`crates/app`) depends on `domain` only.
+- **Infra/** crates depend on `domain` + external crates.
+- **CLI** (`crates/cli`) is the composition root — depends on all layers.
+
+## Safety
+
+- `#[forbid(unsafe_code)]` is enforced in `crates/cli`.
+- Avoid `unsafe` in `domain` and `app` (no `unsafe` allowed in this milestone).
+
+## Style
+
+- Follow `rustfmt.toml` formatting (run `cargo fmt` before committing).
+- All clippy warnings are errors (`-D warnings`).
+- Write tests for new functionality.
