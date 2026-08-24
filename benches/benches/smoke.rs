@@ -1,8 +1,10 @@
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkGroup, Criterion};
+use criterion::{
+    black_box, criterion_group, criterion_main, measurement::WallTime, BenchmarkGroup, Criterion,
+};
 use domain::{DomainError, FileEdit, Task, TaskStatus};
 use std::path::PathBuf;
 
-fn construct_task(c: &mut BenchmarkGroup) {
+fn construct_task(c: &mut BenchmarkGroup<'_, WallTime>) {
     c.bench_function("Task::construct", |b| {
         b.iter(|| {
             black_box(Task {
@@ -15,7 +17,7 @@ fn construct_task(c: &mut BenchmarkGroup) {
     });
 }
 
-fn construct_file_edit(c: &mut BenchmarkGroup) {
+fn construct_file_edit(c: &mut BenchmarkGroup<'_, WallTime>) {
     c.bench_function("FileEdit::construct", |b| {
         b.iter(|| {
             black_box(FileEdit {
@@ -27,7 +29,7 @@ fn construct_file_edit(c: &mut BenchmarkGroup) {
     });
 }
 
-fn domain_error_roundtrip(c: &mut BenchmarkGroup) {
+fn domain_error_roundtrip(c: &mut BenchmarkGroup<'_, WallTime>) {
     c.bench_function("DomainError::format", |b| {
         b.iter(|| {
             let err = DomainError::NotFound("entity not found".into());
