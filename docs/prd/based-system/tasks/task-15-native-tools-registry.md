@@ -2,7 +2,7 @@
 
 **Related PRD sections:** §3.3 Extensible Tool System (FR-TOOL-FS-01/02/03, FR-TOOL-SHELL-01/02; FR-MCP-03/04/05; FR-LSP-02), §3.7 Configuration (FR-CONFIG-04/05/06), §8 DQ1 (PTY defer), DQ10 (Tool trait in domain, registry in crates/tools)
 **Depends on:** task-02 (Domain — `Tool` trait + `ToolRegistryPort` + `ToolSpec`/`ToolResult` defined in §4.2), task-05 (StdFs), task-06 (StdShell), task-13 (McpClient), task-14 (LspClient, optional)
-**Status:** To do
+**Status:** Done
 **Priority:** High (the engine loop dispatches through this registry)
 
 ## Objective
@@ -57,7 +57,7 @@ Empty `allowed` → no segment matches → deny all (default-fail, M2.5). Defaul
 - `StrReplaceTool` — `str_replace_editor` family: `view`/`create`/`str_replace`/`list_dir` (FR-TOOL-FS-03). `str_replace(path, old_str, new_str)` does an in-process `find+replace` (first occurrence wins; error if `old_str` absent). **No `sed`/`awk`.**
 - `ListDirTool` — `list_dir(path)` (FR-TOOL-FS-03).
 - `ShellTool` — `shell(command, cwd?, timeout?)` delegating to `GuardedShell::run_guarded` (FR-TOOL-SHELL-01). Returns `stdout|stderr|exit:N`.
-- `SkillTool` — `ag:skill <name>` reads `<skills_dir>/<name>.md` (FR-OUTPUT-09). **Path-traversal guarded**: resolved path must be inside `skills_dir` (uses `canonicalize` + prefix check).
+- `SkillTool` — `zcode:skill <name>` reads `<skills_dir>/<name>.md` (FR-OUTPUT-09). **Path-traversal guarded**: resolved path must be inside `skills_dir` (uses `canonicalize` + prefix check).
 
 Each implements `domain::Tool` with a `ToolSpec` (name, description, params JSON schema) so the LLM sees the signatures.
 
@@ -79,7 +79,7 @@ impl ToolRegistryPort for ToolRegistry {
 }
 ```
 
-Namespace convention: `mcp::<server_name>::<tool_name>` for MCP tools; `lsp::goto_definition`, `lsp::find_references`, `lsp::hover`, `lsp::rename_symbol` for LSP tools. Native tools have bare names (`read`, `write`, `str_replace_editor`, `list_dir`, `shell`, `ag:skill`).
+Namespace convention: `mcp::<server_name>::<tool_name>` for MCP tools; `lsp::goto_definition`, `lsp::find_references`, `lsp::hover`, `lsp::rename_symbol` for LSP tools. Native tools have bare names (`read`, `write`, `str_replace_editor`, `list_dir`, `shell`, `zcode:skill`).
 
 ### 5. `spawn` (PTY) remains deferred
 
@@ -93,7 +93,7 @@ Namespace convention: `mcp::<server_name>::<tool_name>` for MCP tools; `lsp::got
 - `shell_partial_token_denied`: `run("echo foo; rm -rf /")` → denied because `rm` segment matches no regex.
 - `str_replace_edit_roundtrip`: tempdir file, `str_replace` replaces old→new, file content updated.
 - `write_atomic_on_subdir`: `write` creates parent dirs then renames temp file (FR-TOOL-FS-02).
-- `skill_path_traversal_blocked`: `ag:skill "../secret"` → error (path outside skills_dir).
+- `skill_path_traversal_blocked`: `zcode:skill "../secret"` → error (path outside skills_dir).
 - `registry_merges_native_and_mcp_specs`: build a `ToolRegistry` with 1 native tool + 1 fake `McpPort`; `list()` returns both; `call("read", …)` dispatches to the native tool, `call("mcp::srv::fn", …)` to the fake MCP.
 - `is_native_planning_filter`: `is_native("write")==false`? **NO** — `write` IS native; planning mode excludes *execute-side native tools* (`write`, `str_replace`, `shell`, `rename_symbol`) via the **mode policy** in task-16, not `is_native`. `is_native("read")==true`, `is_native("mcp::srv::fn")==false`. (Clarifies FR-MODE-01 boundary.)
 
@@ -101,8 +101,8 @@ Fakes: provide `FakeMcp` (returns canned `McpToolDef`s) and `FakeLsp` (returns c
 
 ## Test-case scenario
 
-- `ag tools list` shows `read`, `write`, `str_replace_editor`, `list_dir`, `shell`, `ag:skill`, plus any discovered `mcp::<srv>::*` and `lsp::*` tools.
-- `ag run "shell: echo hi"` → `shell` tool runs (allowlisted); `ag run "shell: rm -rf /tmp/x"` → refused with a clear error that is fed back to the LLM.
+- `zcode tools list` shows `read`, `write`, `str_replace_editor`, `list_dir`, `shell`, `zcode:skill`, plus any discovered `mcp::<srv>::*` and `lsp::*` tools.
+- `zcode run "shell: echo hi"` → `shell` tool runs (allowlisted); `zcode run "shell: rm -rf /tmp/x"` → refused with a clear error that is fed back to the LLM.
 
 ## How to verify
 

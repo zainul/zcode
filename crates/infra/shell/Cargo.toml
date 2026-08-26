@@ -12,7 +12,7 @@ license.workspace = true
 pty = []
 
 [dependencies]
-domain = { path = "../../domain", version = "0.1.0" }
+domain = { path = "../../domain", version = "0.2.0" }
 thiserror = { workspace = true }
 
 [dev-dependencies]

@@ -1,0 +1,80 @@
+# Example zcode configuration file.
+# Copy to `zcode.toml` and adjust as needed.
+# `zcode.toml.local` is gitignored for local overrides.
+
+# The same settings are accepted as JSON in `zcode.json`, which wins when both
+# files exist — see zcode.example.json.
+
+# LLM provider + model (FR-CONFIG-02 / FR-MODEL-01..08).
+# One of: openai | anthropic | openrouter | deepseek | ollama | vllm | openai-compatible
+# Override at runtime via ZCODE_PROVIDER / ZCODE_MODEL.
+# Omit `model` to get a sensible default for the chosen provider
+# (openrouter -> openai/gpt-4o-mini, deepseek -> deepseek-chat, ...).
+provider = "openai"
+model = "gpt-4o-mini"
+
+# Secrets are resolved BY NAME from env vars — never put keys in this file (NFR-SEC-01).
+# `resolve_api_key()` reads `std::env::var(api_key_env)` at compose time (wire()).
+# Omit it and the provider's conventional variable is used:
+#   openai -> ZCODE_OPENAI_API_KEY, anthropic -> ZCODE_ANTHROPIC_API_KEY,
+#   openrouter -> ZCODE_OPENROUTER_API_KEY, deepseek -> ZCODE_DEEPSEEK_API_KEY.
+api_key_env = "ZCODE_OPENAI_API_KEY"
+
+# Optional endpoint override. Defaults per provider (see crate docs):
+#   openai      -> https://api.openai.com/v1/chat/completions
+#   anthropic   -> https://api.anthropic.com/v1/messages
+#   openrouter  -> https://openrouter.ai/api/v1/chat/completions
+#   deepseek    -> https://api.deepseek.com/chat/completions
+#   ollama      -> http://localhost:11434/api/chat
+#   vllm / openai-compatible -> use base_url (required)
+# base_url = "http://localhost:8000/v1"
+
+# Working directory for agent operations.
+# Override at runtime via ZCODE_WORKING_DIR.
+# working_dir = "."
+
+# Timeout (ms) for LLM/shell operations. Because responses are streamed, this
+# must cover a whole generation, not just the first byte. Raise it for slow or
+# very long-form models. Override at runtime via ZCODE_TIMEOUT_MS.
+timeout_ms = 60000
+
+# Loop caps (FR-LOOP-02/03/04).
+# Env overrides: ZCODE_MAX_TURNS, ZCODE_MAX_TOKENS, ZCODE_MAX_TOOL_OUTPUT_CHARS.
+max_turns = 20
+max_tokens = 16384
+max_tool_output_chars = 16000
+
+# Agent mode (FR-MODE-01): "planning" (read-only) or "build" (autonomous edits).
+# Override at runtime via ZCODE_MODE.
+mode = "build"
+
+# Directory holding .md skill files (FR-CONFIG-06). Defaults to <working_dir>/.zcode/skills.
+# Override at runtime via ZCODE_SKILLS_DIR.
+# skills_dir = ".zcode/skills"
+
+# Shell command allowlist (FR-CONFIG-04/05). The command is split on `;` and `|`,
+# and every resulting segment must match at least one pattern *in full* (patterns
+# are anchored). Commands containing `` ` ``, `$(`, `>`, `<` or `&` are refused
+# outright, since those could smuggle an unchecked command past an allowed prefix.
+# Empty list = deny all (fail-safe). Env override: ZCODE_SHELL_ALLOWED (newline-separated;
+# set it to the empty string to deny everything).
+shell_allowed = ["echo .*", "ls .*", "cd .*", "cat .*"]
+
+# MCP servers (FR-MCP-02): spawn via stdio JSON-RPC (DQ6).
+[[mcp.servers]]
+name = "everything"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-everything"]
+# env = [["KEY", "value"]]
+
+# LSP servers (FR-LSP-03): spawn via stdio JSON-RPC (DQ7).
+[[lsp.servers]]
+language = "rust"
+command = "rust-analyzer"
+args = ["--stdio"]
+# env = [["KEY", "value"]]
+
+# Extra environment variables passed to the agent context.
+# Secrets are NEVER read from this file (FR-CONFIG-03).
+# [env]
+# CUSTOM_VAR = "value"

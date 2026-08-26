@@ -2,7 +2,7 @@
 
 **Related PRD sections:** §3.1 Domain, §3.2 Entities, FR-DI-01, G3/G4, NFR-PORT-02
 **Depends on:** task-01
-**Status:** To do
+**Status:** Done
 
 ## Objective
 Produce a dependency-free Domain crate (`crates/domain`) holding the core vocabulary (entities), a pure-stdlib `DomainError`, and the five port traits that embody the dependency-inversion boundary. This is the root of the dependency graph and must compile with **zero** third-party crates.

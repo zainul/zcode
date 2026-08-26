@@ -1,4 +1,4 @@
-# PRD: Minimal OpenCode-Capable Agent — QAgent (`ag`) v0.2.0
+# PRD: Minimal OpenCode-Capable Agent — zcode v0.2.0
 
 **Document ID:** PRD-AGENT-CORE-002
 **Status:** Draft
@@ -14,11 +14,11 @@
 
 ### 1.1 Overview
 
-The AI Coding Agent (`ag`) is a terminal-based, AI-driven coding assistant written in Rust that mirrors **1:1 the core capabilities of OpenCode** while deliberately reducing memory footprint and maximizing runtime performance. The v0.1.0 milestone delivered a clean-architecture Cargo workspace with port/adapter traits and stubbed infrastructure. This document defines **v0.2.0**, the milestone that turns the stubs into a **minimal but functional** coding agent.
+The AI Coding Agent (`zcode`) is a terminal-based, AI-driven coding assistant written in Rust that mirrors **1:1 the core capabilities of OpenCode** while deliberately reducing memory footprint and maximizing runtime performance. The v0.1.0 milestone delivered a clean-architecture Cargo workspace with port/adapter traits and stubbed infrastructure. This document defines **v0.2.0**, the milestone that turns the stubs into a **minimal but functional** coding agent.
 
 Concretely, v0.2.0 wires together the five subsystems the user identified as "minimal features like opencode":
 
-1. **Multi-Interface Architecture** — a Terminal User Interface (TUI) for interactive use **and** a Headless CLI for single-run, non-interactive task execution (e.g. `ag run "refactor foo()"`).
+1. **Multi-Interface Architecture** — a Terminal User Interface (TUI) for interactive use **and** a Headless CLI for single-run, non-interactive task execution (e.g. `zcode run "refactor foo()"`).
 2. **Session & State Management** — sessions are created, forked, continued, imported, and exported as portable local artifacts (no cloud lock-in).
 3. **Extensible Tool System** — native fast file/shell operations as first-class tools, plus **MCP** (Model Context Protocol) and **LSP** integration so the agent can reach external data sources and reason about code semantically.
 4. **Model & Provider Agnosticism** — abstracted provider clients for OpenRouter, OpenAI, Anthropic, and local models (Ollama/vLLM), with swappable **agent modes** (Planning vs. Build).
@@ -30,7 +30,7 @@ This milestone delivers the **smallest coherent subset** that constitutes a usab
 
 | # | Goal | Rationale |
 |---|------|-----------|
-| G1 | Ship a **working end-to-end agent loop** from a single prompt to a completed file edit via LLM tool-calling. | Users must be able to do `ag run "rename variable x to ctx in src/foo.rs"` and observe a real edit. A stub-only release cannot validate the architecture. |
+| G1 | Ship a **working end-to-end agent loop** from a single prompt to a completed file edit via LLM tool-calling. | Users must be able to do `zcode run "rename variable x to ctx in src/foo.rs"` and observe a real edit. A stub-only release cannot validate the architecture. |
 | G2 | Deliver **two interfaces** — interactive TUI and headless single-run CLI — sharing one engine. | OpenCode's value proposition is interactive REPL *and* one-shot scripting; both are table-stakes. |
 | G3 | Implement **MCP** and **LSP** as pluggable tool backends so the agent can reach external data and semantic code intel. | Mirrors OpenCode's tool-extensibility; without this the agent is a closed box. |
 | G4 | Abstract the LLM layer with **multi-provider** (OpenAI, Anthropic, OpenRouter, Ollama/vLLM) dispatch driven by config. | Single-provider lock-in kills adoption; config-driven provider + model is a hard requirement. |
@@ -53,16 +53,16 @@ v0.2.0 delivers the first release where that claim is empirically true end-to-en
 
 | ID | As a… | I want to… | So that… |
 |----|-------|------------|----------|
-| US-E-01 | Scripter | run `ag run "add a match arm for Result::Err to Foo::bar"` | the agent reads/writes files and edits code via an LLM without me typing in a REPL. |
-| US-E-02 | Developer | run `ag` with no args to drop into the interactive TUI | I can iterate on multi-step tasks conversationally, see tool output inline, and abort cleanly. |
+| US-E-01 | Scripter | run `zcode run "add a match arm for Result::Err to Foo::bar"` | the agent reads/writes files and edits code via an LLM without me typing in a REPL. |
+| US-E-02 | Developer | run `zcode` with no args to drop into the interactive TUI | I can iterate on multi-step tasks conversationally, see tool output inline, and abort cleanly. |
 | US-E-03 | Developer | have the agent call native file tools (read/write/edit) and `shell:` tools | fast edits and command execution happen without shelling out to `sed`/`grep`. |
 | US-E-04 | Developer | connect an MCP server (e.g. a Notion or Postgres MCP) | the agent can query external data sources the way OpenCode does. |
 | US-E-05 | Developer | have the agent use LSP go-to-definition / find-references | it edits the *right* symbol and doesn't rename unrelated ones. |
-| US-E-06 | Developer | set my provider + model in `ag.toml` (`openai`, `anthropic`, `openrouter`, `ollama`) | I'm not locked into one vendor and can use my local model. |
+| US-E-06 | Developer | set my provider + model in `zcode.toml` (`openai`, `anthropic`, `openrouter`, `ollama`) | I'm not locked into one vendor and can use my local model. |
 | US-E-07 | Developer | run in `--mode planning` vs `--mode build` | planning mode asks for confirmation; build mode executes aggressively. |
-| US-E-08 | Operator | emit `--json` output and a telemetry file (`ag.report.json`) with token/step/time/model | I can pipe results into CICD and attribute costs. |
-| US-E-09 | Developer | create/continue/fork/export a session, save to a local `.ag/sessions/<id>.json` | I can resume long work, branch exploration, and hand sessions to teammates. |
-| US-E-10 | Security-conscious user | have a `shell.allowed` list in `ag.toml`; disallowed commands fail | the agent cannot run arbitrary `rm -rf` / exfil commands. |
+| US-E-08 | Operator | emit `--json` output and a telemetry file (`zcode.report.json`) with token/step/time/model | I can pipe results into CICD and attribute costs. |
+| US-E-09 | Developer | create/continue/fork/export a session, save to a local `.zcode/sessions/<id>.json` | I can resume long work, branch exploration, and hand sessions to teammates. |
+| US-E-10 | Security-conscious user | have a `shell.allowed` list in `zcode.toml`; disallowed commands fail | the agent cannot run arbitrary `rm -rf` / exfil commands. |
 | US-E-11 | Multimodal user | pass an image (`--image foo.png`) to an LLM with vision (gpt-4o, claude-3-opus) | the agent can reason over screenshots / diagrams. |
 
 ### 2.2 Contributor-Facing Stories (enabling)
@@ -83,24 +83,24 @@ The **engine** (`crates/app`) is interface-agnostic. The **Interface** layer own
 
 | ID | Requirement | Description |
 |----|-------------|-------------|
-| FR-IFACE-01 | Headless CLI single-run command | `ag run "<prompt>" [--image <file>]... [--mode <planning\|build>] [--session <id>] [--json] [--config <path>]` executes one agent turn-loop and exits. |
-| FR-IFACE-02 | Interactive TUI | `ag` (no `run`, or `ag repl`) launches a `ratatui`-based TUI with message history, streaming tool output, and `q`/Ctrl-C to abort. |
+| FR-IFACE-01 | Headless CLI single-run command | `zcode run "<prompt>" [--image <file>]... [--mode <planning\|build>] [--session <id>] [--json] [--config <path>]` executes one agent turn-loop and exits. |
+| FR-IFACE-02 | Interactive TUI | `zcode` (no `run`, or `zcode repl`) launches a `ratatui`-based TUI with message history, streaming tool output, and `q`/Ctrl-C to abort. |
 | FR-IFACE-03 | Shared engine | Both interfaces call `App::execute(ctx, plan) -> ExecutionResult` — no duplicated orchestration logic. |
 | FR-IFACE-04 | Streaming token UI | TUI streams LLM deltas and tool results live; headless `--json` streams JSON tool-call + result objects line-by-line. |
 | FR-IFACE-05 | Graceful abort | `Ctrl-C` (SIGINT) and a `--timeout <secs>` cap terminate the loop, flush telemetry, and export the partial session. |
-| FR-IFACE-06 | `version` subcommand preserved | `ag version` continues to print build metadata (unchanged from v0.1.0). |
+| FR-IFACE-06 | `version` subcommand preserved | `zcode version` continues to print build metadata (unchanged from v0.1.0). |
 
 ### 3.2 Session & State Management
 
-Sessions are the durable state unit. On disk layout: `.ag/sessions/<id>.json`. Portable, human-readable JSON so sessions are importable/exportable by hand.
+Sessions are the durable state unit. On disk layout: `.zcode/sessions/<id>.json`. Portable, human-readable JSON so sessions are importable/exportable by hand.
 
 | ID | Requirement | Description |
 |----|-------------|-------------|
-| FR-SESSION-01 | Create session | `ag session create` allocates an ID (UUIDv7), writes an empty session file, returns the ID. |
-| FR-SESSION-02 | Continue session | `ag session continue <id>` loads the session, appends to message history, runs the loop. |
-| FR-SESSION-03 | Fork session | `ag session fork <id> --as <new_id>` snapshots the message history into a new ID; the child is independent. |
-| FR-SESSION-04 | Import session | `ag session import <file.json>` reads a JSON session (from clipboard, another machine, another agent) into a new local ID. |
-| FR-SESSION-05 | Export session | `ag session export <id> --to <file.json>` writes that session's full transcript + telemetry as JSON. |
+| FR-SESSION-01 | Create session | `zcode session create` allocates an ID (UUIDv7), writes an empty session file, returns the ID. |
+| FR-SESSION-02 | Continue session | `zcode session continue <id>` loads the session, appends to message history, runs the loop. |
+| FR-SESSION-03 | Fork session | `zcode session fork <id> --as <new_id>` snapshots the message history into a new ID; the child is independent. |
+| FR-SESSION-04 | Import session | `zcode session import <file.json>` reads a JSON session (from clipboard, another machine, another agent) into a new local ID. |
+| FR-SESSION-05 | Export session | `zcode session export <id> --to <file.json>` writes that session's full transcript + telemetry as JSON. |
 | FR-SESSION-06 | Auto-checkpoint | Every completed step writes a checkpoint to the session file so a crash mid-run resumes from the last good state. |
 | FR-SESSION-07 | Session metadata | Each session records: created_at, model, mode, last_message_at, step_count. |
 
@@ -123,7 +123,7 @@ A `Tool` is any callable that the agent can dispatch via an LLM `tool_use` / `fu
 | ID | Requirement | Description |
 |----|-------------|-------------|
 | FR-MCP-01 | MCP client | `infra/mcp` implements `McpPort` over the MCP JSON-RPC transport (stdio + SSE planned). |
-| FR-MCP-02 | Config-driven servers | `ag.toml` lists `[[mcp.servers]]` with `name`, `command`, `args`, `env`. |
+| FR-MCP-02 | Config-driven servers | `zcode.toml` lists `[[mcp.servers]]` with `name`, `command`, `args`, `env`. |
 | FR-MCP-03 | Tool discovery | On engine boot, the `ToolRegistry` calls each MCP server's `tools/list` and exposes them as agent tools. |
 | FR-MCP-04 | Tool execution | Agent tool calls route to `McpPort::call(name, args)` → MCP `tools/call`. |
 | FR-MCP-05 | Graceful degradation | An MCP server that fails to start is logged and skipped; the agent runs with remaining tools. |
@@ -134,7 +134,7 @@ A `Tool` is any callable that the agent can dispatch via an LLM `tool_use` / `fu
 |----|-------------|-------------|
 | FR-LSP-01 | LSP client | `infra/lsp` implements `LspPort` using the `lsp-types` + `tower-lsp`/`rust-analyzer`-wire protocol. |
 | FR-LSP-02 | Semantic tooling | Exposes `goto_definition`, `find_references`, `hover`, `rename_symbol` as agent tools. |
-| FR-LSP-03 | Per-language server registry | `ag.toml` maps file extensions → LSP server command (`rust_analyzer`, `pyright`, etc.). |
+| FR-LSP-03 | Per-language server registry | `zcode.toml` maps file extensions → LSP server command (`rust_analyzer`, `pyright`, etc.). |
 | FR-LSP-04 | Document sync | LSP client opens files on agent `read`, keeps a text-document state, and pushes `didChange` as edits happen. |
 
 ### 3.4 Model & Provider Agnosticism
@@ -143,9 +143,9 @@ The LLM layer is a single `LlmPort` trait with concrete provider clients in `inf
 
 | ID | Requirement | Description |
 |----|-------------|-------------|
-| FR-MODEL-01 | OpenAI client | `OpenAiLlm` (replaces the v0.1.0 stub) hits `https://api.openai.com/v1/chat/completions` with Bearer token from `AG_OPENAI_API_KEY`. |
-| FR-MODEL-02 | Anthropic client | `AnthropicLlm` via `https://api.anthropic.com/v1/messages` with `AG_ANTHROPIC_API_KEY`. |
-| FR-MODEL-03 | OpenRouter client | `OpenRouterLlm` via `https://openrouter.ai/api/v1/chat/completions` with `AG_OPENROUTER_API_KEY`. |
+| FR-MODEL-01 | OpenAI client | `OpenAiLlm` (replaces the v0.1.0 stub) hits `https://api.openai.com/v1/chat/completions` with Bearer token from `ZCODE_OPENAI_API_KEY`. |
+| FR-MODEL-02 | Anthropic client | `AnthropicLlm` via `https://api.anthropic.com/v1/messages` with `ZCODE_ANTHROPIC_API_KEY`. |
+| FR-MODEL-03 | OpenRouter client | `OpenRouterLlm` via `https://openrouter.ai/api/v1/chat/completions` with `ZCODE_OPENROUTER_API_KEY`. |
 | FR-MODEL-04 | Ollama client | `OllamaLlm` via `http://localhost:11434/api/chat` (local, streaming). |
 | FR-MODEL-05 | vLLM client | `VllmLlm` via OpenAI-compatible endpoint (reuse `OpenAiLlm` with custom endpoint). |
 | FR-MODEL-06 | Provider dispatch | `wire()` reads `config.provider` and constructs the matching `Box<dyn LlmPort>`. Unknown provider → typed `AppError`. |
@@ -168,27 +168,27 @@ The agent emits machine-readable output per requirement 5 ("Generate Use JSON ou
 | ID | Requirement | Description |
 |----|-------------|-------------|
 | FR-OUTPUT-01 | `--json` streaming | In headless mode, each LLM delta, tool call decision, tool result, and terminal answer is emitted as a JSON object on stdout (one per line, JSONL). |
-| FR-OUTPUT-02 | Report file | On completion, write `.ag/reports/<timestamp>-<session>.json` with the full run. |
+| FR-OUTPUT-02 | Report file | On completion, write `.zcode/reports/<timestamp>-<session>.json` with the full run. |
 | FR-OUTPUT-03 | Input token count | Count prompt tokens (approx via a lightweight tokenizer or provider-reported) per step. |
 | FR-OUTPUT-04 | Output token count | Count generated completion tokens per step. |
 | FR-OUTPUT-05 | Cache token count | Count provider-emitted cache tokens (Anthropic `cache_creation_output_tokens`, OpenAI `prompt_tokens_details`) when available; 0 otherwise. |
 | FR-OUTPUT-06 | Execution step count | Increment a counter per LLM-turn + tool-call round. |
 | FR-OUTPUT-07 | Execution time | Wall-clock from engine start to final answer (ms). |
 | FR-OUTPUT-08 | Model name | Record provider + model identifier in every telemetry event. |
-| FR-OUTPUT-09 | Skill folder access | Tool `ag:skill` reads a markdown file from `.ag/skills/` (or the configured skills dir) and injects it as context; skill path access is allowlisted by directory. |
+| FR-OUTPUT-09 | Skill folder access | Tool `zcode:skill` reads a markdown file from `.zcode/skills/` (or the configured skills dir) and injects it as context; skill path access is allowlisted by directory. |
 
 ### 3.7 Configuration & Allowed Commands
 
-Configuration lives in `ag.toml` (see existing `examples/ag.example.toml` extended below) plus `AG_*` env overrides (precedence: env > file).
+Configuration lives in `zcode.toml` (see existing `examples/zcode.example.toml` extended below) plus `ZCODE_*` env overrides (precedence: env > file).
 
 | ID | Requirement | Description |
 |----|-------------|-------------|
-| FR-CONFIG-01 | Extend `ag.toml` schema | Add `provider`, `model`, `api_key_env` (key env-var name), `[[mcp.servers]]`, `[lsp.servers]`, `shell.allowed` (list of regex patterns), `skills_dir`, `mode`. |
+| FR-CONFIG-01 | Extend `zcode.toml` schema | Add `provider`, `model`, `api_key_env` (key env-var name), `[[mcp.servers]]`, `[lsp.servers]`, `shell.allowed` (list of regex patterns), `skills_dir`, `mode`. |
 | FR-CONFIG-02 | Provider selection | `config.provider` ∈ {openai, anthropic, openrouter, ollama, vllm, openai-compatible}. |
-| FR-CONFIG-03 | Env-var secret resolution | API keys are read by the *name* in `api_key_env` (e.g. `AG_OPENAI_API_KEY`) at `wire()` time; never persisted. |
+| FR-CONFIG-03 | Env-var secret resolution | API keys are read by the *name* in `api_key_env` (e.g. `ZCODE_OPENAI_API_KEY`) at `wire()` time; never persisted. |
 | FR-CONFIG-04 | Shell allowlist | `shell.allowed` is a list of regexes; a command runs iff **every token/segment** matches at least one allowed pattern. Default: `["echo .*", "ls .*", "cd .*", "cat .*"]`. Empty list → block all (fail-safe). |
 | FR-CONFIG-05 | Command execution gating | `ShellPort::run` is wrapped by a `GuardedShell` decorator that applies the allowlist *before* dispatching to `StdShell` — satisfying "execute every command based on allowed on the configuration". |
-| FR-CONFIG-06 | Skills dir | `skills_dir` defaults to `.ag/skills`; `ag:skill <name>` reads `<skills_dir>/<name>.md`. |
+| FR-CONFIG-06 | Skills dir | `skills_dir` defaults to `.zcode/skills`; `zcode:skill <name>` reads `<skills_dir>/<name>.md`. |
 
 ### 3.8 Engine Orchestration Loop (the heart)
 
@@ -217,16 +217,16 @@ loop:
 
 | Command | Interface | Purpose |
 |---------|-----------|---------|
-| `ag version` | headless | Build metadata (unchanged). |
-| `ag run "<prompt>"` | headless | Single-run agent turn. |
-| `ag` / `ag repl` | TUI | Interactive session. |
-| `ag session create` | headless | New session ID. |
-| `ag session continue <id>` | headless/TUI | Resume. |
-| `ag session fork <id> --as <new>` | headless | Branch. |
-| `ag session import <file>` | headless | Ingest external JSON. |
-| `ag session export <id> --to <file>` | headless | Emit JSON. |
-| `ag tools list` | headless | Enumerate available tools. |
-| `ag skills list` | headless | Enumerate `.ag/skills/*.md`. |
+| `zcode version` | headless | Build metadata (unchanged). |
+| `zcode run "<prompt>"` | headless | Single-run agent turn. |
+| `zcode` / `zcode repl` | TUI | Interactive session. |
+| `zcode session create` | headless | New session ID. |
+| `zcode session continue <id>` | headless/TUI | Resume. |
+| `zcode session fork <id> --as <new>` | headless | Branch. |
+| `zcode session import <file>` | headless | Ingest external JSON. |
+| `zcode session export <id> --to <file>` | headless | Emit JSON. |
+| `zcode tools list` | headless | Enumerate available tools. |
+| `zcode skills list` | headless | Enumerate `.zcode/skills/*.md`. |
 
 ---
 
@@ -254,8 +254,8 @@ loop:
 
 | ID | NFR | Acceptance |
 |----|-----|------------|
-| NFR-PERF-01 | Cold start (`ag version`) | < 300 ms on 2023 laptop (carried from v0.1.0). |
-| NFR-PERF-02 | Single-run task latency | `ag run "<small task>"` completes a 1-turn edit in < 2 s wall-clock excluding LLM network RTT. |
+| NFR-PERF-01 | Cold start (`zcode version`) | < 300 ms on 2023 laptop (carried from v0.1.0). |
+| NFR-PERF-02 | Single-run task latency | `zcode run "<small task>"` completes a 1-turn edit in < 2 s wall-clock excluding LLM network RTT. |
 | NFR-PERF-03 | Hot-loop memory | A 20-step task holds < 8 MB process RSS above baseline (measured via `valgrind massif` / `ps`). |
 | NFR-PERF-04 | No GC pauses | Pure Rust, no GC; latency bounded by I/O and provider RTT only. |
 | NFR-PERF-05 | Release profile | `lto = thin`, `codegen-units = 1`, `panic = abort`, `strip = symbols` (unchanged). |
@@ -285,7 +285,7 @@ loop:
 |----|-----|------------|
 | NFR-PORT-01 | Tier-1 targets | Builds on Linux x86_64 and macOS aarch64. |
 | NFR-PORT-02 | No unsafe | Zero `unsafe` in Domain/App; `unsafe` confined to infra crates that need PTY (`infra/shell`) and is `#![forbid]`-gated per crate. |
-| NFR-SEC-01 | No secrets in repo | API keys never written to disk; `.ag/skills`, `.ag/sessions`, `ag.toml.local` gitignored. |
+| NFR-SEC-01 | No secrets in repo | API keys never written to disk; `.zcode/skills`, `.zcode/sessions`, `zcode.toml.local` gitignored. |
 | NFR-SEC-02 | Shell sandboxing | `shell.allowed` regex allowlist enforced before any `std::process::Command::spawn`; default-deny. |
 | NFR-SEC-03 | Supply chain | `deny.toml` + `cargo audit` configured for CI. |
 | NFR-SEC-04 | TUI escapes | ratatui output is sanitized; no raw terminal escape injection from tool results. |
@@ -294,8 +294,8 @@ loop:
 
 | ID | NFR | Acceptance |
 |----|-----|------------|
-| NFR-OBS-01 | JSONL emit | `ag run --json` emits one JSON object per event; parseable by `jq`. |
-| NFR-OBS-02 | Telemetry schema | Every `.ag/reports/*.json` matches a documented schema (model, input_tokens, output_tokens, cache_tokens, steps, execution_time_ms, session_id). |
+| NFR-OBS-01 | JSONL emit | `zcode run --json` emits one JSON object per event; parseable by `jq`. |
+| NFR-OBS-02 | Telemetry schema | Every `.zcode/reports/*.json` matches a documented schema (model, input_tokens, output_tokens, cache_tokens, steps, execution_time_ms, session_id). |
 
 ---
 
@@ -328,22 +328,22 @@ The following are deliberately excluded from v0.2.0; they land in later mileston
 | M1.2 Tests green | `cargo test --workspace` passes (network tests `#[ignore]`'d) | CI / local |
 | M1.3 Lint green | `cargo clippy --workspace -- -D warnings` + `cargo fmt --check` pass | CI / local |
 | M1.4 Architecture lint | `make check-deps` acyclic graph still green after new crates | CI / local |
-| M1.5 End-to-end edit | `ag run "rename function foo to bar in crates/domain/src/model.rs"` performs the rename correctly | Manual + scripted acceptance |
-| M1.6 Headless JSON | `ag run --json "<task>"` emits valid JSONL (parseable by `jq -e .`) | Automated check |
-| M1.7 Telemetry present | `.ag/reports/*.json` contains `model`, `input_tokens`, `output_tokens`, `steps`, `execution_time_ms` | Schema check |
-| M1.8 Session lifecycle | `ag session create` → `export` → `import` of an external JSON session succeeds | Manual + scripted |
-| M1.9 MCP tool discovery | A fixture MCP server (`mcp-everything`) exposes ≥ 1 tool to `ag tools list` | Integration test (ignore'able) |
+| M1.5 End-to-end edit | `zcode run "rename function foo to bar in crates/domain/src/model.rs"` performs the rename correctly | Manual + scripted acceptance |
+| M1.6 Headless JSON | `zcode run --json "<task>"` emits valid JSONL (parseable by `jq -e .`) | Automated check |
+| M1.7 Telemetry present | `.zcode/reports/*.json` contains `model`, `input_tokens`, `output_tokens`, `steps`, `execution_time_ms` | Schema check |
+| M1.8 Session lifecycle | `zcode session create` → `export` → `import` of an external JSON session succeeds | Manual + scripted |
+| M1.9 MCP tool discovery | A fixture MCP server (`mcp-everything`) exposes ≥ 1 tool to `zcode tools list` | Integration test (ignore'able) |
 | M1.10 Shell allowlist | A blocked command (`rm -rf /`) is refused; an allowed command (`echo hi`) runs | Test in `crates/infra/shell` |
-| M1.11 TUI launches | `ag repl` renders a ratatui screen and exits cleanly on `q` | Manual smoke |
+| M1.11 TUI launches | `zcode repl` renders a ratatui screen and exits cleanly on `q` | Manual smoke |
 
 ### 7.2 Secondary — Performance & Security
 
 | Metric | Target | Measurement |
 |--------|--------|-------------|
-| M2.1 Cold start | `ag version` < 300 ms (release) | `time` on 2023 laptop |
-| M2.2 Task latency | single-turn file edit (excl. network) < 2 s | `hyperfine` on `ag run` with a local Ollama provider |
+| M2.1 Cold start | `zcode version` < 300 ms (release) | `time` on 2023 laptop |
+| M2.2 Task latency | single-turn file edit (excl. network) < 2 s | `hyperfine` on `zcode run` with a local Ollama provider |
 | M2.3 Memory ceiling | 20-step task < 8 MB RSS above baseline | `valgrind massif` or `ps` sample |
-| M2.4 Binary size | release `ag` < 12 MB | `du -h target/release/ag` |
+| M2.4 Binary size | release `zcode` < 12 MB | `du -h target/release/zcode` |
 | M2.5 Shell deny-all | empty `shell.allowed` → no command runs | Test |
 | M2.6 No secrets leak | grep repo for `*.api_key` patterns → 0 hits | `make secrets-scan` |
 

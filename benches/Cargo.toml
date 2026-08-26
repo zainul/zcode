@@ -1,11 +1,11 @@
 [package]
-name = "ag-benches"
+name = "zcode-benches"
 version.workspace = true
 edition.workspace = true
 publish = false
 
 [dependencies]
-domain = { path = "../crates/domain", version = "0.1.0" }
+domain = { path = "../crates/domain", version = "0.2.0" }
 criterion = "0.5"
 
 [[bench]]

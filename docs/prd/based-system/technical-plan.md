@@ -1,8 +1,8 @@
-# Technical Plan: Minimal OpenCode-Capable Agent — QAgent (`ag`) v0.2.0
+# Technical Plan: Minimal OpenCode-Capable Agent — zcode v0.2.0
 
 **Plan ID:** TP-AGENT-CORE-002
 **Derived from:** `docs/prd/based-system/prd.md`
-**Target:** QAgent v0.2.0 — first minimally functional end-to-end coding agent in Rust
+**Target:** zcode v0.2.0 — first minimally functional end-to-end coding agent in Rust
 **Lead Engineer:** Backend Team
 **Status:** Draft (ready for implementation ordering per §11)
 
@@ -10,13 +10,13 @@
 
 ## 1. Executive Summary
 
-v0.1.0 shipped a clean, **stubbed** skeleton: traits wired, `ag version` working, no I/O behavior. v0.2.0 turns the stubs into a **real, looping** coding agent that satisfies G1–G8 of the PRD. Concretely we deliver:
+v0.1.0 shipped a clean, **stubbed** skeleton: traits wired, `zcode version` working, no I/O behavior. v0.2.0 turns the stubs into a **real, looping** coding agent that satisfies G1–G8 of the PRD. Concretely we deliver:
 
 - A synchronous **engine loop** (`App::execute`) that renders chat history + tool specs to an LLM, streams deltas, dispatches `tool_use`, accumulates results, checkpoints, and iterates up to `max_turns`.
 - An evolved **LLM port** that supports tool-calling and provider-reported token usage across OpenAI, Anthropic, OpenRouter, and Ollama (vLLM via OpenAI-compatible reuse).
-- Two **interfaces** sharing one engine: a headless `ag run "<prompt>"` (JSONL to stdout) and an interactive `ratatui` TUI (`ag repl`) where the blocking loop runs on a worker thread and streams results to the renderer via an `mpsc` channel.
+- Two **interfaces** sharing one engine: a headless `zcode run "<prompt>"` (JSONL to stdout) and an interactive `ratatui` TUI (`zcode repl`) where the blocking loop runs on a worker thread and streams results to the renderer via an `mpsc` channel.
 - An **extensible tool system** — native file/shell tools in `crates/tools`, plus MCP (stdio JSON-RPC) and LSP (rust-analyzer-style stdio JSON-RPC) as pluggable `ToolRegistryPort` backends.
-- **Session + telemetry** persistence: `.ag/sessions/<uuidv7>.json` with auto-checkpoints, import/export JSON, and `.ag/reports/*.json` + JSONL streaming events.
+- **Session + telemetry** persistence: `.zcode/sessions/<uuidv7>.json` with auto-checkpoints, import/export JSON, and `.zcode/reports/*.json` + JSONL streaming events.
 
 The v0.1.0 architectural constraints are **frozen** (PRD §8): Domain is stdlib-only; App depends on Domain only; Infra depends on Domain; CLI is the composition root. All v0.2.0 changes honor this.
 
@@ -29,12 +29,12 @@ The v0.1.0 architectural constraints are **frozen** (PRD §8): Domain is stdlib-
 | DQ1 | PTY / persistent shell | **Defer the persistent PTY shell.** `ShellPort::spawn` keeps returning `Pty(PtyError)` (Unix-only; Windows shim in v0.2.1) behind a `pty` cargo feature. The single-run `shell` tool via `run()` **is** fully implemented with the allowlist. Resolves PRD Q1; keeps M1.11 achievable without a heavy PTY dep. | Avoids a large native dep in the critical path; persistent shells are a v0.2.1 feature per FR-TOOL-SHELL-02's own "Stubbed in headless" note. |
 | DQ2 | Token counting | **Provider-reported `usage`** is authoritative (LlmEvent::Finish carries `input_tokens`/`output_tokens`/`cache_tokens`). A whitespace/word heuristic in `domain::tokens` is the **fallback** only when a provider omits usage (e.g. some Ollama builds). Resolves PRD Q4. | Accuracy + cost attribution (FR-OUTPUT-03/04/05) without bloating domain with a tokenizer crate. |
 | DQ3 | HTTP client | **`reqwest` blocking** (`features = ["blocking", "json", "rustls-tls", "gzip"]`) for all provider adapters, plus `serde_json` for SSE line parsing. Resolves PRD Q6. | Single client, rustls (no platform C toolchain for TLS), blocking form factor matches the sync ports (see DQ4) and keeps current-thread runtime unblocked. |
-| DQ4 | Async vs sync ports | **Sync port traits** kept (Domain stdlib-only, async-agnostic). `LlmPort::stream` returns `Box<dyn Iterator<Item = LlmEvent>>`. Adapters do blocking HTTP reads; the TUI runs the engine on a **dedicated `std::thread`** with a `std::sync::mpsc` channel to the renderer. Headless `ag run` runs on the tokio current-thread directly (blocking is acceptable there). | Preserves FR-DI-01 (domain pure) and the frozen layering; avoids pulling `tokio`/`futures` into `domain` or `app`. |
+| DQ4 | Async vs sync ports | **Sync port traits** kept (Domain stdlib-only, async-agnostic). `LlmPort::stream` returns `Box<dyn Iterator<Item = LlmEvent>>`. Adapters do blocking HTTP reads; the TUI runs the engine on a **dedicated `std::thread`** with a `std::sync::mpsc` channel to the renderer. Headless `zcode run` runs on the tokio current-thread directly (blocking is acceptable there). | Preserves FR-DI-01 (domain pure) and the frozen layering; avoids pulling `tokio`/`futures` into `domain` or `app`. |
 | DQ5 | App port ownership | **`App` owns ports by value** (`Box<dyn Port + Send>`), dropping the v0.1 `Arc<dyn … + Sync>` wrapper. Single-owner, single-thread loop; `Send` suffices because the TUI moves the `App` into a worker `std::thread`. | Clean `&mut self` semantics (LlmPort/stream/mut call need unique access); removes the v0.1 Arc-mut mismatch. |
 | DQ6 | MCP transport | **Stdio JSON-RPC implemented directly** in `crates/infra/mcp` (deps: `serde`, `serde_json`, `domain`). SSE transport deferred to v0.3.0 (PRD §6 Out of Scope #1 for v0.2). Resolves PRD Q3. | Eliminates dependency on an upstream crate whose 1.85 compatibility is uncertain; stdio covers `mcp-everything` and the vast majority of MCP servers. |
 | DQ7 | LSP client | **`lsp-types` + hand-rolled JSON-RPC** over a spawned stdio process (deps: `lsp-types`, `serde_json`, `domain`). `tower-lsp` is **server-only**; not applicable as a client. Resolves PRD Q2. | Minimal dep footprint; stdio JSON-RPC is trivially synchronous and matches DQ4. |
 | DQ8 | TUI framework | **`ratatui` 0.29** with `crossterm` backend (confirmed by PRD Q5). No extra features. | Matches the codebase's lean ethos; crossterm backend is Tier-1 on Linux/macOS. |
-| DQ9 | Session ID format | **UUIDv7** via `uuid` `v7` feature (time-ordered, sortable). Resolves PRD Q7. | Deterministic ordering of sessions in `.ag/sessions/`, human-auditable. |
+| DQ9 | Session ID format | **UUIDv7** via `uuid` `v7` feature (time-ordered, sortable). Resolves PRD Q7. | Deterministic ordering of sessions in `.zcode/sessions/`, human-auditable. |
 | DQ10 | Tool trait location | **`Tool` trait + `ToolSpec`/`ToolResult` + `ToolRegistryPort` trait live in `domain`** (pure). Concrete **native** tool impls (`read`, `write`, `str_replace`, `list_dir`, `shell`) and the merging **`ToolRegistry`** live in `crates/tools`. MCP/LSP tool adapters bridge into the same registry. | Domain stays the contract owner; app calls `ToolRegistryPort` without knowing native vs MCP vs LSP. Enforces FR-C-01 (add a tool = implement `Tool`). |
 | DQ11 | Configuration shape | **Single `Config` serde struct** extended from v0.1 with nested `Provider`, `McpServer`, `LspServer`, `Shell` sections; `Loader` keeps env-over-file precedence. Secrets referenced by **name** (`api_key_env`) and resolved via `std::env::var` at `wire()`. | Satisfies FR-CONFIG-01–06, NFR-SEC-01 (keys never persisted). |
 
@@ -232,17 +232,17 @@ Evolve `App` to own `LlmPort + ToolRegistryPort + SessionStorePort + TelemetryPo
 - `infra/lsp` (new): spawn per-language LSP servers from `[lsp.servers.*]`, maintain an open-documents state, expose `LspPort`.
 - `infra/filesystem` / `infra/shell`: unchanged interface; `shell` wrapped by a `GuardedShell` decorator applying the allowlist (FR-CONFIG-05). Native tools in `crates/tools` use these.
 - `infra/config`: extend `Config` + `Loader` (task-20).
-- `infra/session` (new): `UuidSessionStore` writing `.ag/sessions/<id>.json` with auto-checkpoints.
-- `infra/telemetry` (new): `JsonTelemetry` emitting stdout JSONL + `.ag/reports/*.json`.
+- `infra/session` (new): `UuidSessionStore` writing `.zcode/sessions/<id>.json` with auto-checkpoints.
+- `infra/telemetry` (new): `JsonTelemetry` emitting stdout JSONL + `.zcode/reports/*.json`.
 
 ### 6.5 Tools crate
-`crates/tools` defines `ToolRegistry` merging `Box<dyn Tool>` (native) + `McpPort`-backed + `LspPort`-backed tools behind `ToolRegistryPort`. Native tools: `read`, `write`, `str_replace_editor` (`view`/`create`/`str_replace`/`list_dir`), `shell` (guarded), `ag:skill` (read-only skills dir).
+`crates/tools` defines `ToolRegistry` merging `Box<dyn Tool>` (native) + `McpPort`-backed + `LspPort`-backed tools behind `ToolRegistryPort`. Native tools: `read`, `write`, `str_replace_editor` (`view`/`create`/`str_replace`/`list_dir`), `shell` (guarded), `zcode:skill` (read-only skills dir).
 
 ### 6.6 CLI crate (composition root)
 - `wire(ctx)` reads `Config`, resolves API key by `api_key_env`, constructs the matching `LlmPort`, builds the `ToolRegistry` (native + configured MCP + LSP), wires session + telemetry ports, builds `App`.
 - clap subcommands: `version`, `run`, `repl`, `session {create,continue,fork,import,export}`, `tools list`, `skills list`.
-- `ag run` → headless `App::execute`, JSONL to stdout.
-- `ag repl` → ratatui TUI; engine runs on `std::thread`, `mpsc<UiEvent>` back to renderer; `q`/`Ctrl-C` aborts, flushes telemetry + exports partial session (FR-IFACE-05).
+- `zcode run` → headless `App::execute`, JSONL to stdout.
+- `zcode repl` → ratatui TUI; engine runs on `std::thread`, `mpsc<UiEvent>` back to renderer; `q`/`Ctrl-C` aborts, flushes telemetry + exports partial session (FR-IFACE-05).
 
 ## 7. Low-Level Changes (file-by-file)
 
@@ -316,10 +316,10 @@ impl LspPort for LspClient { ... }
 `ToolRegistry { native: Vec<Box<dyn Tool>>, mcp: Vec<McpRef>, lsp: Option<LspRef> }` implementing `ToolRegistryPort`. Native tools: `FsReadTool`, `FsWriteTool`, `StrReplaceTool`, `ListDirTool`, `ShellTool` (delegating to a `GuardedShell`), `SkillTool`. `guarded_run` matches `cmd` segments against `shell.allowed` regexes (FR-CONFIG-05).
 
 ### 7.9 `crates/infra/session/src/lib.rs` (new)
-`UuidSessionStore { base: PathBuf }` — `create()` writes empty `.ag/sessions/<v7>.json`, returns id; `checkpoint()` overwrites atomically (temp+rename); `fork`/`import`/`export` per FR-SESSION-01..07. Ignores `.ag` entries outside the sessions dir (FS-tool path traversal guarded too).
+`UuidSessionStore { base: PathBuf }` — `create()` writes empty `.zcode/sessions/<v7>.json`, returns id; `checkpoint()` overwrites atomically (temp+rename); `fork`/`import`/`export` per FR-SESSION-01..07. Ignores `.zcode` entries outside the sessions dir (FS-tool path traversal guarded too).
 
 ### 7.10 `crates/infra/telemetry/src/lib.rs` (new)
-`JsonTelemetry { out: Box<dyn Write + Send>, report_dir: PathBuf }` — `emit()` writes one JSON object + newline; `flush_report()` serializes `TelemetryTotals` to `.ag/reports/<ts>-<session>.json`. `extra` field uses domain's `ExtraField` enum, rendered to JSON by `serde_json` only inside this crate (keeps domain pure).
+`JsonTelemetry { out: Box<dyn Write + Send>, report_dir: PathBuf }` — `emit()` writes one JSON object + newline; `flush_report()` serializes `TelemetryTotals` to `.zcode/reports/<ts>-<session>.json`. `extra` field uses domain's `ExtraField` enum, rendered to JSON by `serde_json` only inside this crate (keeps domain pure).
 
 ### 7.11 `crates/infra/config/src/lib.rs` (extended, task-20)
 Extend `Config` with `provider`, `model`, `api_key_env`, `max_turns`, `max_tokens`, `max_tool_output_chars`, `[[mcp.servers]]`, `[lsp.servers]`, `shell.allowed`, `skills_dir`, `mode`. `Loader` keeps env-over-file; `resolve_api_key` reads `api_key_env`.
@@ -327,9 +327,9 @@ Extend `Config` with `provider`, `model`, `api_key_env`, `max_turns`, `max_token
 ### 7.12 `crates/cli/src/cli/mod.rs` (evolved)
 - `Cli` derive with all subcommands (§6.6).
 - `wire()` becomes `wire(&Config) -> Result<App, AppError>`: provider dispatch (FR-MODEL-06), constructs matching `LlmPort`, builds `ToolRegistry`, `UuidSessionStore`, `JsonTelemetry`.
-- `ag run`: build `ExecutionRequest`, call `app.execute`, stream JSONL.
-- `ag repl`: spawn ratatui app; spawn `std::thread` running `app.execute`; bridge via `mpsc`.
-- `ag session *`, `ag tools list`, `ag skills list` delegate to ports.
+- `zcode run`: build `ExecutionRequest`, call `app.execute`, stream JSONL.
+- `zcode repl`: spawn ratatui app; spawn `std::thread` running `app.execute`; bridge via `mpsc`.
+- `zcode session *`, `zcode tools list`, `zcode skills list` delegate to ports.
 
 ### 7.13 `crates/cli/src/cli/tui.rs` (new)
 ratatui render loop: message pane (top), tool-call/result pane (middle), input bar (bottom). Renders `UiEvent`s from the channel. `q`/`Esc`/`Ctrl-C` → signal abort.
@@ -355,16 +355,16 @@ ratatui render loop: message pane (top), tool-call/result pane (middle), input b
 | T11 | LSP goto def | `infra/lsp` | `#[ignore]` rust-analyzer fixture | resolves a definition (L3) |
 | T12 | Session lifecycle | `infra/session` | create→checkpoint→fork→import→export | round-trip JSON, UUIDv7 format |
 | T13 | Session auto-checkpoint | `infra/session` | kill mid-write → load | resumes from last completed step (NFR-REL-03) |
-| T14 | JSONL emit | `infra/telemetry` | `ag run --json` | `jq -e .` parses every line (NFR-OBS-01) |
+| T14 | JSONL emit | `infra/telemetry` | `zcode run --json` | `jq -e .` parses every line (NFR-OBS-01) |
 | T15 | Telemetry schema | `infra/telemetry` | assert report has required keys | M1.7 |
 | T16 | Engine tool-use loop | `app` | fake `LlmPort` returning a `str_replace` tool_call → `ToolRegistry` mocks | file edited, step_count=1 |
 | T17 | Planning mode read-only | `app` | planning mode, LLM returns `write` tool_call | engine refuses execute-side tool → `AppError::Tool` |
-| T18 | TUI launches + aborts | `cli` | `ag repl` smoke (manual) | renders, `q` exits 0 |
-| T19 | `ag run` end-to-end | `cli` | `#[ignore]` local Ollama, rename a var | file renamed (M1.5) |
-| T20 | Version + build meta | `cli` | `cargo run -q -- version` | prints `ag v0.2.0 (git:…, profile:…)` |
+| T18 | TUI launches + aborts | `cli` | `zcode repl` smoke (manual) | renders, `q` exits 0 |
+| T19 | `zcode run` end-to-end | `cli` | `#[ignore]` local Ollama, rename a var | file renamed (M1.5) |
+| T20 | Version + build meta | `cli` | `cargo run -q -- version` | prints `zcode v0.2.0 (git:…, profile:…)` |
 | T21 | clippy + fmt | workspace | `cargo clippy --workspace -- -D warnings` / `cargo fmt --check` | exit 0 |
-| T22 | Binary size | `cli` | `du -h target/release/ag` | < 12 MB (M2.4) |
-| T23 | Cold start | `cli` | `time ./target/release/ag version` | < 300 ms (M2.1) |
+| T22 | Binary size | `cli` | `du -h target/release/zcode` | < 12 MB (M2.4) |
+| T23 | Cold start | `cli` | `time ./target/release/zcode version` | < 300 ms (M2.1) |
 
 All network/PTY/LSP/MCP/LLM-live tests are `#[ignore]`'d or gated behind a `network`/`integration` feature so `cargo test --workspace` is deterministic (NFR-REL-01). Hermetic tests use `tempfile` + in-process fakes.
 
@@ -396,13 +396,13 @@ Architecture gates (new for v0.2): `cargo tree -p domain`/`-p app` pure; `make c
 
 ## 11. Observability, Reliability, Stability & Security
 
-**Observability** — `JsonTelemetry` emits one JSON event per LLM delta/tool-result/finish (NFR-OBS-01); `flush_report` writes `.ag/reports/<ts>-<session>.json` matching the documented schema (NFR-OBS-02). `LlmFinish` carries provider-reported token counts for cost attribution. `log`/`env_logger` wired in CLI for `RUST_LOG` debug; `LoggerPort` trait kept in domain for future structured adoption.
+**Observability** — `JsonTelemetry` emits one JSON event per LLM delta/tool-result/finish (NFR-OBS-01); `flush_report` writes `.zcode/reports/<ts>-<session>.json` matching the documented schema (NFR-OBS-02). `LlmFinish` carries provider-reported token counts for cost attribution. `log`/`env_logger` wired in CLI for `RUST_LOG` debug; `LoggerPort` trait kept in domain for future structured adoption.
 
 **Reliability** — `wire()` fails fast with typed `AppError::Config`/`AppError::Port` when a provider key or MCP server is misconfigured (NFR-REL-01, NFR-REL-02). `App::execute` wraps each turn in a checkpoint so a `Ctrl-C`/kill resumes from the last good step (NFR-REL-03, FR-SESSION-06). All child processes (MCP, LSP, shell, PTY) are held in RAII guards and `drop()`-killed on exit (NFR-REL-04). `cargo test` is hermetic by design (T1–T9, T12–T17, T20–T23 are pure; T10/T11/T5/T19 `#[ignore]`'d).
 
 **Stability** — `panic = abort` + `lto = thin` + `codegen-units = 1` + `strip = symbols` (PRD NFR-PERF-05). `#[forbid(unsafe_code)]` in `cli` and `domain`; `unsafe` only in `infra/shell` behind the `pty` feature for termios (NFR-PORT-02). `deny.toml` bans copyleft; CI runs `cargo audit` (NFR-SEC-03). No `unsafe` in app/tools/telemetry/session/mcp (only `infra/shell` PTY path).
 
-**Security** — secrets read **by name** from env at `wire()`, never written to disk (FR-CONFIG-03, NFR-SEC-01); `.ag/toml.local`, `.ag/skills`, `.ag/sessions`, `target/`, `*.profraw` already gitignored; `make secrets-scan` (T23) flags any committed key. Shell tool is gated by the `GuardedShell` allowlist decorator applying `shell.allowed` regex to **every** command segment, default-deny on empty list (NFR-SEC-02, FR-CONFIG-04/05). `ag:skill` path-traversal guarded (must resolve inside `skills_dir`). ratatui output is plain text; tool results are not interpreted as terminal escapes (NFR-SEC-04).
+**Security** — secrets read **by name** from env at `wire()`, never written to disk (FR-CONFIG-03, NFR-SEC-01); `.zcode/toml.local`, `.zcode/skills`, `.zcode/sessions`, `target/`, `*.profraw` already gitignored; `make secrets-scan` (T23) flags any committed key. Shell tool is gated by the `GuardedShell` allowlist decorator applying `shell.allowed` regex to **every** command segment, default-deny on empty list (NFR-SEC-02, FR-CONFIG-04/05). `zcode:skill` path-traversal guarded (must resolve inside `skills_dir`). ratatui output is plain text; tool results are not interpreted as terminal escapes (NFR-SEC-04).
 
 ## 12. Implementation Roadmap (task ordering)
 

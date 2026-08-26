@@ -1,8 +1,8 @@
-# Technical Plan: Initial Project Scaffolding — QAgent (`ag`) in Rust
+# Technical Plan: Initial Project Scaffolding — zcode in Rust
 
 **Plan ID:** TP-SCAFFOLD-001
 **Derived from:** `docs/prd/initial-scaffolding/prd.md`
-**Target:** QAgent v0.1.0 — Clean Architecture foundation in Rust
+**Target:** zcode v0.1.0 — Clean Architecture foundation in Rust
 **Lead Engineer:** Backend Team
 **Status:** Final (ready for implementation)
 
@@ -10,7 +10,7 @@
 
 ## 1. Executive Summary
 
-This plan scaffolds the **initial, non-behavioral** codebase for `ag` (QAgent), the Rust-native terminal coding agent that mirrors OpenCode's capabilities while cutting memory and cold-start cost. Success is **structural**: a compilable, tested, lint-clean, dependency-inverted Cargo workspace with seven functional crates and zero user-facing agent behavior.
+This plan scaffolds the **initial, non-behavioral** codebase for `zcode` (zcode), the Rust-native terminal coding agent that mirrors OpenCode's capabilities while cutting memory and cold-start cost. Success is **structural**: a compilable, tested, lint-clean, dependency-inverted Cargo workspace with seven functional crates and zero user-facing agent behavior.
 
 No LLM calls, no chat loop, no PTY sessions, no plugin loading runtime ship in v0.1. The scaffolding delivers **traits, entities, a composition root, a `version` subcommand, and all quality gates** so future milestones inherit clean boundaries and a <300 ms cold start.
 
@@ -61,7 +61,7 @@ Pure stdlib crate: `entities` (`Task`, `FileEdit`, `ShellCommand`, `Plugin`, `Ag
 - `crates/infra/llm` — `LlmPort` impl (OpenAI-compatible trait impl only; **no network token**, stubs stream type).
 - `crates/infra/filesystem` — `FileSystemPort` impl backed by `std::fs`.
 - `crates/infra/shell` — `ShellPort` impl backed by `std::process::Command`.
-- `crates/infra/config` — config model + TOML/env loader (`ag.toml`).
+- `crates/infra/config` — config model + TOML/env loader (`zcode.toml`).
 
 ### 4.5 Interface crate (`crates/cli`)
 `clap v4` CLI with `version` subcommand; **composition root** that wires concrete ports into `App`; embeds build metadata via `vergen gix`.
@@ -98,12 +98,12 @@ members = [
 exclude = ["target"]
 
 [workspace.package]
-name = "ag"
+name = "zcode"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.80"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/qagent/ag"
+repository = "https://github.com/zainul/zcode"
 
 [workspace.dependencies]
 tokio = { version = "1.39", default-features = false, features = ["rt"] }
@@ -185,7 +185,7 @@ wildcards = "allow"
 /target
 **/*.rs.bk
 .env
-ag.toml.local
+zcode.toml.local
 .coverage/
 *.profraw
 ```
@@ -491,14 +491,14 @@ mod tests {
 
 **`crates/infra/shell`** — `std::process::Command`-wrapped `ShellPort::run`/`spawn`. Tests via `echo` on Unix.
 
-**`crates/infra/config`** — `ConfigSchema` serde struct + `Loader` combining `std::env` and `ag.toml` (via `toml`). Default `ag.toml` example committed under `crates/infra/config/examples/ag.example.toml`.
+**`crates/infra/config`** — `ConfigSchema` serde struct + `Loader` combining `std::env` and `zcode.toml` (via `toml`). Default `zcode.toml` example committed under `crates/infra/config/examples/zcode.example.toml`.
 
 ### 5.5 Interface crate — `crates/cli`
 
 **`Cargo.toml`**
 ```toml
 [package]
-name = "ag"
+name = "zcode"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -541,15 +541,15 @@ use std::process::ExitCode;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
-    if let Err(e) = ag::cli::run().await {
-        eprintln!("ag: {e}");
+    if let Err(e) = zcode::cli::run().await {
+        eprintln!("zcode: {e}");
         return ExitCode::from(1);
     }
     ExitCode::SUCCESS
 }
 ```
 
-**`src/lib.rs`** exports `pub mod cli;` so integration tests can call `ag::cli::run()`.
+**`src/lib.rs`** exports `pub mod cli;` so integration tests can call `zcode::cli::run()`.
 
 **`src/cli/mod.rs`** — `clap` CLI + composition root:
 ```rust
@@ -558,7 +558,7 @@ use std::sync::Arc;
 
 /// CLI definition parsed with clap v4 derive (FR-CLI-02).
 #[derive(Parser)]
-#[command(name = "ag", version, about = "QAgent — the lean Rust coding agent")]
+#[command(name = "zcode", version, about = "zcode — the lean Rust coding agent")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
@@ -578,7 +578,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cli = Cli::try_parse()?;
     match cli.command {
         Commands::Version => {
-            println!("ag v{} (git: {}, profile: {})", VERSION, GIT_SHA, BUILD_PROFILE);
+            println!("zcode v{} (git: {}, profile: {})", VERSION, GIT_SHA, BUILD_PROFILE);
             Ok(())
         }
     }
@@ -592,7 +592,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 **`benches/Cargo.toml`**
 ```toml
 [package]
-name = "ag-benches"
+name = "zcode-benches"
 version.workspace = true
 edition.workspace = true
 publish = false
@@ -630,9 +630,9 @@ bench = false
 | T5 | Docs build | all | `cargo doc --no-deps` | exit 0 |
 | T6 | Domain purity | `domain` | `cargo tree -p domain` | no `[j`-`/cargo:` lines |
 | T7 | Dependency acyclicity | workspace | `cargo-depgraph` script | matches §3 graph |
-| T8 | Version runs | `cli` | `cargo run -q -- version` | prints `ag v0.1.0 (git: …, profile: …)` |
+| T8 | Version runs | `cli` | `cargo run -q -- version` | prints `zcode v0.1.0 (git: …, profile: …)` |
 | T9 | Cold start < 300 ms | `cli` | `time cargo run --release -- version` | wall < 300 ms (measured next milestone) |
-| T10 | Release binary size | `cli` | `ls -la target/release/ag` | < 8 MB (leading indicator L2) |
+| T10 | Release binary size | `cli` | `ls -la target/release/zcode` | < 8 MB (leading indicator L2) |
 | T11 | LLM stub no network | `infra-llm` | unit test | `send()` returns `Err` |
 | T12 | Filesystem impl round-trip | `infra-filesystem` | tempdir read/write/list/exists | round-trip ok, idempotent |
 | T13 | Shell impl runs | `infra-shell` | `run("echo qagent")` | stdout contains `qagent` |
@@ -671,7 +671,7 @@ cargo run --quiet -- version             # T8
 | Metric | Threshold | Verified by |
 |--------|-----------|-------------|
 | L1 Compile time | `cargo build --release` cold < 180 s | manual |
-| L2 Binary size | release `ag` < 8 MB | T10 |
+| L2 Binary size | release `zcode` < 8 MB | T10 |
 | L3 Dep edges | infra direct deps ≤ 15 | `cargo tree` |
 
 ---
@@ -717,7 +717,7 @@ cargo run --quiet -- version             # T8
 - `lto = "thin"`, `codegen-units = 1`, `panic = "abort"`, `strip = "symbol"` minimize binary bloat & abort cost (NFR-PERF-03).
 
 ### Security
-- `.gitignore` excludes `.env`, `ag.toml.local`, `target/`; no hardcoded secrets (NFR-SEC-01).
+- `.gitignore` excludes `.env`, `zcode.toml.local`, `target/`; no hardcoded secrets (NFR-SEC-01).
 - LLM adapter deliberately exposes **no API key field** wired to network in v0.1 (Out of Scope); config loader stores secrets only in-process env, never written to disk (§5.4).
 - Supply-chain `deny.toml` (§5.1) gates dependencies to approved licenses.
 - Filesystem/Shell adapters operate on explicit `Path`/`ShellCommand` inputs — no ambient shell=True (no shell-injection surface at this layer).

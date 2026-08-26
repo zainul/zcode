@@ -1,35 +1,38 @@
 [package]
-name = "ag"
+name = "zcode"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-domain = { path = "../domain", version = "0.1.0" }
-app = { path = "../app", version = "0.1.0" }
-infra-llm = { path = "../infra/llm", version = "0.1.0" }
-infra-filesystem = { path = "../infra/filesystem", version = "0.1.0" }
-infra-shell = { path = "../infra/shell", version = "0.1.0" }
-infra-config = { path = "../infra/config", version = "0.1.0" }
-infra-session = { path = "../infra/session", version = "0.1.0" }
-infra-telemetry = { path = "../infra/telemetry", version = "0.1.0" }
-infra-mcp = { path = "../infra/mcp", version = "0.1.0" }
-infra-lsp = { path = "../infra/lsp", version = "0.1.0" }
-tools = { path = "../tools", version = "0.1.0" }
+domain = { path = "../domain", version = "0.2.0" }
+app = { path = "../app", version = "0.2.0" }
+infra-llm = { path = "../infra/llm", version = "0.2.0" }
+infra-filesystem = { path = "../infra/filesystem", version = "0.2.0" }
+infra-shell = { path = "../infra/shell", version = "0.2.0" }
+infra-config = { path = "../infra/config", version = "0.2.0" }
+infra-session = { path = "../infra/session", version = "0.2.0" }
+infra-telemetry = { path = "../infra/telemetry", version = "0.2.0" }
+tools = { path = "../tools", version = "0.2.0", default-features = false }
 clap = { workspace = true }
-tokio = { workspace = true, features = ["rt", "macros", "time"] }
 log = { workspace = true }
 env_logger = { workspace = true }
 ratatui = { workspace = true }
-crossterm = { workspace = true }
 uuid = { workspace = true }
 signal-hook = { workspace = true }
 serde_json = { workspace = true }
 
+[dev-dependencies]
+tempfile = { workspace = true }
+
 [features]
-default = []
+default = ["mcp", "lsp"]
+# Forwarded to `tools`, which owns the optional adapters. Building with
+# --no-default-features drops the MCP and LSP clients from the binary.
+mcp = ["tools/mcp"]
+lsp = ["tools/lsp"]
 pty = ["infra-shell/pty"]
 
 [build-dependencies]
-# Build script embeds git SHA + profile; no external deps for Rust 1.80 compat.
+# Build script embeds the git SHA + profile; no external build deps.

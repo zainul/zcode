@@ -293,7 +293,7 @@ pub struct TelemetryEvent {
     pub extra: Box<[(String, ExtraField)]>,
 }
 
-/// Accumulated totals written into `.ag/reports/<ts>-<session>.json` (M1.7).
+/// Accumulated totals written into `.zcode/reports/<ts>-<session>.json` (M1.7).
 #[derive(Clone, Debug)]
 pub struct TelemetryTotals {
     pub model: String,

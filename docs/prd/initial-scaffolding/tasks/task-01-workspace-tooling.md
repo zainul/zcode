@@ -2,7 +2,7 @@
 
 **Related PRD sections:** FR-TOOL-01..06, NFR-BUILD-01..03, FR-PERF-01/03
 **Depends on:** none (foundation task)
-**Status:** To do
+**Status:** Done
 
 ## Objective
 Establish the Cargo workspace, pin the toolchain, and configure all static quality tooling so every subsequent crate inherits consistent builds, formatting, and lint rules.
@@ -15,7 +15,7 @@ Establish the Cargo workspace, pin the toolchain, and configure all static quali
 4. Create `rustfmt.toml` (edition 2021, max_width 100, tab_spaces 4, wrap_comments).
 5. Create `clippy.toml` (msrv 1.80.0).
 6. Create `deny.toml` (advisories, licenses: allow OSI/FSF free, deny copyleft).
-7. Create `.gitignore` (`./target`, `.env`, `ag.toml.local`, `*.profraw`, `.coverage/`).
+7. Create `.gitignore` (`./target`, `.env`, `zcode.toml.local`, `*.profraw`, `.coverage/`).
 
 ## File tree created
 ```
@@ -34,7 +34,7 @@ deny.toml
 ## How to verify
 ```
 rustup show                          # toolchain == 1.80.0, components present
-cargo metadata --no-deps --format-version 1 | grep '"name":"ag"'   # workspace root resolves
+cargo metadata --no-deps --format-version 1 | grep '"name":"zcode"'   # workspace root resolves
 cargo fmt --check                    # no diff (T4)
 cargo build                          # compiles, 0 warnings (T1)
 cat target/.rustc_info.json &>/dev/null; true   # sanity that target is writable

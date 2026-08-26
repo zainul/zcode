@@ -2,7 +2,7 @@
 
 **Related PRD sections:** §3.1 infra, §3.2 LlmPort, Out-of-Scope #1 (no network calls)
 **Depends on:** task-02 (Domain)
-**Status:** To do
+**Status:** Done
 
 ## Objective
 Implement the OpenAI-compatible `LlmPort` in `crates/infra/llm`. Deliver the trait impl shape **only** — no API key field wired to a network request in v0.1.0 (per Out of Scope #1). A unit test asserts the stub never reaches the network.

@@ -2,7 +2,7 @@
 
 **Related PRD sections:** §3.1 infra, §3.2 ShellPort, Out-of-Scope #4
 **Depends on:** task-02 (Domain)
-**Status:** To do
+**Status:** Done
 
 ## Objective
 Implement `ShellPort` for `crates/infra/shell` using `std::process::Command`. `run` captures stdout; `spawn` is a stub returning `Err` (persistent PTY sessions deferred). Tests use a portable command (`echo`/`printf`).
