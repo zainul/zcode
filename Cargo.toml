@@ -18,13 +18,15 @@ members = [
 exclude = ["target"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/qagent/ag"
+repository = "https://github.com/zainul/zcode"
 
 [workspace.dependencies]
+# Pinned for a future async surface; nothing depends on it today — the agent
+# runs on std threads so there is no runtime to pay for (see crates/cli/src/main.rs).
 tokio = { version = "1.39", default-features = false, features = ["rt", "macros"] }
 clap = { version = "4.5", features = ["derive"] }
 toml = "0.8"

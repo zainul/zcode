@@ -2,7 +2,7 @@
 
 **Related PRD sections:** §3.4 Model & Provider Agnosticism (FR-MODEL-01..08), §3.6 Telemetry (FR-OUTPUT-03/04/05), §8 DQ3 (HTTP) / DQ2 (token counting)
 **Depends on:** task-02 (Domain — evolved `LlmPort` from §4.1 of the technical plan), task-20 (config `Provider` + `api_key_env`)
-**Status:** To do
+**Status:** Done
 **Priority:** High (the engine loop cannot run without a working `LlmPort`)
 
 ## Objective

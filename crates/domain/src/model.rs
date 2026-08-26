@@ -103,12 +103,30 @@ impl CancelFlag {
         (Self(flag.clone()), Self(flag))
     }
 
+    /// Wrap a flag owned by someone else — e.g. the `Arc<AtomicBool>` a
+    /// signal handler writes to. Lets the CLI register SIGINT without the
+    /// domain knowing anything about signals.
+    pub fn from_shared(flag: Arc<AtomicBool>) -> Self {
+        Self(flag)
+    }
+
+    /// The underlying flag, for handing to an external registrar.
+    pub fn shared(&self) -> Arc<AtomicBool> {
+        self.0.clone()
+    }
+
     pub fn triggered(&self) -> bool {
         self.0.load(Ordering::SeqCst)
     }
 
     pub fn trigger(&self) {
         self.0.store(true, Ordering::SeqCst);
+    }
+
+    /// Clear the flag. The REPL calls this after a cancelled turn so the next
+    /// prompt is not aborted before it starts.
+    pub fn reset(&self) {
+        self.0.store(false, Ordering::SeqCst);
     }
 }
 

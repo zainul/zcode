@@ -2,7 +2,7 @@
 
 **Related PRD sections:** §3.8 Engine Loop (FR-LOOP-01..04), §3.5 Agent Mode Switching (FR-MODE-01..04), §3.8 FR-TOOL-FS/SHELL dispatch, §3.7 allowlist, §3.2 checkpoint, §3.6 telemetry emission, §5 NFR-REL-03 (crash recovery)
 **Depends on:** task-12 (LlmPort), task-15 (ToolRegistry), task-18 (SessionStorePort), task-19 (TelemetryPort), task-20 (Config)
-**Status:** To do
+**Status:** Done
 **Priority:** High (the central deliverable — the actual agent loop)
 
 ## Objective
@@ -79,7 +79,7 @@ fn execute(&mut self, ctx, req) -> Result<ExecutionResult, AppError>:
 
 ### 4. Mode gating (FR-MODE-01/02/03/04)
 
-`execute_only_tools` for `Build` = `[write, str_replace_editor, shell, ag:skill? no, lsp::rename_symbol]`; for `Planning` the engine **refuses** any tool whose name starts with `write`/`str_replace_editor`/`shell`/`lsp::rename_symbol` and instead prompts the LLM to confirm. Read-only tools (`read`, `list_dir`, `hover`, `find_references`, MCP reads) remain available in Planning (FR-MODE-01). Mode is stored in session metadata + every telemetry event (FR-MODE-04).
+`execute_only_tools` for `Build` = `[write, str_replace_editor, shell, zcode:skill? no, lsp::rename_symbol]`; for `Planning` the engine **refuses** any tool whose name starts with `write`/`str_replace_editor`/`shell`/`lsp::rename_symbol` and instead prompts the LLM to confirm. Read-only tools (`read`, `list_dir`, `hover`, `find_references`, MCP reads) remain available in Planning (FR-MODE-01). Mode is stored in session metadata + every telemetry event (FR-MODE-04).
 
 A tiny mode→system-prompt template map lives in `domain::modes` (§FR-MODE-03: "prompt templates + tool restriction" — orchestrate-only, no external files):
 
@@ -124,8 +124,8 @@ Provide `#[cfg(test)]` structs mirroring v0.1's Noop* pattern but richer:
 
 ## Test-case scenario
 
-- Headless: `ag run "rename foo to bar in crates/domain/src/model.rs"` → engine streams deltas → emits one `Finish(ToolUse)` with `str_replace_editor` args → `ToolRegistry` applies the edit → second turn `Finish(Stop)` → final text + `.ag/reports/<ts>-<session>.json`.
-- Planning: `ag run --mode planning "show me how to rename foo"` → engine refuses `write`/`str_replace` and reports `AppError::Tool("denied in planning")`.
+- Headless: `zcode run "rename foo to bar in crates/domain/src/model.rs"` → engine streams deltas → emits one `Finish(ToolUse)` with `str_replace_editor` args → `ToolRegistry` applies the edit → second turn `Finish(Stop)` → final text + `.zcode/reports/<ts>-<session>.json`.
+- Planning: `zcode run --mode planning "show me how to rename foo"` → engine refuses `write`/`str_replace` and reports `AppError::Tool("denied in planning")`.
 - Ctrl-C mid-loop → partial session checkpointed + report flushed (FR-IFACE-05).
 
 ## How to verify
@@ -145,5 +145,5 @@ cargo tree -p app                        # must show only: domain, thiserror (FR
 
 ## Notes / risks
 
-- The loop is **synchronous** by design (DQ4). The TUI (task-17) runs this on a worker `std::thread` and receives `UiEvent`s; headless `ag run` runs inline. Keeping `app` single-threaded and sync is what lets `domain`/`app` stay dep-free.
+- The loop is **synchronous** by design (DQ4). The TUI (task-17) runs this on a worker `std::thread` and receives `UiEvent`s; headless `zcode run` runs inline. Keeping `app` single-threaded and sync is what lets `domain`/`app` stay dep-free.
 - `ToolResult` content is capped **after** the tool returns but **before** it enters history, so the LLM never sees >16k chars of tool output in one turn (FR-LOOP-04 memory guard, NFR-PERF-03).

@@ -2,7 +2,7 @@
 
 **Related PRD sections:** §3.1 infra, §3.2 FileSystemPort, Out-of-Scope #3
 **Depends on:** task-02 (Domain)
-**Status:** To do
+**Status:** Done
 
 ## Objective
 Implement `FileSystemPort` for `crates/infra/filesystem` backed by `std::fs`. Provides `read`, `write`, `list`, `exists`, `watch` (watch is a stub). Tests use `tempfile` under `#[cfg(test)]` to be hermetic.

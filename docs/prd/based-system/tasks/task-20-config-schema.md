@@ -2,12 +2,12 @@
 
 **Related PRD sections:** §3.7 Configuration & Allowed Commands (FR-CONFIG-01..06), §3.5 Agent Mode Switching (FR-MODE-03), §3.6 Structured Output, §5 Out of Scope, §8 Assumptions (env > file precedence)
 **Depends on:** task-01, task-07 (extend existing `infra/config`)
-**Status:** To do
+**Status:** Done
 **Priority:** High (foundation — `wire()` and every other task consume `Config`)
 
 ## Objective
 
-Extend the v0.1 `Config` model and `Loader` so `ag.toml` + `AG_*` env vars drive provider selection, MCP server list, LSP server registry, shell allowlist, skills dir, agent mode, and loop caps. Secrets are resolved **by name** from env at compose time; nothing is persisted to disk. Env always overrides file (FR-CONFIG-04 / §8).
+Extend the v0.1 `Config` model and `Loader` so `zcode.toml` + `ZCODE_*` env vars drive provider selection, MCP server list, LSP server registry, shell allowlist, skills dir, agent mode, and loop caps. Secrets are resolved **by name** from env at compose time; nothing is persisted to disk. Env always overrides file (FR-CONFIG-04 / §8).
 
 ## Step-by-step
 
@@ -19,7 +19,7 @@ Add nested sections to `Config`:
 pub struct Config {
     pub provider: Provider,            // FR-CONFIG-02
     pub model: String,                // already exists, kept
-    pub api_key_env: String,          // name of env var, e.g. "AG_OPENAI_API_KEY" (FR-CONFIG-03)
+    pub api_key_env: String,          // name of env var, e.g. "ZCODE_OPENAI_API_KEY" (FR-CONFIG-03)
     pub base_url: Option<String>,     // override default endpoint (vLLM/Ollama/OpenAI-compatible)
     pub working_dir: PathBuf,         // already exists
     pub env: Vec<(String, String)>,   // already exists
@@ -30,7 +30,7 @@ pub struct Config {
     pub mcp_servers: Box<[McpServerConfig]>, // FR-MCP-02
     pub lsp_servers: Box<[LspServerConfig]>, // FR-LSP-03
     pub shell_allowed: Box<[String]>,         // FR-CONFIG-04 (regex patterns)
-    pub skills_dir: PathBuf,                 // FR-CONFIG-06 (default .ag/skills)
+    pub skills_dir: PathBuf,                 // FR-CONFIG-06 (default .zcode/skills)
     pub mode: AgentMode,                     // FR-MODE-01 (Planning/Build; default Build)
 }
 ```
@@ -68,18 +68,18 @@ Add `ConfigError` variants: `UnknownProvider(String)`, `MissingSecret(String)`, 
 
 ### 3. Defaults tuned to PRD
 
-`max_turns = 20`, `max_tokens = 16384`, `max_tool_output_chars = 16000`, `mode = Build`, `skills_dir = <working_dir>/.ag/skills`, `provider = Openai`, `model = "gpt-4o-mini"` (unchanged default).
+`max_turns = 20`, `max_tokens = 16384`, `max_tool_output_chars = 16000`, `mode = Build`, `skills_dir = <working_dir>/.zcode/skills`, `provider = Openai`, `model = "gpt-4o-mini"` (unchanged default).
 
-### 4. Extend `examples/ag.example.toml`
+### 4. Extend `examples/zcode.example.toml`
 
 Document every new key with comments + the secrets-by-name rule (FR-CONFIG-03).
 
 ### 5. Tests (`#[cfg(test)]`)
 
-- `env_overrides_file_and_provider`: set `AG_PROVIDER=anthropic`, assert parsed `Provider::Anthropic`.
+- `env_overrides_file_and_provider`: set `ZCODE_PROVIDER=anthropic`, assert parsed `Provider::Anthropic`.
 - `empty_allowed_is_deny_all`: config with `shell_allowed = []` → `config.shell_allowed.is_empty()` true.
 - `unknown_provider_errors`: file has `provider = "bogus"` → `ConfigError::UnknownProvider`.
-- `resolve_api_key_missing`: `api_key_env = "AG_NONEXISTENT"` → `MissingSecret`.
+- `resolve_api_key_missing`: `api_key_env = "ZCODE_NONEXISTENT"` → `MissingSecret`.
 - `mcp_servers_parsed`: two `[[mcp.servers]]` tables deserialize to 2 entries.
 - `default_caps_match_prd`: `Config::default().max_turns == 20`.
 
@@ -87,7 +87,7 @@ Document every new key with comments + the secrets-by-name rule (FR-CONFIG-03).
 
 ## Test-case scenario
 
-- `ag.toml` sets `provider="openrouter"`, `model="google/gemini-2.0-flash"`, `api_key_env="AG_OPENROUTER_API_KEY"`, two MCP servers, three LSP servers, `shell.allowed=["git .*", "cargo .*"]`, `mode="planning"`, `skills_dir=".ag/skills"`. Loader merges, `AG_MODEL=gpt-4o` overrides only the model, `resolve_api_key()` reads `AG_OPENROUTER_API_KEY` from env.
+- `zcode.toml` sets `provider="openrouter"`, `model="google/gemini-2.0-flash"`, `api_key_env="ZCODE_OPENROUTER_API_KEY"`, two MCP servers, three LSP servers, `shell.allowed=["git .*", "cargo .*"]`, `mode="planning"`, `skills_dir=".zcode/skills"`. Loader merges, `ZCODE_MODEL=gpt-4o` overrides only the model, `resolve_api_key()` reads `ZCODE_OPENROUTER_API_KEY` from env.
 
 ## How to verify
 
@@ -107,4 +107,4 @@ cargo doc -p infra-config --no-deps
 ## Open questions resolved here
 
 - **Q (DQ11):** Single `Config` struct vs. split files? → single struct, nested sections (chosen).
-- **Secrets storage:** env-by-name at `wire()`, confirmed here; `ag.toml.local` stays gitignored (already in `.gitignore`).
+- **Secrets storage:** env-by-name at `wire()`, confirmed here; `zcode.toml.local` stays gitignored (already in `.gitignore`).

@@ -24,6 +24,29 @@ impl Default for StdFs {
     }
 }
 
+impl StdFs {
+    /// Atomic write: write `<path>.tmp` then rename over the target
+    /// (FR-TOOL-FS-02). A same-filesystem rename is atomic, so a crash mid-write
+    /// leaves the previous file intact rather than a half-written one.
+    ///
+    /// This is an inherent method rather than a `FileSystemPort` addition: the
+    /// port stays minimal, and only the native write tools need the guarantee.
+    pub fn write_atomic(&self, path: &Path, content: &str) -> Result<(), io::Error> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        let tmp = path.with_extension("zcode-tmp");
+        {
+            let mut f = fs::File::create(&tmp)?;
+            io::Write::write_all(&mut f, content.as_bytes())?;
+            f.sync_all()?;
+        }
+        fs::rename(&tmp, path)
+    }
+}
+
 impl domain::FileSystemPort for StdFs {
     fn read(&self, path: &Path) -> Result<String, Box<dyn Error + Send + Sync>> {
         let content = fs::read_to_string(path)?;

@@ -2,7 +2,7 @@
 
 **Related PRD sections:** FR-DOC-01..05, US-C-03
 **Depends on:** task-01 (so crate map is stable)
-**Status:** To do
+**Status:** Done
 
 ## Objective
 Produce the contributor-facing docs that make architecture, layer rules, and quick-start discoverable from a fresh clone.

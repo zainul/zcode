@@ -1,4 +1,4 @@
-# Code Review: Initial Scaffolding — QAgent (`ag`) v0.1.0
+# Code Review: Initial Scaffolding — zcode v0.1.0
 
 **Review ID:** CR-SCAFFOLD-001  
 **Reviewer:** Senior Tech Lead  
@@ -12,7 +12,7 @@
 
 ## 1. Summary
 
-The initial-scaffolding milestone delivers a complete, compilable Rust Cargo workspace implementing **Clean Architecture** in Rust for the QAgent (`ag`) terminal coding agent. The workspace contains **7 functional crates** plus a criterion benchmark crate, all wired into a strict acyclic dependency graph (`cli → app/infra/* → domain`).
+The initial-scaffolding milestone delivers a complete, compilable Rust Cargo workspace implementing **Clean Architecture** in Rust for the zcode terminal coding agent. The workspace contains **7 functional crates** plus a criterion benchmark crate, all wired into a strict acyclic dependency graph (`cli → app/infra/* → domain`).
 
 The scaffolding establishes the dependency-inversion boundary (port traits in Domain, concrete adapters in Infra), a fail-fast composition root (`wire()`), build-metadata embedding via a custom git-SHA build script, and the full quality-gate toolchain (Makefile, clippy, rustfmt, deny.toml, dependency-check script).
 
@@ -47,7 +47,7 @@ Verification commands run against the live build (see §3 for raw output):
 | FR-DI-03 | `infra/*` → `domain` + external; no `app`/`cli` | ✅ Pass | `dependency-check.sh` infra checks OK |
 | FR-DI-04 | `cli` is composition root, depends on all layers | ✅ Pass | `dependency-check.sh` CLI checks OK |
 | FR-DI-05 | Acyclic dependency assertion | ✅ Pass | `make check-deps` + `dependency-check.sh` green |
-| FR-CLI-01 | `version` prints `ag v<version> (git: <sha>, profile: <profile>)` | ✅ Pass | Output: `ag v0.1.0 (git: d9c7219d…, profile: debug)` |
+| FR-CLI-01 | `version` prints `zcode v<version> (git: <sha>, profile: <profile>)` | ✅ Pass | Output: `zcode v0.1.0 (git: d9c7219d…, profile: debug)` |
 | FR-CLI-02 | `clap v4` derive CLI with `version` subcommand | ✅ Pass | `crates/cli/src/cli/mod.rs` |
 | FR-CLI-03 | Build metadata embedded at compile time | ✅ Pass | `build.rs` emits `VERGEN_GIX_SHA`, `VERGEN_BUILD_PROFILE` |
 | FR-CLI-04 | Composition root fails fast with typed error | ✅ Pass | `wire()` returns `Result<App, AppError>`; `main` maps to exit 1 |
@@ -61,7 +61,7 @@ Verification commands run against the live build (see §3 for raw output):
 | FR-PERF-01 | Release profile `lto = "thin"`, `codegen-units = 1` | ✅ Pass | `[profile.release]` in `Cargo.toml` |
 | FR-PERF-02 | `benches/` criterion placeholder | ✅ Pass (after fix §5.1) | Compiles and runs |
 | FR-PERF-03 | Domain entities use owned types | ✅ Pass | `String`, `PathBuf`, `Box<[String]>`, `Vec<T>` throughout `model.rs` |
-| FR-PERF-04 | `ag.toml.example` documents low-memory defaults | ✅ Pass | `examples/ag.example.toml` present with env-secrets note |
+| FR-PERF-04 | `zcode.toml.example` documents low-memory defaults | ✅ Pass | `examples/zcode.example.toml` present with env-secrets note |
 | NFR-BUILD-01 | Clean build, 0 warnings | ✅ Pass | `cargo build` — no warnings |
 | NFR-BUILD-02 | Reproducible (pinned toolchain) | ✅ Pass | `rust-toolchain.toml` |
 | NFR-BUILD-03 | Minimal default feature set | ✅ Pass | `tokio` uses `default-features = false`, features `["rt", "macros"]` |
@@ -75,7 +75,7 @@ Verification commands run against the live build (see §3 for raw output):
 | NFR-MAINT-05 | `deny.toml` present | ✅ Pass | Present |
 | NFR-PORT-01 | Tier-1 targets (Linux x86_64, macOS aarch64) | ✅ N/A | Builds on Linux x86_64; macOS not tested in this environment |
 | NFR-PORT-02 | Zero `unsafe` in Domain/App | ✅ Pass | `grep` finds no `unsafe` blocks outside the `#![forbid]` declaration; Domain/App are clean |
-| NFR-SEC-01 | No secrets in repo | ✅ Pass | `.gitignore` excludes `.env`, `ag.toml.local`; config secrets from env only |
+| NFR-SEC-01 | No secrets in repo | ✅ Pass | `.gitignore` excludes `.env`, `zcode.toml.local`; config secrets from env only |
 | NFR-SEC-02 | Supply-chain `deny.toml` | ✅ Present | Present; audit is CI-only per PRD |
 
 ### Out-of-Scope verification (all correctly excluded)
@@ -102,7 +102,7 @@ All commands run from workspace root with toolchain 1.85.0:
 
 ```
 $ cargo build
-   Compiling ag v0.1.0 (/workspace/crates/cli)
+   Compiling zcode v0.1.0 (/workspace/crates/cli)
     Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.57s
   [0 warnings]
 
@@ -110,7 +110,7 @@ $ cargo fmt --check
   [exit 0 — no diff]
 
 $ cargo clippy --workspace -- -D warnings
-   Compiling ag v0.1.0 (/workspace/crates/cli)
+   Compiling zcode v0.1.0 (/workspace/crates/cli)
     Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.06s
   [0 warnings]
 
@@ -119,7 +119,7 @@ $ cargo test --workspace
   18 unit tests across all crates, 0 failures
 
 $ cargo doc --no-deps --workspace
-    Generated /workspace/target/doc/ag/index.html and 7 other files
+    Generated /workspace/target/doc/zcode/index.html and 7 other files
   [exit 0]
 
 $ cargo tree -p domain
@@ -127,7 +127,7 @@ domain v0.1.0 (/workspace/crates/domain)
   [stdlib only — no cargo:/[j] lines]
 
 $ cargo run --quiet -- version
-ag v0.1.0 (git: d9c7219d3f6d80e4a9027cc556aabf7812eb0e08, profile: debug)
+zcode v0.1.0 (git: d9c7219d3f6d80e4a9027cc556aabf7812eb0e08, profile: debug)
   [exit 0]
 
 $ make check-deps
@@ -142,7 +142,7 @@ OK: cli depends on domain / app / infra-llm / infra-filesystem / infra-shell / i
 All dependency checks passed.
   [exit 0]
 
-$ cargo bench -p ag-benches --bench smoke -- --quick
+$ cargo bench -p zcode-benches --bench smoke -- --quick
 smoke/Task::construct          time:   [160.52 ns 180.02 ns 184.90 ns]
 smoke/FileEdit::construct      time:   [165.86 ns 165.98 ns 166.01 ns]
 smoke/DomainError::format      time:   [165.98 ns 166.36 ns 167.84 ns]
@@ -151,11 +151,11 @@ smoke/DomainError::format      time:   [165.98 ns 166.36 ns 167.84 ns]
 $ cargo build --release
     Finished `release` profile [optimized] target(s) in 17.00s
 
-$ ./target/release/ag version
-ag v0.1.0 (git: d9c7219d3f6d80e4a9027cc556aabf7812eb0e08, profile: release)
+$ ./target/release/zcode version
+zcode v0.1.0 (git: d9c7219d3f6d80e4a9027cc556aabf7812eb0e08, profile: release)
 
-$ du -h target/release/ag
-736K    target/release/ag    [well under 8 MB L2 threshold]
+$ du -h target/release/zcode
+736K    target/release/zcode    [well under 8 MB L2 threshold]
 
 $ # Cold-start timing (release binary, 3 runs)
 Run 1: 8ms
@@ -182,7 +182,7 @@ crates/cli/src/main.rs:#![forbid(unsafe_code)]
 
 - **Dependency inversion is correctly enforced.** The five port traits (`LlmPort`, `FileSystemPort`, `ShellPort`, `PluginRegistryPort`, `LoggerPort`) are declared in `domain::ports` with no infra coupling. Each infra adapter implements the trait from the `domain` crate. The `dependency-check.sh` script and `make check-deps` provide automated enforcement.
 - **Composition root is clean.** `cli/src/cli/mod.rs::wire()` constructs `Arc::new(OpenAiLlm::new(...))`, `Arc::new(StdFs::new())`, etc., wraps them as `Arc<dyn Port>` type-objects, and passes them to `App::new(...)`. The `NullPluginRegistry` and `NullLogger` stubs correctly avoid pulling in unused infra.
-- **Fail-fast error handling in the composition root.** `wire()` returns `Result<App, AppError>`; `main.rs` maps errors to `eprintln!("ag: {e}")` + `ExitCode::from(1)`. No panic traces (NFR-REL-01/02 satisfied).
+- **Fail-fast error handling in the composition root.** `wire()` returns `Result<App, AppError>`; `main.rs` maps errors to `eprintln!("zcode: {e}")` + `ExitCode::from(1)`. No panic traces (NFR-REL-01/02 satisfied).
 - **The `App<const N: usize = 4>` generic** is a forward-looking hook (per technical-plan §5.3 note). It is unused but properly annotated with `#[allow(dead_code)]` on the struct and clippy passes.
 
 ### 4.2 Domain purity
@@ -201,7 +201,7 @@ Matches the technical-plan DQ3 decision:
 
 ### 4.4 Build metadata strategy
 
-The technical plan (DQ2) specified `vergen-gix`, but the actual `build.rs` implements a **custom git-SHA embedding** using `git rev-parse HEAD` with a `.git/HEAD` file fallback. The in-code comment explains this was necessitated because `vergen-gix` requires Rust >= 1.88 (beyond the pinned toolchain). This is a **pragmatic, well-documented deviation** that produces correct output (`ag v0.1.0 (git: <sha>, profile: debug)`). No action required, but the PRD/technical-plan should be updated to reflect the actual strategy.
+The technical plan (DQ2) specified `vergen-gix`, but the actual `build.rs` implements a **custom git-SHA embedding** using `git rev-parse HEAD` with a `.git/HEAD` file fallback. The in-code comment explains this was necessitated because `vergen-gix` requires Rust >= 1.88 (beyond the pinned toolchain). This is a **pragmatic, well-documented deviation** that produces correct output (`zcode v0.1.0 (git: <sha>, profile: debug)`). No action required, but the PRD/technical-plan should be updated to reflect the actual strategy.
 
 ### 4.5 Test coverage
 
@@ -225,8 +225,8 @@ The technical plan (DQ2) specified `vergen-gix`, but the actual `build.rs` imple
 ### 4.7 Security
 
 - `#![forbid(unsafe_code)]` in `cli/src/main.rs` — NFR-PORT-02 satisfied. No `unsafe` blocks exist anywhere in Domain/App.
-- `.gitignore` covers `.env`, `ag.toml.local`, `target/`, `*.profraw`, `.coverage/`.
-- Config loader reads secrets from `AG_*` env vars only; `ag.example.toml` explicitly documents that secrets never come from the file.
+- `.gitignore` covers `.env`, `zcode.toml.local`, `target/`, `*.profraw`, `.coverage/`.
+- Config loader reads secrets from `ZCODE_*` env vars only; `zcode.example.toml` explicitly documents that secrets never come from the file.
 - Shell adapter passes commands via `sh -c` as a single argv (documented in task-06); no shell-injection surface at the adapter layer.
 
 ---
@@ -245,7 +245,7 @@ The smoke benchmark used `BenchmarkGroup` without the generic type parameter req
 - Imported `criterion::measurement::WallTime` (the `measurement` module is public in criterion 0.5.1, but the `Measurement` trait itself is not re-exported at the crate root).
 - Changed all three helper functions from `fn construct_task(c: &mut BenchmarkGroup)` to `fn construct_task(c: &mut BenchmarkGroup<'_, WallTime>)`, matching the type returned by `c.benchmark_group("smoke")`.
 
-**Re-verified:** `cargo bench -p ag-benches --bench smoke -- --quick` now compiles and runs, reporting nanosecond-level timings for all three fixtures.
+**Re-verified:** `cargo bench -p zcode-benches --bench smoke -- --quick` now compiles and runs, reporting nanosecond-level timings for all three fixtures.
 
 ### 5.2 MINOR — Unused `thiserror` dependency in `infra-llm`
 
@@ -285,9 +285,9 @@ quiet-workspaces = true
 **Severity:** Low  
 **PRD / Technical-plan:** §5.1
 
-The technical plan §5.1 shows `[workspace.package]` with `name = "ag"`, but the actual workspace `Cargo.toml` omits the `name` field. This is harmless (the `ag` binary crate has its own `name = "ag"` in `crates/cli/Cargo.toml`), but it deviates from the documented plan and means there is no single workspace-level package name.
+The technical plan §5.1 shows `[workspace.package]` with `name = "zcode"`, but the actual workspace `Cargo.toml` omits the `name` field. This is harmless (the `zcode` binary crate has its own `name = "zcode"` in `crates/cli/Cargo.toml`), but it deviates from the documented plan and means there is no single workspace-level package name.
 
-**Recommendation:** Add `name = "ag"` to `[workspace.package]` for consistency with the technical plan and to enable workspace-level metadata queries.
+**Recommendation:** Add `name = "zcode"` to `[workspace.package]` for consistency with the technical plan and to enable workspace-level metadata queries.
 
 ### 5.6 MINOR — Missing rustfmt options
 
@@ -309,14 +309,14 @@ The technical plan §5.1 specifies `wrap_comments = true` and `format_code_in_do
 
 Task-08 step 5 explicitly calls for "an integration test `tests/cli.rs` invoking `Cli::try_parse_from`." The actual implementation places these tests as unit tests in the `#[cfg(test)] mod tests` block inside `cli/src/cli/mod.rs` instead of a separate `tests/cli.rs` file.
 
-**Assessment:** The test coverage is equivalent — `Cli::try_parse_from(["ag", "version"])` is tested, and `wire_constructs_app` validates the composition root. The deviation is structural only. If strict task compliance is desired, move the tests to `tests/cli.rs` and make the `cli` module `pub`.
+**Assessment:** The test coverage is equivalent — `Cli::try_parse_from(["zcode", "version"])` is tested, and `wire_constructs_app` validates the composition root. The deviation is structural only. If strict task compliance is desired, move the tests to `tests/cli.rs` and make the `cli` module `pub`.
 
 ### 5.8 MINOR — Stray files in workspace root
 
 **Files:** `.qagent_node_config.env`, `node.json`, `logs/` directory  
 **Severity:** Low
 
-The `.gitignore` includes `.qagent_node_config.env`, `node.json`, and `/logs/`, which are not part of the PRD's specified ignore list (PRD FR-TOOL-03 / NFR-SEC-01 lists `.env`, `target/`, `ag.toml.local`). These appear to be artifacts from another tool in the environment, not from this scaffolding task. They are correctly gitignored but are outside the intended scope of the initial-scaffolding PRD.
+The `.gitignore` includes `.qagent_node_config.env`, `node.json`, and `/logs/`, which are not part of the PRD's specified ignore list (PRD FR-TOOL-03 / NFR-SEC-01 lists `.env`, `target/`, `zcode.toml.local`). These appear to be artifacts from another tool in the environment, not from this scaffolding task. They are correctly gitignored but are outside the intended scope of the initial-scaffolding PRD.
 
 **Recommendation:** Leave as-is (correctly ignored); clean up if these files are not project artifacts.
 
@@ -358,7 +358,7 @@ The `[profile.ci]` profile (inherits from `dev`, `opt-level = 0`) is defined but
 ### Should-fix before merge (strong recommendation)
 2. **Remove unused `thiserror` from `infra-llm`** (§5.2) — reduces dependency edges, improves L3 compliance.
 3. **Add `[term] quiet-workspaces = true` to `.cargo/config.toml`** (§5.4) — PRD compliance.
-4. **Add `name = "ag"` to `[workspace.package]`** (§5.5) — aligns with technical-plan §5.1.
+4. **Add `name = "zcode"` to `[workspace.package]`** (§5.5) — aligns with technical-plan §5.1.
 5. **Document actual toolchain (1.85.0) and build.rs strategy** in PRD/technical-plan — the docs currently specify 1.80.0 and `vergen-gix`, neither of which matches the implementation.
 
 ### Nice-to-have (future iteration)

@@ -2,7 +2,7 @@
 
 **Related PRD sections:** §3.3.2 MCP Integration (FR-MCP-01..05), §3.3 Extensible Tool System, §8 DQ6 (MCP transport)
 **Depends on:** task-02 (Domain — `McpPort` trait defined in §4.3 of technical plan)
-**Status:** To do
+**Status:** Done
 **Priority:** Medium (enables external data sources; graceful degradation keeps the agent usable without it)
 
 ## Objective
@@ -71,7 +71,7 @@ Integration (network/subprocess, `#[ignore]`):
 
 ## Test-case scenario
 
-- `ag.toml` defines `[[mcp.servers]] name="everything", command="npx", args=["-y","@modelcontextprotocol/server-everything"]`. On boot the `ToolRegistry` calls `list_tools` and merges an `everything/*` namespace of tools. `ag tools list` shows them. Killing the server mid-session degrades gracefully (logged, remaining tools usable).
+- `zcode.toml` defines `[[mcp.servers]] name="everything", command="npx", args=["-y","@modelcontextprotocol/server-everything"]`. On boot the `ToolRegistry` calls `list_tools` and merges an `everything/*` namespace of tools. `zcode tools list` shows them. Killing the server mid-session degrades gracefully (logged, remaining tools usable).
 
 ## How to verify
 

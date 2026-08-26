@@ -2,7 +2,7 @@
 
 **Related PRD sections:** FR-TOOL-04/05, FR-DI-05, M1.1..M1.6, NFR-MAINT-01..05
 **Depends on:** all other tasks (final gate)
-**Status:** To do
+**Status:** Done
 
 ## Objective
 Provide a single `Makefile` entrypoint (`make test`, `make lint`, `make fmt`, `make build`, `make bench`, `make check-deps`) and a dependency-direction assertion script so CI and contributors share one source of truth for quality gates.

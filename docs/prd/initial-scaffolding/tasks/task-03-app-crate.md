@@ -2,7 +2,7 @@
 
 **Related PRD sections:** §3.1 App, §3.2 TaskRunner/EditPlanner, FR-DI-02, G3
 **Depends on:** task-02 (Domain)
-**Status:** To do
+**Status:** Done
 
 ## Objective
 Create `crates/app`, the use-case orchestration layer. It depends **only** on `domain` and declares the `TaskRunner` / `EditPlanner` contracts plus an `App` orchestrator parameterized by boxed port trait-objects. Behavior returns a typed `AppError::Port` stub (fail-fast, no panic) — the chat loop ships in a later milestone.

@@ -13,6 +13,7 @@
 pub mod error;
 pub mod model;
 pub mod modes;
+pub mod naming;
 pub mod ports;
 pub mod tokens;
 
@@ -21,6 +22,7 @@ pub use model::{
     AgentContext, AgentMode, CancelFlag, FileEdit, ImageRef, LspLocation, LspPosition, LspRange,
     LspTextEdit, LspWorkspaceEdit, Plugin, ShellCommand, Task, TaskStatus,
 };
+pub use naming::canonical_tool_name;
 #[allow(deprecated)]
 pub use ports::CompletionChunk;
 pub use ports::{

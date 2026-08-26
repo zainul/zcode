@@ -1,50 +1,161 @@
-# QAgent (`ag`)
+# zcode
 
 > A lean, fast, and memory-safe terminal coding agent written in Rust.
 
 ## Vision
 
-QAgent is a Rust-native terminal coding agent that mirrors [OpenCode](https://github.com/sst/opencode)'s core capabilities — LLM interaction, file system operations, shell command execution, and plugin architecture — while cutting memory usage and cold-start cost through idiomatic Rust, zero-cost abstractions, and a thin dependency footprint.
+zcode is a Rust-native terminal coding agent that mirrors [OpenCode](https://github.com/sst/opencode)'s core capabilities — LLM interaction, file system operations, shell command execution, MCP/LSP extensibility — while cutting memory usage and cold-start cost through idiomatic Rust, zero-cost abstractions, and a thin dependency footprint.
 
 > *"Build for correctness first, performance always."*
+
+## Quick start
+
+```sh
+git clone <this-repo> && cd zcode
+./scripts/install.sh              # detects your platform, builds, installs
+zcode version
+```
+
+`./scripts/install.sh --help` covers `--prefix`, `--no-build` and the rest.
+To update later: `git pull && ./scripts/update.sh` — it replaces the binary
+where it already lives and prints the old and new build stamps.
+`./scripts/uninstall.sh` removes it again. Prefer to do it by hand?
+`cargo build --release` and copy `target/release/zcode` anywhere on your `PATH`.
+
+Point it at a provider. Configuration lives in `zcode.json` or `zcode.toml`
+(JSON wins if both are present); keys are read from the environment by name and
+are never written to disk.
+
+```sh
+cp crates/infra/config/examples/zcode.example.json zcode.json
+export ZCODE_OPENROUTER_API_KEY=sk-or-v1-...
+
+zcode run "add a doc comment to every public fn in crates/domain/src/model.rs"
+zcode run --json "list the files in crates"     # JSONL for scripts/CI
+zcode run --mode planning "how would you split this crate?"
+zcode                                           # interactive TUI
+```
+
+The smallest possible config — everything else has a per-provider default:
+
+```json
+{ "provider": "openrouter", "model": "anthropic/claude-sonnet-4.5" }
+```
+
+Supported providers: `openrouter`, `openai`, `anthropic`, `deepseek`,
+`ollama`, `vllm`, and any `openai-compatible` endpoint via `base_url`. Omit
+`model` and each provider gets a working default; omit `api_key_env` and the
+conventional variable for that provider is used
+(`ZCODE_OPENROUTER_API_KEY`, `ZCODE_ANTHROPIC_API_KEY`, `ZCODE_DEEPSEEK_API_KEY`, …).
+
+**New here? The [user guide](docs/guide/README.md) walks through installation
+and every feature step by step.**
+
+## Commands
+
+| Command | Interface | Purpose |
+|---------|-----------|---------|
+| `zcode version` | headless | Build metadata (version, git SHA, profile). |
+| `zcode run "<prompt>"` | headless | One agent run. `--json`, `--mode`, `--image`, `--session`, `--timeout`, `--config`. |
+| `zcode` / `zcode repl` | TUI | Interactive session with live tool output. |
+| `zcode session create` | headless | Allocate a session id (UUIDv7). |
+| `zcode session continue <id> [prompt]` | headless/TUI | Resume; without a prompt it opens the TUI. |
+| `zcode session fork <id> [--as <new>]` | headless | Branch a transcript. |
+| `zcode session import <file>` / `export <id> --to <file>` | headless | Portable JSON sessions. |
+| `zcode tools list` | headless | Every tool: native + `mcp__*` + `lsp__*`. |
+| `zcode config` | headless | Which config files are in use and what they resolve to. |
+| `zcode skills list` | headless | Markdown skills in the skills dir. |
 
 ## Architecture
 
 ```
 Interface (cli) → Application (app) → Domain (domain)
-Interface (cli) → Infrastructure (infra/*) → Domain (domain)
+Interface (cli) → Infrastructure (infra/*, tools) → Domain (domain)
 ```
 
 ### Layer dependency rules
 
-- **Domain** → stdlib only (zero third-party deps).
+- **Domain** → stdlib only (zero third-party deps, enforced by `make check-deps`).
 - **App** → depends on `domain` only.
-- **Infra/\*** → depend on `domain` + external crates.
+- **Infra/\*** and **tools** → depend on `domain` + external crates.
 - **CLI** → composition root; depends on all layers.
 
 ### Crate map
 
-| Crate                | Layer       | Purpose                                  |
-|----------------------|-------------|------------------------------------------|
-| `crates/domain`      | Domain      | Entities, errors, port traits            |
-| `crates/app`         | Application | Use-case orchestration (`App`, `TaskRunner`) |
-| `crates/infra/llm`   | Infra       | OpenAI-compatible LLM adapter            |
-| `crates/infra/fs`    | Infra       | Filesystem adapter (`std::fs`)           |
-| `crates/infra/shell` | Infra       | Shell adapter (`std::process`)           |
-| `crates/infra/config`| Infra       | TOML + env configuration loader          |
-| `crates/cli`         | Interface   | `clap` CLI + composition root            |
+| Crate | Layer | Purpose |
+|-------|-------|---------|
+| `crates/domain` | Domain | Entities, errors, port traits, mode policy, tool-name canonicalisation |
+| `crates/app` | Application | The agent loop (`AgentLoop::execute`): stream → tool-use → checkpoint → repeat |
+| `crates/tools` | Infra | Native tools + allowlisted shell + the merging `ToolRegistry` |
+| `crates/infra/llm` | Infra | OpenAI / OpenRouter / Anthropic / DeepSeek / Ollama / vLLM streaming clients |
+| `crates/infra/mcp` | Infra | MCP stdio JSON-RPC client |
+| `crates/infra/lsp` | Infra | LSP stdio JSON-RPC client |
+| `crates/infra/filesystem` | Infra | Filesystem adapter (`std::fs`), atomic writes |
+| `crates/infra/shell` | Infra | Shell adapter (`std::process`) |
+| `crates/infra/session` | Infra | UUIDv7 session store, atomic checkpoints, import/export |
+| `crates/infra/telemetry` | Infra | JSONL event stream + run report |
+| `crates/infra/config` | Infra | TOML + `ZCODE_*` env configuration loader |
+| `crates/cli` | Interface | `clap` CLI, ratatui TUI, composition root |
 
-## Quick start
+### The tool namespace
 
-```sh
-cargo build                    # build workspace
-cargo test                     # run all tests
-cargo run -q -- version        # print version + git sha
+Native tools have bare names — `read`, `write`, `str_replace_editor`,
+`apply_patch`, `list_dir`, `shell`, `zcode_skill`. MCP tools appear as `mcp__<server>__<tool>`
+and LSP tools as `lsp__goto_definition`, `lsp__find_references`, `lsp__hover`,
+`lsp__rename_symbol`. `__` rather than `::` because provider function-calling
+APIs only accept `[A-Za-z0-9_-]`; the `::` spellings still resolve as aliases.
+
+Adding a tool means implementing `domain::Tool` and registering it — the engine
+needs no changes.
+
+## Streaming and telemetry
+
+Responses are decoded incrementally: the first token reaches the screen as soon
+as the provider emits it, not when the generation ends. Every run records the
+model name, input/output/cache tokens, step count, and wall-clock time, and
+writes them to `.zcode/reports/<timestamp>-<session>.json`. With `--json` the same
+events stream to stdout as JSONL, one object per line:
+
 ```
+{"kind":"loop_start","model":"anthropic/claude-sonnet-4.5",...}
+{"kind":"tool_call","tool":"apply_patch",...}
+{"kind":"tool_result","tool":"apply_patch","truncated":false,...}
+{"kind":"llm_delta","text":"Done — ",...}
+{"kind":"finish","input_tokens":320,"output_tokens":42,"cache_tokens":10,"steps":2,...}
+```
+
+Transient provider failures (429, 5xx) are retried with exponential backoff and
+honour `Retry-After`; authentication and model-name errors fail immediately with
+the provider's own message.
+
+## Safety
+
+- Every shell command is checked against the `shell_allowed` regex allowlist
+  **before** it reaches `std::process::Command`. An empty list denies
+  everything, and substitution/redirection/chaining (`` ` ``, `$(`, `>`, `&`)
+  is refused outright.
+- Planning mode withholds every editing tool from the model and refuses one if
+  it is requested anyway.
+- API keys are read from the env var named by `api_key_env` at wiring time and
+  never written to disk.
+- Tool output is stripped of terminal escapes before display and capped at
+  `max_tool_output_chars` before it enters the transcript.
 
 ## Memory efficiency
 
-All Domain entities use owned types (`String`, `PathBuf`, `Box<[T]>`) to avoid lifetime propagation through use-cases. No garbage collector, no runtime, no GC pauses. The CLI uses a single-threaded tokio runtime for minimal idle-thread memory.
+No garbage collector, no async runtime, no thread pool: the engine loop is
+synchronous, the TUI renders on the main thread, and the one worker thread is a
+plain `std::thread`. Domain entities use owned types (`String`, `PathBuf`,
+`Box<[T]>`) so no lifetimes propagate through use-cases; session checkpoints
+move the transcript in and out of the session rather than cloning it; and both
+TUI panes are bounded so runaway tool output cannot grow the process.
+
+## Documentation
+
+- **[User guide](docs/guide/README.md)** — installation through to MCP, LSP and telemetry
+- [Configuration reference](docs/guide/12-configuration-reference.md)
+- [Troubleshooting](docs/guide/13-troubleshooting.md)
+- [Architecture](docs/architecture/README.md)
 
 ## License
 

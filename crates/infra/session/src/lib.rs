@@ -3,7 +3,7 @@
 //! `Session` is a dep-free domain struct (no serde derives — FR-DI-01), so this
 //! crate defines a `SessionFile` serialization adapter with local mirror types
 //! for the message/role sub-structures plus a `version: 1` tag. Sessions are
-//! written as plain JSON to `<working_dir>/.ag/sessions/<id>.json` (portable &
+//! written as plain JSON to `<working_dir>/.zcode/sessions/<id>.json` (portable &
 //! human-readable per US-E-09) and every `checkpoint` is atomic (temp+rename).
 //!
 //! Direct deps: domain, uuid (v7), serde, serde_json. No other transitive deps.
@@ -313,13 +313,35 @@ impl From<SerializableRole> for LlmRole {
 // UuidSessionStore
 // ---------------------------------------------------------------------------
 
+/// Session ids the store will touch.
+///
+/// Generated ids are UUIDv7 (time-ordered, DQ9), but `zcode session fork --as
+/// <id>` lets a person name a branch — and no one types a valid v7 by hand —
+/// so any short, filesystem-safe slug is accepted. The constraint that matters
+/// is that an id can never escape the sessions directory: no separators, no
+/// `..`, no leading dot, and nothing outside `[A-Za-z0-9._-]`.
+pub fn is_safe_id(id: &str) -> bool {
+    const MAX_LEN: usize = 64;
+    if id.is_empty() || id.len() > MAX_LEN {
+        return false;
+    }
+    if id.starts_with('.') {
+        return false;
+    }
+    if id.contains("..") {
+        return false;
+    }
+    id.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+}
+
 /// Portable JSON session store with atomic checkpoints (FR-SESSION-01..07).
 pub struct UuidSessionStore {
     base: PathBuf,
 }
 
 impl UuidSessionStore {
-    /// Create a store rooted at `base` (`.ag/sessions`), making the dir if it
+    /// Create a store rooted at `base` (`.zcode/sessions`), making the dir if it
     /// does not yet exist (FR-SESSION create_creates_dot_ag_dir).
     pub fn new(base: PathBuf) -> Self {
         if !base.as_os_str().is_empty() {
@@ -331,15 +353,8 @@ impl UuidSessionStore {
     /// Resolve a session id to its on-disk path, validating that the id is a
     /// path-traversal-safe UUIDv7. Rejects `/`, `\`, `..`, and non-UUID inputs.
     fn id_path(&self, id: &str) -> Result<PathBuf, SessionError> {
-        if id.is_empty() {
-            return Err(SessionError::InvalidId("empty id".into()));
-        }
-        if id.contains('/') || id.contains('\\') || id.contains("..") {
+        if !is_safe_id(id) {
             return Err(SessionError::InvalidId(id.into()));
-        }
-        match Uuid::parse_str(id) {
-            Ok(uuid) if uuid.get_version() == Some(uuid::Version::SortRand) => {}
-            _ => return Err(SessionError::InvalidId(id.into())),
         }
         Ok(self.base.join(format!("{id}.json")))
     }
@@ -384,7 +399,7 @@ impl UuidSessionStore {
 
 impl Default for UuidSessionStore {
     fn default() -> Self {
-        Self::new(PathBuf::from(".ag/sessions"))
+        Self::new(PathBuf::from(".zcode/sessions"))
     }
 }
 
@@ -411,7 +426,13 @@ impl SessionStorePort for UuidSessionStore {
     }
 
     fn checkpoint(&mut self, id: &str, session: &Session) -> Result<(), domain::BoxError> {
-        Ok(self.write_session(id, session)?)
+        // Stamp the write time here: the engine is stdlib-only and has no
+        // calendar formatting, so the clock lives in the adapter.
+        let stamped = Session {
+            last_message_at: now_iso(),
+            ..session.clone()
+        };
+        Ok(self.write_session(id, &stamped)?)
     }
 
     fn fork(&mut self, id: &str, new_id: &str) -> Result<(), domain::BoxError> {
@@ -460,6 +481,59 @@ impl SessionStorePort for UuidSessionStore {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn accepts_human_chosen_ids_but_never_escapes_the_directory() {
+        // `zcode session fork --as my-experiment` has to work: nobody types a
+        // valid UUIDv7 by hand.
+        for good in [
+            "01a03bdd-4b19-7ce2-99d1-e983bd9abdc8",
+            "my-experiment",
+            "retry_2",
+            "v1.2",
+            "ABC123",
+        ] {
+            assert!(is_safe_id(good), "{good} should be accepted");
+        }
+        // Anything that could reach outside `.zcode/sessions/` must not be.
+        for bad in [
+            "",
+            "..",
+            "../etc/passwd",
+            "a/b",
+            "a\\b",
+            ".hidden",
+            "with space",
+            "semi;colon",
+            "star*",
+            "~root",
+        ] {
+            assert!(!is_safe_id(bad), "{bad:?} must be rejected");
+        }
+        // And an unbounded id cannot blow past filesystem name limits.
+        assert!(!is_safe_id(&"a".repeat(65)));
+    }
+
+    #[test]
+    fn fork_accepts_a_named_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = UuidSessionStore::new(dir.path().to_path_buf());
+        let parent = store.create().unwrap();
+
+        store.fork(&parent, "experiment-a").expect("named fork");
+        let forked = store.load("experiment-a").expect("load named fork");
+        assert_eq!(forked.id, "experiment-a");
+        assert!(dir.path().join("experiment-a.json").exists());
+    }
+
+    #[test]
+    fn fork_still_refuses_a_traversing_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = UuidSessionStore::new(dir.path().to_path_buf());
+        let parent = store.create().unwrap();
+        assert!(store.fork(&parent, "../escaped").is_err());
+        assert!(!dir.path().parent().unwrap().join("escaped.json").exists());
+    }
+
     use super::*;
 
     fn with_two_messages(id: &str, steps: u64) -> Session {
@@ -596,7 +670,7 @@ mod tests {
     #[test]
     fn create_creates_dot_ag_dir() {
         let dir = tempfile::tempdir().unwrap();
-        let base = dir.path().join(".ag/sessions");
+        let base = dir.path().join(".zcode/sessions");
         assert!(!base.exists());
         let mut store = UuidSessionStore::new(base.clone());
         let id = store.create().unwrap();
@@ -618,15 +692,36 @@ mod tests {
         assert_eq!(restored.messages.len(), 2);
     }
 
+    /// A plain name is a legitimate id (see `is_safe_id`) — asking for one
+    /// that does not exist is "not found", not "invalid".
     #[test]
-    fn non_uuid_id_rejected() {
+    fn unknown_but_well_formed_id_reports_not_found() {
         let dir = tempfile::tempdir().unwrap();
         let store = UuidSessionStore::new(dir.path().join("sessions"));
         let err = store.load("not-a-uuid").unwrap_err();
-        assert!(matches!(
-            err.downcast_ref::<SessionError>(),
-            Some(SessionError::InvalidId(_))
-        ));
+        assert!(
+            matches!(
+                err.downcast_ref::<SessionError>(),
+                Some(SessionError::Other(_))
+            ),
+            "expected a not-found error, got {err}"
+        );
+    }
+
+    #[test]
+    fn traversing_id_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = UuidSessionStore::new(dir.path().join("sessions"));
+        for bad in ["../escape", "a/b", "..", ".hidden"] {
+            let err = store.load(bad).unwrap_err();
+            assert!(
+                matches!(
+                    err.downcast_ref::<SessionError>(),
+                    Some(SessionError::InvalidId(_))
+                ),
+                "{bad:?} must be rejected as an invalid id"
+            );
+        }
     }
 
     #[test]
@@ -640,18 +735,15 @@ mod tests {
         ));
     }
 
+    /// Ids the store *generates* stay UUIDv7 so the directory sorts by age;
+    /// ids a person supplies are not held to that.
     #[test]
-    fn v4_uuid_rejected_in_favor_of_v7() {
+    fn generated_ids_are_uuid_v7() {
         let dir = tempfile::tempdir().unwrap();
-        let store = UuidSessionStore::new(dir.path().join("sessions"));
-        let v4 = "f47ac10b-8000-4e4c-a0a9-d0a4c10b8000";
-        let parsed = Uuid::parse_str(v4).unwrap();
-        assert_ne!(parsed.get_version(), Some(uuid::Version::SortRand));
-        let err = store.load(v4).unwrap_err();
-        assert!(matches!(
-            err.downcast_ref::<SessionError>(),
-            Some(SessionError::InvalidId(_))
-        ));
+        let mut store = UuidSessionStore::new(dir.path().join("sessions"));
+        let id = store.create().unwrap();
+        let parsed = Uuid::parse_str(&id).expect("generated ids parse as UUIDs");
+        assert_eq!(parsed.get_version(), Some(uuid::Version::SortRand));
     }
 
     #[test]

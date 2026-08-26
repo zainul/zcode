@@ -6,9 +6,5 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-domain = { path = "../../domain", version = "0.1.0" }
-serde = { workspace = true }
+domain = { path = "../../domain", version = "0.2.0" }
 serde_json = { workspace = true }
-
-[dev-dependencies]
-assert-json-diff = "2"

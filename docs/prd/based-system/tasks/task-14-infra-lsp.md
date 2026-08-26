@@ -2,7 +2,7 @@
 
 **Related PRD sections:** §3.3.3 LSP Integration (FR-LSP-01..04), §3.3 Extensible Tool System, §8 DQ7 (LSP client library)
 **Depends on:** task-02 (Domain — `LspPort` trait defined in §4.3 of technical plan)
-**Status:** To do
+**Status:** Done
 **Priority:** Medium (semantic code intel; graceful if a server is absent)
 
 ## Objective
@@ -74,7 +74,7 @@ Integration (subprocess, `#[ignore]`):
 
 ## Test-case scenario
 
-- `ag run "show me callers of foo"` in a Rust crate → the LSP-backed `find_references` tool resolves real references via rust-analyzer; results are fed back to the LLM.
+- `zcode run "show me callers of foo"` in a Rust crate → the LSP-backed `find_references` tool resolves real references via rust-analyzer; results are fed back to the LLM.
 
 ## How to verify
 

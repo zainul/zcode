@@ -1,0 +1,45 @@
+{
+  "$comment": [
+    "Example zcode configuration in JSON. Copy to ./zcode.json and edit.",
+    "`zcode.json` is preferred over `zcode.toml` when both exist.",
+    "Secrets are NEVER stored here: `api_key_env` names the environment",
+    "variable the key is read from at startup."
+  ],
+
+  "provider": "openrouter",
+  "model": "anthropic/claude-sonnet-4.5",
+  "api_key_env": "ZCODE_OPENROUTER_API_KEY",
+
+  "timeout_ms": 120000,
+  "max_turns": 20,
+  "max_tokens": 16384,
+  "max_tool_output_chars": 16000,
+  "mode": "build",
+
+  "shell_allowed": [
+    "echo .*",
+    "ls .*",
+    "cat .*",
+    "git status",
+    "git diff.*",
+    "cargo (build|test|check|fmt|clippy).*"
+  ],
+
+  "skills_dir": ".zcode/skills",
+
+  "mcp": {
+    "servers": [
+      {
+        "name": "everything",
+        "command": "npx",
+        "args": ["-y", "@modelcontextprotocol/server-everything"]
+      }
+    ]
+  },
+
+  "lsp": {
+    "servers": [
+      { "language": "rust", "command": "rust-analyzer", "args": [] }
+    ]
+  }
+}

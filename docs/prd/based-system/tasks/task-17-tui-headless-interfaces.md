@@ -2,15 +2,15 @@
 
 **Related PRD sections:** §3.1 Multi-Interface (FR-IFACE-01..06), §3.9 CLI Command Matrix, §3.7 skills, §3.8 caps, §5 NFR-PERF-01 (cold <300 ms), §7 M1.5/M1.6/M1.8/M1.11, §8 DQ4 (current-thread) / DQ8 (ratatui)
 **Depends on:** task-16 (App::execute), task-20 (Config), task-18 (SessionStorePort), task-19 (TelemetryPort), task-15 (ToolRegistry)
-**Status:** To do
+**Status:** Done
 **Priority:** High (the user-facing surface; the two interfaces share one engine per FR-IFACE-03)
 
 ## Objective
 
-Extend the v0.1 `ag version`-only CLI into the full command matrix while preserving the shared engine (FR-IFACE-03). Two interfaces share `App::execute`:
+Extend the v0.1 `zcode version`-only CLI into the full command matrix while preserving the shared engine (FR-IFACE-03). Two interfaces share `App::execute`:
 
-1. **Headless** — `ag run "<prompt>"` runs one agent turn and exits; with `--json` it streams one JSON object per event (FR-IFACE-04, FR-OUTPUT-01). `ag version`, `ag session …`, `ag tools list`, `ag skills list` are also headless.
-2. **Interactive TUI** — `ag` / `ag repl` launches a `ratatui` screen with message + tool pane; the blocking engine runs on a **dedicated `std::thread`** (keep current-thread runtime free to render), streaming `UiEvent`s back via `mpsc`. `q`/`Ctrl-C` aborts, flushes telemetry + partial session (FR-IFACE-05).
+1. **Headless** — `zcode run "<prompt>"` runs one agent turn and exits; with `--json` it streams one JSON object per event (FR-IFACE-04, FR-OUTPUT-01). `zcode version`, `zcode session …`, `zcode tools list`, `zcode skills list` are also headless.
+2. **Interactive TUI** — `zcode` / `zcode repl` launches a `ratatui` screen with message + tool pane; the blocking engine runs on a **dedicated `std::thread`** (keep current-thread runtime free to render), streaming `UiEvent`s back via `mpsc`. `q`/`Ctrl-C` aborts, flushes telemetry + partial session (FR-IFACE-05).
 
 The CLI is the composition root: `wire(&Config) -> Result<App, AppError>` constructs the matching provider LLM (FR-MODEL-06), the `ToolRegistry` (native + configured MCP + optional LSP), the session store, and telemetry (FR-IFACE-03 shared).
 
@@ -40,7 +40,7 @@ pty = ["infra-shell/pty"]               # future persistent shell (task-21)
 
 ```rust
 #[derive(Parser)]
-#[command(name="ag", version, about="QAgent — the lean Rust coding agent")]
+#[command(name="zcode", version, about="zcode — the lean Rust coding agent")]
 pub struct Cli { #[command(subcommand)] pub command: Commands }
 
 pub enum Commands {
@@ -76,14 +76,14 @@ pub fn wire(cfg: &Config) -> Result<App, AppError> {
         unknown => return Err(AppError::Config(...)),          // FR-MODEL-06 typed error
     };
     let tools = ToolRegistry::new(cfg);                        // native + mcp + lsp (FR-MCP-03/04)
-    let sessions = UuidSessionStore::new(cfg.working_dir.join(".ag").join("sessions"));
-    let telemetry = JsonTelemetry::new(stdout_or_sink(cfg.json), cfg.working_dir.join(".ag").join("reports"));
+    let sessions = UuidSessionStore::new(cfg.working_dir.join(".zcode").join("sessions"));
+    let telemetry = JsonTelemetry::new(stdout_or_sink(cfg.json), cfg.working_dir.join(".zcode").join("reports"));
     Ok(App::new(Box::new(llm), Box::new(tools), Box::new(sessions), Box::new(telemetry), ...))
 }
 ```
 `AppError` gains `Config(String)` variant (FR-MODEL-06: unknown provider → typed error, not panic — NFR-REL-02). Each MCP server that fails to start is logged+skipped (FR-MCP-05) — `ToolRegistry::new` swallows `McpClient::new` errors.
 
-### 4. Headless `ag run` (FR-IFACE-01/03/04)
+### 4. Headless `zcode run` (FR-IFACE-01/03/04)
 
 ```rust
 Commands::Run(a) => {
@@ -123,10 +123,10 @@ pub fn run_tui(cfg: Config) -> Result<(), AppError> {
 
 ### 6. Remaining subcommands
 
-- `ag version` — unchanged (FR-IFACE-06).
-- `ag session create|continue|cork|import|export` — delegate to `UuidSessionStore` (FR-SESSION-01..05).
-- `ag tools list` — `wire` the registry, print `ToolSpec` names (native + `mcp::*` + `lsp::*`).
-- `ag skills list` — `fs::read_dir(skills_dir)`, print `*.md` names (FR-OUTPUT-09).
+- `zcode version` — unchanged (FR-IFACE-06).
+- `zcode session create|continue|cork|import|export` — delegate to `UuidSessionStore` (FR-SESSION-01..05).
+- `zcode tools list` — `wire` the registry, print `ToolSpec` names (native + `mcp::*` + `lsp::*`).
+- `zcode skills list` — `fs::read_dir(skills_dir)`, print `*.md` names (FR-OUTPUT-09).
 
 ### 7. Ctrl-C / timeout handling
 
@@ -143,35 +143,35 @@ signal-hook = "0.3"   # registers a Unix signal handler setting the flag
 ### 8. Tests
 
 - `wire_dispatches_provider`: `Config{provider: Anthropic, ...}` → `App` constructed with an `AnthropicLlm` (assert via a `cfg`-gated `App::kind()` debug accessor or by exercising behavior — keep an internal `pub(crate)` probe). At minimum, `wire` returns `Ok` for each known provider and `Err(AppError::Config)` for `"bogus"`.
-- `run_subcommand_parses_all_flags`: `Cli::try_parse_from(["ag","run","x","--mode", "planning","--json","--timeout","10"])` → `Commands::Run` with the right fields (clap).
+- `run_subcommand_parses_all_flags`: `Cli::try_parse_from(["zcode","run","x","--mode", "planning","--json","--timeout","10"])` → `Commands::Run` with the right fields (clap).
 - `version_parses`: unchanged from v0.1 (keep the existing test).
 - `ag_run_json_is_jsonl`: `#[ignore]` integration against local Ollama — stdout lines each parse with `serde_json`.
-- `tui_launches_and_quits`: manual smoke (`ag repl`, `q` exits 0) — documented as M1.11.
+- `tui_launches_and_quits`: manual smoke (`zcode repl`, `q` exits 0) — documented as M1.11.
 
 Hermetic: all `wire`/clap tests use `tempfile` configs + a dummy provider (`Provider::Ollama` with a fake local endpoint is still network; so provider-dispatch tests assert only construction, not network). Network tests `#[ignore]`'d.
 
 ## Test-case scenario
 
-- TUI: `ag repl` renders; user pastes "rename foo to bar in model.rs"; engine emits deltas into the message pane; on finish writes the file; `q` exits 0 + report flushed.
-- Headless: `ag run --json "ls crates"` (allowlisted shell) → stdout lines: `loop_start`, several `llm_delta`, one or more `tool_call`/`tool_result`, `finish` — all `jq -e .`-parseable (M1.6).
-- `ag session create` → UUIDv7; `ag tools list` → `read write str_replace_editor list_dir shell ag:skill mcp::* lsp::*`.
-- `Ctrl-C` during `ag run` → partial session checkpointed + `.ag/reports/*` written, exit 130, no panic (FR-IFACE-05, NFR-REL-01).
+- TUI: `zcode repl` renders; user pastes "rename foo to bar in model.rs"; engine emits deltas into the message pane; on finish writes the file; `q` exits 0 + report flushed.
+- Headless: `zcode run --json "ls crates"` (allowlisted shell) → stdout lines: `loop_start`, several `llm_delta`, one or more `tool_call`/`tool_result`, `finish` — all `jq -e .`-parseable (M1.6).
+- `zcode session create` → UUIDv7; `zcode tools list` → `read write str_replace_editor list_dir shell zcode:skill mcp::* lsp::*`.
+- `Ctrl-C` during `zcode run` → partial session checkpointed + `.zcode/reports/*` written, exit 130, no panic (FR-IFACE-05, NFR-REL-01).
 
 ## How to verify
 
 ```
-cargo test -p ag
+cargo test -p zcode
 cargo run -q -- version                       # M1.6 build meta; T20
 cargo run -q -- run "echo hi"                  # FR-TOOL-SHELL allowlisted
 cargo run -q -- run --json "echo hi" | jq -e .   # NFR-OBS-01 / M1.6
-cargo test -p ag -- --ignored                 # integration (needs local Ollama/MCP)
-cargo clippy -p ag -- -D warnings
-cargo tree -p ag                             # all layers reachable
-du -h target/release/ag                       # M2.4 < 12MB
-time ./target/release/ag version              # M2.1 < 300ms
+cargo test -p zcode -- --ignored                 # integration (needs local Ollama/MCP)
+cargo clippy -p zcode -- -D warnings
+cargo tree -p zcode                             # all layers reachable
+du -h target/release/zcode                       # M2.4 < 12MB
+time ./target/release/zcode version              # M2.1 < 300ms
 ```
 
-**Pass criteria:** `ag version` unchanged; `ag run` runs the loop end-to-end (fake/local); `ag repl` renders + quits on `q`; JSONL is line-valid JSON (M1.6); reports/schema present (M1.7); signal/timeout path checkpoints + reports without panic (FR-IFACE-05, NFR-REL-01); `cargo tree -p ag` reaches all layers (M1.4); release binary < 12 MB (M2.4); cold `ag version` < 300 ms (M2.1); `#![forbid(unsafe_code)]` holds.
+**Pass criteria:** `zcode version` unchanged; `zcode run` runs the loop end-to-end (fake/local); `zcode repl` renders + quits on `q`; JSONL is line-valid JSON (M1.6); reports/schema present (M1.7); signal/timeout path checkpoints + reports without panic (FR-IFACE-05, NFR-REL-01); `cargo tree -p zcode` reaches all layers (M1.4); release binary < 12 MB (M2.4); cold `zcode version` < 300 ms (M2.1); `#![forbid(unsafe_code)]` holds.
 
 ## Success metric mapping
 

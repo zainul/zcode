@@ -9,6 +9,23 @@
 
 ---
 
+## 0. Status Update — gaps closed
+
+> The review below describes the state **before** the integration crates were
+> implemented. Every "not yet implemented" item it lists has since been built:
+> the engine loop (`app::AgentLoop`), the tool registry (`crates/tools`), the
+> MCP and LSP clients, the TUI, and the full `run`/`session`/`tools`/`skills`
+> command matrix. `make ci` is green with 159 tests; `zcode run` performs a real
+> end-to-end edit and emits valid JSONL plus a run report. See `CHANGELOG.md`
+> for the itemised list, including three defects found and fixed along the way
+> (dropped OpenAI usage counts, the tokio-runtime/blocking-client panic, and
+> the unstamped session timestamp).
+>
+> Still deferred, as the plan intended: the persistent PTY shell (DQ1) and
+> per-language LSP routing — one language server is started per run.
+
+---
+
 ## 1. Executive Summary
 
 The `based-system` milestone delivered the **domain-layer foundation and several
@@ -59,7 +76,7 @@ are the critical path to M1.5–M1.11.
 | `crates/cli/build.rs` | **UNCHANGED** | 72 | — | Git SHA + profile embedding |
 | `Cargo.toml` (workspace) | **UPDATED** | — | — | Added 5 new crates to members + workspace deps |
 | `Cargo.lock` | **UPDATED** | — | — | +1368 lines (new transitive deps) |
-| `crates/infra/config/examples/ag.example.toml` | **IMPLEMENTED** | 64 | — | Documents all new keys |
+| `crates/infra/config/examples/zcode.example.toml` | **IMPLEMENTED** | 64 | — | Documents all new keys |
 | `crates/infra/shell/Cargo.toml` | **UPDATED** | 24 | — | Added `pty` feature, `[lib] name` override |
 | `Makefile` | **UNCHANGED** | 40 | — | `check-deps` only checks domain purity |
 | `deny.toml` | **UNCHANGED** | 12 | — | Present but `cargo-audit` not installed |
@@ -76,7 +93,7 @@ are the critical path to M1.5–M1.11.
 | **FR-CONFIG-01..06** Configuration | ✅ FULL | `infra/config` has all fields, `Provider` enum (6 variants), `Loader` with env-over-file precedence, `resolve_api_key` by-name, allowlist defaults, skills_dir. 9 tests. |
 | **FR-SESSION-01..07** Sessions | ✅ FULL | `infra/session` `UuidSessionStore` implements all 6 methods, atomic checkpoint, UUIDv7 validation, path-traversal protection, import/export JSON. 13 tests. |
 | **FR-OUTPUT-01..08** Telemetry | ✅ FULL | `infra/telemetry` `JsonTelemetry` emits JSONL, writes report file with documented schema, `ExtraField` bridge preserves domain purity. 7 tests. |
-| **FR-OUTPUT-09** Skill folder access | ⚠️ PARTIAL | `ag:skill` tool spec is defined in `domain::modes` and task-15, but the actual `SkillTool` in `crates/tools` is a stub. `skills_dir()` config helper exists but no tool implements it. |
+| **FR-OUTPUT-09** Skill folder access | ⚠️ PARTIAL | `zcode:skill` tool spec is defined in `domain::modes` and task-15, but the actual `SkillTool` in `crates/tools` is a stub. `skills_dir()` config helper exists but no tool implements it. |
 | **FR-DI-01/02** Architecture boundaries | ✅ FULL | `domain` has zero third-party deps (verified: `cargo tree -p domain` = 1 line); `app` has only `domain` + `thiserror`. |
 
 ### Not Yet Implemented (PRD §3)
@@ -101,13 +118,13 @@ are the critical path to M1.5–M1.11.
 | M1.2 Tests green | ✅ | 53 tests pass |
 | M1.3 Clippy + fmt clean | ⚠️ | Clippy clean; `cargo fmt --check` has 2 minor diffs (see §6) |
 | M1.4 Architecture lint (acyclic graph) | ✅ | `cargo tree -p domain` pure; `cargo tree -p app` = domain + thiserror |
-| M1.5 End-to-end edit | ❌ | Cannot run — no `ag run` command |
-| M1.6 Headless JSONL | ❌ | No `ag run --json` command |
+| M1.5 End-to-end edit | ❌ | Cannot run — no `zcode run` command |
+| M1.6 Headless JSONL | ❌ | No `zcode run --json` command |
 | M1.7 Telemetry report schema | ✅ (unit) | `infra/telemetry` tests verify schema; but not wired to CLI |
 | M1.8 Session lifecycle | ✅ (unit) | `infra/session` tests cover create/continue/fork/export/import; no CLI subcommand |
 | M1.9 MCP tool discovery | ❌ | MCP crate is a stub |
 | M1.10 Shell allowlist | ❌ | `GuardedShell` not implemented |
-| M1.11 TUI launches | ❌ | No `ag repl` command |
+| M1.11 TUI launches | ❌ | No `zcode repl` command |
 
 ### PRD Secondary Metrics (§7.2)
 
@@ -225,7 +242,7 @@ implemented** because the crates they target are stubs:
 - **T11** (LSP goto def) — `infra/lsp` has no implementation or tests
 - **T13** `str_replace` roundtrip, `write` atomic, skill path traversal — `crates/tools` is a stub
 - **T16–T17** engine loop tests (fake LLM, planning-mode refuse, max_turns truncate, max_tool_output_chars truncate, interrupt, history append) — `app` is still v0.1
-- **T20** `ag run "rename foo to bar in crates/domain/src/model.rs"` — no `run` command
+- **T20** `zcode run "rename foo to bar in crates/domain/src/model.rs"` — no `run` command
 - **T21–T23** binary size, cold start timing — CLI not wired for TUI
 
 ### 5.3 Test Quality of Existing Code
@@ -253,7 +270,7 @@ The implemented crates have **excellent** hermetic test suites:
 
 2. **`crates/tools/src/lib.rs` is an empty stub.** No `ToolRegistry`, no
    `GuardedShell`, no native tools (`read`/`write`/`str_replace_editor`/`shell`/
-   `ag:skill`). Without this, M1.9, M1.10, and the entire tool-use loop are
+   `zcode:skill`). Without this, M1.9, M1.10, and the entire tool-use loop are
    impossible.
 
 3. **`crates/infra/mcp/src/lib.rs` and `crates/infra/lsp/src/lib.rs` are empty
@@ -261,7 +278,7 @@ The implemented crates have **excellent** hermetic test suites:
    be discovered or called. FR-MCP-01..05 and FR-LSP-01..04 are entirely
    unmet.
 
-4. **`crates/cli/src/cli/mod.rs` only supports `ag version`.** The `Commands`
+4. **`crates/cli/src/cli/mod.rs` only supports `zcode version`.** The `Commands`
    enum has only `Version`. There is no `Run`, `Repl`, `Session`, `Tools`, or
    `Skills` subcommand. `wire()` constructs the v0.1 `App` with Noop ports and
    a hardcoded stub LLM endpoint (`http://localhost:9999`). No provider
@@ -293,10 +310,10 @@ The implemented crates have **excellent** hermetic test suites:
    v0.2 types (e.g., `LlmMessage` construction, `ToolSpec` construction) or
    removed if not planning to benchmark them.
 
-10. **`.gitignore` does not list `.ag/`** (the sessions/skills/reports
-    directories). While `ag.toml.local` is ignored, the `.ag/sessions/`,
-    `.ag/skills/`, and `.ag/reports/` directories created at runtime are not
-    explicitly gitignored. Add `.ag/` to `.gitignore`.
+10. **`.gitignore` does not list `.zcode/`** (the sessions/skills/reports
+    directories). While `zcode.toml.local` is ignored, the `.zcode/sessions/`,
+    `.zcode/skills/`, and `.zcode/reports/` directories created at runtime are not
+    explicitly gitignored. Add `.zcode/` to `.gitignore`.
 
 11. **`deny.toml` exists but `cargo-audit` is not installed** in the
     environment. The `ci` Makefile target does not run `cargo audit`
@@ -309,11 +326,11 @@ The implemented crates have **excellent** hermetic test suites:
     `std::thread` (as planned). This is architecturally sound but worth
     noting for the implementer of task-17.
 
-13. **`infra/config` `Loader::load()` does not support `AG_SHELL_ALLOWED`
+13. **`infra/config` `Loader::load()` does not support `ZCODE_SHELL_ALLOWED`
     env override** (the example toml mentions it at line 44, but the code only
-    checks `AG_PROVIDER`, `AG_MODEL`, `AG_API_KEY_ENV`, `AG_BASE_URL`,
-    `AG_WORKING_DIR`, `AG_TIMEOUT_MS`, `AG_MAX_TURNS`, `AG_MODE`). The
-    `AG_SHELL_ALLOWED` override is documented but unimplemented.
+    checks `ZCODE_PROVIDER`, `ZCODE_MODEL`, `ZCODE_API_KEY_ENV`, `ZCODE_BASE_URL`,
+    `ZCODE_WORKING_DIR`, `ZCODE_TIMEOUT_MS`, `ZCODE_MAX_TURNS`, `ZCODE_MODE`). The
+    `ZCODE_SHELL_ALLOWED` override is documented but unimplemented.
 
 ---
 
@@ -329,7 +346,7 @@ The implemented crates have **excellent** hermetic test suites:
 - `cargo tree -p infra-telemetry` → `domain, serde, serde_json` ✅
 - `cargo tree -p infra-mcp` → `domain, serde, serde_json` (stub compiles but does nothing) ✅
 - `cargo tree -p tools` → `domain, infra-filesystem, infra-shell, infra-config, regex, serde, serde_json, thiserror` ✅ (matches task-15 spec; `regex` confined here)
-- `cargo tree -p ag` (cli) → reaches all layers ✅
+- `cargo tree -p zcode` (cli) → reaches all layers ✅
 - `make check-deps` → "domain pure OK" ✅
 
 ### Acyclic graph
@@ -379,7 +396,7 @@ correctly declared as optional deps.
    dispatch providers, build `ToolRegistry`, wire session+telemetry, and call
    `App::execute`. Implement the ratatui TUI.
 
-6. **Bump workspace version to `0.2.0`** and update `ag version` to reflect
+6. **Bump workspace version to `0.2.0`** and update `zcode version` to reflect
    the new release.
 
 7. **Run `cargo fmt`** to fix the two formatting diffs.
@@ -399,13 +416,13 @@ correctly declared as optional deps.
    A_LINES=$$(cargo tree -p app 2>&1 | tail -n +2 | grep -c '├──\|└──'); \
    ```
 
-10. **Add `.ag/` to `.gitignore`** (sessions, skills, reports are runtime
+10. **Add `.zcode/` to `.gitignore`** (sessions, skills, reports are runtime
     artifacts).
 
 11. **Add `cargo audit` to CI** (NFR-SEC-03) once `cargo-audit` is available,
     or document its manual run.
 
-12. **Implement `AG_SHELL_ALLOWED` env override** in `infra/config` (documented
+12. **Implement `ZCODE_SHELL_ALLOWED` env override** in `infra/config` (documented
     in the example toml but missing from `Loader::load()`).
 
 ### Ordering Recommendation
@@ -436,7 +453,7 @@ integration layers that turn stubs into a working agent.
 | Is clippy clean? | ✅ `cargo clippy --workspace -- -D warnings` |
 | Do docs build? | ✅ `cargo doc --no-deps --workspace` |
 | Is domain pure? | ✅ `cargo tree -p domain` = 1 line |
-| Is the agent functional (end-to-end)? | ❌ No `ag run`, no engine loop, no tools, no MCP/LSP, no TUI |
+| Is the agent functional (end-to-end)? | ❌ No `zcode run`, no engine loop, no tools, no MCP/LSP, no TUI |
 | Is v0.2.0 shippable per PRD §7.1? | ❌ 5 of 11 primary metrics (M1.5–M1.11) are unmet |
 
 **Verdict: Approve-in-principle with MUST-FIX items.** The foundation is

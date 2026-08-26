@@ -2,7 +2,8 @@
 **/*.rs.bk
 .env
 .qagent_node_config.env
-ag.toml.local
+zcode.toml.local
+zcode.json.local
 .coverage/
 *.profraw
 /logs/

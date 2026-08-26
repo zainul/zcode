@@ -13,7 +13,7 @@
 
 ### 1.1 Overview
 
-The AI Coding Agent (`ag`) is a terminal-based, AI-driven coding assistant written in Rust that mirrors **1:1 the core capabilities of OpenCode** while deliberately reducing memory footprint and maximizing runtime performance. This document defines the requirements for the **initial project scaffolding** that establishes the clean, layered codebase upon which all subsequent features will be built.
+The AI Coding Agent (`zcode`) is a terminal-based, AI-driven coding assistant written in Rust that mirrors **1:1 the core capabilities of OpenCode** while deliberately reducing memory footprint and maximizing runtime performance. This document defines the requirements for the **initial project scaffolding** that establishes the clean, layered codebase upon which all subsequent features will be built.
 
 This initial milestone is **non-negotiable on structure**: it does not deliver user-facing agent behavior, but it creates the durable, testable, and maintainable foundation that makes future feature velocity possible. The scaffolding must make the **right engineering tradeoffs** explicit at day one so that every future feature inherits low coupling, clear boundaries, and a minimal memory profile.
 
@@ -88,7 +88,7 @@ The project is structured as a Cargo **workspace** with explicit crates per arch
 - `crates/infra/llm` — LLM provider port + OpenAI-compatible adapter (trait impl only, no secrets).
 - `crates/infra/filesystem` — Filesystem operations trait + std-backed impl.
 - `crates/infra/shell` — Shell execution trait + std::process-backed impl.
-- `crates/infra/config` — Configuration model + loader (env + `ag.toml`).
+- `crates/infra/config` — Configuration model + loader (env + `zcode.toml`).
 - `crates/cli` — `main.rs` + `cli/` module with `version` subcommand + wire-up (DI composition root) + `README` snippet.
 
 ### 3.2 Domain Entities (Scaffolded)
@@ -117,8 +117,8 @@ Domain traits (ports) to be declared now:
 
 | Requirement | Description |
 |-------------|-------------|
-| FR-CLI-01 | `cargo run --quiet -- version` prints `ag v<version> (git: <sha>, profile: <profile>)`. |
-| FR-CLI-02 | CLI is built with `clap v4` (derive) with a top-level `ag` command and subcommands `version`. |
+| FR-CLI-01 | `cargo run --quiet -- version` prints `zcode v<version> (git: <sha>, profile: <profile>)`. |
+| FR-CLI-02 | CLI is built with `clap v4` (derive) with a top-level `zcode` command and subcommands `version`. |
 | FR-CLI-03 | Build metadata (version from `CARGO_PKG_VERSION`, git SHA from `vergen`/`git` env, profile) is embedded at compile time. |
 | FR-CLI-04 | Composition root wires Domain/App/Infra and panics with a clean message on unresolved dependencies. |
 
@@ -162,7 +162,7 @@ The scaffolding **establishes the hooks** for the memory-efficiency mandate but 
 | FR-PERF-01 | `Cargo.toml` for the workspace sets `lto = "thin"` and `codegen-units = 1` for release builds (binary size + perf). |
 | FR-PERF-02 | A `benches/` directory exists with a criterion placeholder benchmark crate (stub) so perf regression tracking is wired early. |
 | FR-PERF-03 | Domain entities use owned `String`/`Box<[T]>` types over `&str`/references where it avoids lifetimes in core paths; this choice is documented in code comments. |
-| FR-PERF-04 | `ag.toml` example explicitly documents that defaults are tuned for low memory (model context window sizing guidance TBD). |
+| FR-PERF-04 | `zcode.toml` example explicitly documents that defaults are tuned for low memory (model context window sizing guidance TBD). |
 
 ---
 
@@ -212,7 +212,7 @@ The scaffolding **establishes the hooks** for the memory-efficiency mandate but 
 
 | ID | NFR | Acceptance |
 |----|-----|------------|
-| NFR-SEC-01 | No secrets in repo | `.gitignore` excludes `.env`, `target/`, `ag.toml.local`. No hardcoded credentials. |
+| NFR-SEC-01 | No secrets in repo | `.gitignore` excludes `.env`, `target/`, `zcode.toml.local`. No hardcoded credentials. |
 | NFR-SEC-02 | Supply chain | `deny.toml` + `rust-advisory-db`-friendly audit configured for CI. |
 
 ---
@@ -263,7 +263,7 @@ The scaffolding milestone must **resist scope creep**. The following are explici
 | Metric | Threshold (early signal) | Note |
 |--------|--------------------------|------|
 | L1 Compile time | `cargo build --release` cold < 180s on CI runner | Signals healthy crate size |
-| L2 Binary size | `ag version` release binary < 8 MB | Memory/efficiency proxy |
+| L2 Binary size | `zcode version` release binary < 8 MB | Memory/efficiency proxy |
 | L3 `cargo tree` edge count | Infra crates' direct deps ≤ 15 | Dependency complexity proxy |
 
 > A milestone is considered **successful** when all of section 6.1 is green and section 6.3 leading indicators are within threshold.

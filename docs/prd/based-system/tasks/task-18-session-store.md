@@ -2,12 +2,12 @@
 
 **Related PRD sections:** §3.2 Session & State Management (FR-SESSION-01..07), §3.8 Engine Loop (FR-LOOP / checkpoint), §8 DQ9 (UUIDv7)
 **Depends on:** task-02 (Domain — `Session`/`SessionStorePort` defined in §4.4 of the technical plan)
-**Status:** To do
+**Status:** Done
 **Priority:** High (the engine loop checkpoints here per turn; session lifecycle is a user-facing story US-E-09)
 
 ## Objective
 
-Implement `crates/infra/session` with `UuidSessionStore` writing portable, human-readable JSON sessions to `.ag/sessions/<id>.json`. Supports the full CLI subcommand set (`create`, `continue`, `fork`, `import`, `export`) and writes an **atomic checkpoint after every completed tool round** (FR-SESSION-06) so a killed process resumes from the last good state (NFR-REL-03). Session IDs are UUIDv7 (time-ordered for easy sorting).
+Implement `crates/infra/session` with `UuidSessionStore` writing portable, human-readable JSON sessions to `.zcode/sessions/<id>.json`. Supports the full CLI subcommand set (`create`, `continue`, `fork`, `import`, `export`) and writes an **atomic checkpoint after every completed tool round** (FR-SESSION-06) so a killed process resumes from the last good state (NFR-REL-03). Session IDs are UUIDv7 (time-ordered for easy sorting).
 
 ## Step-by-step
 
@@ -27,7 +27,7 @@ tempfile = "3.10"
 ### 2. `src/lib.rs` — `UuidSessionStore`
 
 ```rust
-pub struct UuidSessionStore { base: PathBuf }   // base = <working_dir>/.ag/sessions
+pub struct UuidSessionStore { base: PathBuf }   // base = <working_dir>/.zcode/sessions
 impl UuidSessionStore {
     pub fn new(base: PathBuf) -> Self;          // creates dir if missing
     fn id_path(&self, id: &str) -> Result<PathBuf, SessionError>; // validates id is UUIDv7, sanitizes
@@ -51,8 +51,8 @@ impl SessionStorePort for UuidSessionStore {
 ### 3. Safety details
 
 - **ID validation/sanitization:** `id_path` rejects any id not parseable as `Uuid::now_v7` or containing path separators (`/`, `\`, `..`) — prevents path traversal from a user-supplied session id.
-- **Atomic checkpoint:** write to `.ag/sessions/<id>.json.tmp` then `fs::rename` (rename is atomic on the same filesystem). On crash mid-write, the `.tmp` is ignored on next load (FR-SESSION-06, NFR-REL-03).
-- **Portability:** `.ag` is created relative to `config.working_dir`. Sessions are plain JSON (transcript + telemetry + metadata) so a teammate can copy `*.json` and `import` it (US-E-09, FR-SESSION-04/05).
+- **Atomic checkpoint:** write to `.zcode/sessions/<id>.json.tmp` then `fs::rename` (rename is atomic on the same filesystem). On crash mid-write, the `.tmp` is ignored on next load (FR-SESSION-06, NFR-REL-03).
+- **Portability:** `.zcode` is created relative to `config.working_dir`. Sessions are plain JSON (transcript + telemetry + metadata) so a teammate can copy `*.json` and `import` it (US-E-09, FR-SESSION-04/05).
 - **Metadata:** every session carries `created_at`, `model`, `mode`, `last_message_at`, `step_count` (FR-SESSION-07).
 
 ### 4. `Session` serialization
@@ -68,13 +68,13 @@ impl SessionStorePort for UuidSessionStore {
 - `import_export_roundtrip`: `export_to` a temp file → `import_from` that file → new UUIDv7; `load` the imported id equals the exported transcript.
 - `path_traversal_blocked`: `load("../../../etc/passwd")` → `SessionError::InvalidId`.
 - `id_with_separator_blocked`: `load("ab/cd")` → error.
-- `create_creates_dot_ag_dir`: `base` dir did not exist → `create` makes `.ag/sessions/`.
+- `create_creates_dot_ag_dir`: `base` dir did not exist → `create` makes `.zcode/sessions/`.
 
 ## Test-case scenario
 
-- `ag session create` prints a UUIDv7; `.ag/sessions/<id>.json` exists with `version`, `created_at`, `model`, `mode`, `step_count`.
-- Mid-`ag run` kill (SIGKILL) → `.ag/sessions/<id>.json` reflects the last completed checkpoint (FR-SESSION-06).
-- `ag session export <id> --to /tmp/x.json && ag session import /tmp/x.json` → new id, full transcript restored (US-E-09).
+- `zcode session create` prints a UUIDv7; `.zcode/sessions/<id>.json` exists with `version`, `created_at`, `model`, `mode`, `step_count`.
+- Mid-`zcode run` kill (SIGKILL) → `.zcode/sessions/<id>.json` reflects the last completed checkpoint (FR-SESSION-06).
+- `zcode session export <id> --to /tmp/x.json && zcode session import /tmp/x.json` → new id, full transcript restored (US-E-09).
 
 ## How to verify
 

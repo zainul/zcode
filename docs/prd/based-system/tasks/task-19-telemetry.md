@@ -2,12 +2,12 @@
 
 **Related PRD sections:** §3.6 Structured Output & Telemetry (FR-OUTPUT-01..09), §5.6 Observability (NFR-OBS-01/02), §8 DQ2 (token counting), §7 M1.7/M2.6
 **Depends on:** task-02 (Domain — `TelemetryEvent`/`TelemetryTotals`/`TelemetryEvent.extra` defined in §4.4 of the technical plan)
-**Status:** To do
+**Status:** Done
 **Priority:** High (machine-readable output + cost attribution is a hard requirement US-E-08 / G6)
 
 ## Objective
 
-Implement `crates/infra/telemetry` with `JsonTelemetry` that (a) streams one JSON object per event to stdout in headless `--json` mode (FR-OUTPUT-01, NFR-OBS-01) and (b) accumulates totals into `.ag/reports/<timestamp>-<session>.json` (FR-OUTPUT-02, NFR-OBS-02). The schema is the documented success metric for M1.7. Domain stays dep-free by carrying `ExtraField` (domain enum) instead of `serde_json::Value`.
+Implement `crates/infra/telemetry` with `JsonTelemetry` that (a) streams one JSON object per event to stdout in headless `--json` mode (FR-OUTPUT-01, NFR-OBS-01) and (b) accumulates totals into `.zcode/reports/<timestamp>-<session>.json` (FR-OUTPUT-02, NFR-OBS-02). The schema is the documented success metric for M1.7. Domain stays dep-free by carrying `ExtraField` (domain enum) instead of `serde_json::Value`.
 
 ## Step-by-step
 
@@ -47,7 +47,7 @@ struct TelemetryTotals { model, input_tokens, output_tokens, cache_tokens, steps
 ```rust
 pub struct JsonTelemetry {
     out: Box<dyn Write + Send>,          // stdout in headless; sink in TUI
-    report_dir: PathBuf,                 // .ag/reports
+    report_dir: PathBuf,                 // .zcode/reports
     totals: TelemetryTotals,
     start: Instant,
 }
@@ -61,7 +61,7 @@ impl TelemetryPort for JsonTelemetry {
         // write one JSON object + '\n' to out  (FR-OUTPUT-01 / NFR-OBS-01)
     }
     fn flush_report(&mut self, session_id: &str, totals: TelemetryTotals) -> Result<PathBuf, Box<dyn Error>> {
-        // write .ag/reports/<timestamp>-<session>.json atomically (temp+rename)
+        // write .zcode/reports/<timestamp>-<session>.json atomically (temp+rename)
     }
 }
 ```
@@ -83,7 +83,7 @@ impl TelemetryPort for JsonTelemetry {
 ```
 Every line is a single valid JSON object → `jq -e .` parseable (M1.6, NFR-OBS-01). `model` is always `provider/model` (FR-OUTPUT-08).
 
-### 5. Report file schema (`.ag/reports/<timestamp>-<session>.json`)
+### 5. Report file schema (`.zcode/reports/<timestamp>-<session>.json`)
 
 ```jsonc
 { "version":1, "session_id":"<uuidv7>", "model":"openai/gpt-4o-mini",
@@ -108,7 +108,7 @@ M1.7 requires exactly these keys. `flush_report` is called by the engine on loop
 
 ## Test-case scenario
 
-- `ag run --json "echo hi"` → stdout shows `{"kind":"loop_start",...}\n{"kind":"llm_delta",...}\n{"kind":"finish",...}\n`, parseable by `jq -e .`. A `.ag/reports/<ts>-<session>.json` appears with all required keys and the model token counts.
+- `zcode run --json "echo hi"` → stdout shows `{"kind":"loop_start",...}\n{"kind":"llm_delta",...}\n{"kind":"finish",...}\n`, parseable by `jq -e .`. A `.zcode/reports/<ts>-<session>.json` appears with all required keys and the model token counts.
 
 ## How to verify
 

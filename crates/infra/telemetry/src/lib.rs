@@ -1,5 +1,5 @@
 //! Telemetry emitter: streams one JSON object per event to `out` (JSONL, for
-//! `ag run --json`) and accumulates totals into `.ag/reports/<ts>-<session>.json`
+//! `zcode run --json`) and accumulates totals into `.zcode/reports/<ts>-<session>.json`
 //! on `flush_report` (FR-OUTPUT-01/02, NFR-OBS-01/02, M1.6/M1.7).
 //!
 //! `domain` stays serde-free (FR-DI-01) by carrying `ExtraField`; this crate is
@@ -472,7 +472,7 @@ mod tests {
     #[test]
     fn report_dir_created_if_missing() {
         let dir = tempfile::tempdir().unwrap().keep();
-        let nested = dir.join("ag").join("reports");
+        let nested = dir.join(".zcode").join("reports");
         let out: Box<dyn Write + Send> = Box::new(CapturingWriter::default());
         let _ = JsonTelemetry::new(out, nested.clone());
         assert!(nested.exists());

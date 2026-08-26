@@ -6,9 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-domain = { path = "../../domain", version = "0.1.0" }
+domain = { path = "../../domain", version = "0.2.0" }
 lsp-types = { workspace = true }
 serde_json = { workspace = true }
-
-[dev-dependencies]
-tempfile = "3.10"
