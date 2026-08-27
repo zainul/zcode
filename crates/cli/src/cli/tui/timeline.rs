@@ -59,6 +59,34 @@ impl ToolStatus {
     }
 }
 
+/// The glyph that says what *kind* of work a tool row did.
+///
+/// The status icon beside it says how the call went; this one says what was
+/// called, so a run of rows can be read by shape before any word is. Chosen
+/// from the same geometric and dingbat blocks as the status icons, all of
+/// which render one cell wide — a two-cell glyph would shift every column to
+/// its right, and a timeline that only lines up sometimes is worse than one
+/// with no icons at all.
+pub fn tool_icon(name: &str) -> &'static str {
+    let canonical = domain::canonical_tool_name(name);
+    if let Some(rest) = canonical.strip_prefix("mcp__") {
+        let _ = rest;
+        return "⊞";
+    }
+    if canonical.starts_with("lsp__") {
+        return "⌖";
+    }
+    match &*canonical {
+        "read" => "◇",
+        "list_dir" => "▪",
+        "write" | "str_replace_editor" => "✎",
+        "apply_patch" => "±",
+        "shell" => "❯",
+        "zcode_skill" => "✦",
+        _ => "·",
+    }
+}
+
 /// Severity of an engine note (a retry, a server warning).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NoteLevel {

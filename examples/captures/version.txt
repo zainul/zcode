@@ -1,5 +1,5 @@
 $ cd . && /Users/zainul/rust/zcode/target/release/zcode version
 
-zcode v0.2.0 (git: 59157b3-dirty, built: 2026-08-27T04:09:26Z, release)
+zcode v0.2.0 (git: 8c45155-dirty, built: 2026-08-27T10:11:41Z, release)
 
 [exit 0]

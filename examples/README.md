@@ -9,7 +9,7 @@ limit is legible.
 ```
 examples/
 ├── run-acceptance.sh     40 checks over the CLI surface
-├── tui-screenshot.py     71 checks; drives the TUI on a pty
+├── tui-screenshot.py     76 checks; drives the TUI on a pty
 ├── fake-provider.py      429s, a canned tool call, or N numbered lines
 ├── demo-go/              a Go project the agent edits and builds
 ├── demo-rust/            a Rust project
@@ -34,7 +34,7 @@ export ZCODE_OPENROUTER_API_KEY=sk-or-v1-...
 ./examples/run-acceptance.sh offline    # only what needs no API key
 ```
 
-`ratelimit`, `blocked`, `scrolling` and `providers` need no API key: all four
+`ratelimit`, `blocked`, `scrolling`, `providers` and `selection` need no API key: all four
 run against `fake-provider.py`, because what they prove is what *zcode* does —
 with a 429, with a given command, with more rows than fit, with two endpoints —
 and a live model that answers differently every time proves nothing either way.

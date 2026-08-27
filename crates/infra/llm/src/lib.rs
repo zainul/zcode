@@ -452,6 +452,13 @@ pub struct OpenAiShapeLlm {
     retry: RetryPolicy,
     /// Extra headers a specific provider requires (e.g. OpenRouter attribution).
     extra_headers: Vec<(&'static str, String)>,
+    /// When set, the stable prefix (system prompt + tools + history) is marked
+    /// with `cache_control` breakpoints so repeated calls hit the provider's
+    /// prompt cache instead of re-billing the full prompt every turn. Required
+    /// for Anthropic models routed through the OpenAI shape (OpenRouter), and
+    /// ignored by providers that do not understand it — which is why it is a
+    /// per-adapter flag rather than always-on.
+    cache_control: bool,
 }
 
 impl OpenAiShapeLlm {
@@ -468,12 +475,20 @@ impl OpenAiShapeLlm {
             provider: "openai",
             retry: RetryPolicy::default(),
             extra_headers: Vec::new(),
+            cache_control: false,
         }
     }
 
     /// Replace the retry policy (`max_retries` / `rate_limit_backoff_ms`).
     pub fn set_retry_policy(&mut self, retry: RetryPolicy) {
         self.retry = retry;
+    }
+
+    /// Enable provider prompt caching by marking the request prefix with
+    /// `cache_control` breakpoints (FR-COST-01).
+    pub fn with_cache_control(mut self, on: bool) -> Self {
+        self.cache_control = on;
+        self
     }
 
     fn labelled(mut self, provider: &'static str) -> Self {
@@ -508,7 +523,7 @@ impl OpenAiShapeLlm {
     }
 
     fn open_stream(&self, req: &LlmRequest) -> Result<RetriedResponse, BoxError> {
-        let payload = build_openai_request(req, &self.model);
+        let payload = build_openai_request(req, &self.model, self.cache_control);
         send_with_retry(self.provider, self.retry, || self.request(&payload))
     }
 
@@ -587,7 +602,8 @@ impl OpenRouterLlm {
                     "HTTP-Referer",
                     "https://github.com/zainul/zcode".to_string(),
                 )
-                .with_header("X-Title", "zcode".to_string()),
+                .with_header("X-Title", "zcode".to_string())
+                .with_cache_control(true),
         )
     }
     pub fn endpoint() -> &'static str {
@@ -646,7 +662,7 @@ fn chat_completions_url(base_url: &str) -> String {
 }
 openai_shaped_port!(VllmLlm);
 
-fn build_openai_request(req: &LlmRequest, model: &str) -> serde_json::Value {
+fn build_openai_request(req: &LlmRequest, model: &str, cache_control: bool) -> serde_json::Value {
     let messages: Vec<serde_json::Value> = req
         .messages
         .iter()
@@ -666,6 +682,20 @@ fn build_openai_request(req: &LlmRequest, model: &str) -> serde_json::Value {
     if !tools.is_empty() {
         payload["tools"] = serde_json::Value::Array(tools);
         payload["tool_choice"] = serde_json::json!("auto");
+    }
+    // Mark the whole stable prefix — system prompt, tools and the conversation
+    // so far — as a cache breakpoint. On a provider that honours
+    // `cache_control` (e.g. OpenRouter routing Anthropic models, or any
+    // OpenAI-compatible server that implements prompt caching) the next turn's
+    // identical prefix is served from cache instead of being re-billed. The
+    // breakpoint sits on the last message so it folds in everything before it.
+    if cache_control {
+        if let Some(last) = payload["messages"]
+            .as_array_mut()
+            .and_then(|m| m.last_mut())
+        {
+            last["cache_control"] = serde_json::json!({ "type": "ephemeral" });
+        }
     }
     payload
 }
@@ -1064,9 +1094,21 @@ fn build_anthropic_request(req: &LlmRequest, model: &str) -> serde_json::Value {
         "temperature": req.temperature,
     });
     if !system.is_empty() {
-        payload["system"] = serde_json::Value::String(system);
+        // Anthropic accepts the system prompt as an array of text blocks, and
+        // only blocks carry `cache_control`. Marking it caches the (large,
+        // turn-stable) system instructions so every turn after the first reads
+        // them from the prompt cache (FR-COST-01).
+        payload["system"] = serde_json::json!([
+            { "type": "text", "text": system, "cache_control": { "type": "ephemeral" } }
+        ]);
     }
     if !tools.is_empty() {
+        let mut tools = tools;
+        // The tool schemas are equally stable; a cache breakpoint on the last
+        // tool folds the whole tool list into the cached prefix.
+        if let Some(last) = tools.last_mut() {
+            last["cache_control"] = serde_json::json!({ "type": "ephemeral" });
+        }
         payload["tools"] = serde_json::Value::Array(tools);
     }
     payload
@@ -1770,7 +1812,7 @@ mod tests {
     #[test]
     fn openai_omits_empty_tool_arrays() {
         // An empty `tools: []` is rejected by several OpenAI-compatible servers.
-        let payload = build_openai_request(&req(), "gpt-4o-mini");
+        let payload = build_openai_request(&req(), "gpt-4o-mini", false);
         assert!(payload.get("tools").is_none());
         assert!(payload["stream"].as_bool().unwrap());
         assert!(payload["stream_options"]["include_usage"]
@@ -1786,7 +1828,7 @@ mod tests {
             description: "read a file".into(),
             params_json: r#"{"type":"object"}"#.into(),
         }]);
-        let payload = build_openai_request(&r, "gpt-4o-mini");
+        let payload = build_openai_request(&r, "gpt-4o-mini", false);
         assert_eq!(payload["tools"][0]["function"]["name"], "read");
         assert_eq!(payload["tool_choice"], "auto");
     }
@@ -1794,7 +1836,7 @@ mod tests {
     #[test]
     fn anthropic_lifts_the_system_prompt_out_of_messages() {
         let payload = build_anthropic_request(&req(), "claude-sonnet-4");
-        assert_eq!(payload["system"], "you are helpful");
+        assert_eq!(payload["system"][0]["text"], "you are helpful");
         let messages = payload["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 1, "system must not remain a message");
         assert_eq!(messages[0]["role"], "user");
@@ -1963,6 +2005,54 @@ mod tests {
         assert_eq!(finish.output_tokens, 2);
     }
     use super::*;
+
+    /// OpenRouter (and any cache-aware OpenAI-shaped server) must get a
+    /// `cache_control` breakpoint on the request prefix, or every turn re-pays
+    /// for the full system prompt + tools.
+    #[test]
+    fn openai_cache_control_marks_the_last_message() {
+        let payload = build_openai_request(&req(), "gpt-4o-mini", true);
+        let messages = payload["messages"].as_array().unwrap();
+        assert!(
+            messages
+                .last()
+                .unwrap()
+                .get("cache_control")
+                .is_some_and(|c| c["type"] == "ephemeral"),
+            "last message must carry the cache breakpoint: {messages:?}"
+        );
+        // A provider that ignores it must not receive the field at all.
+        let off = build_openai_request(&req(), "gpt-4o-mini", false);
+        assert!(off["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m.get("cache_control").is_none()));
+    }
+
+    /// Anthropic caches only what is explicitly marked; without the breakpoint
+    /// the large system prompt and tool schemas are re-billed every turn.
+    #[test]
+    fn anthropic_cache_control_marks_system_and_tools() {
+        let mut r = req();
+        r.tools = Box::new([domain::ToolSpec {
+            name: "read".into(),
+            description: "read a file".into(),
+            params_json: r#"{"type":"object"}"#.into(),
+        }]);
+        let payload = build_anthropic_request(&r, "claude-sonnet-4");
+        let sys = payload["system"]
+            .as_array()
+            .expect("system must be an array of blocks");
+        assert_eq!(sys[0]["type"], "text");
+        assert_eq!(sys[0]["cache_control"]["type"], "ephemeral");
+        let tools = payload["tools"].as_array().unwrap();
+        assert_eq!(
+            tools.last().unwrap()["cache_control"]["type"],
+            "ephemeral",
+            "last tool must carry the cache breakpoint"
+        );
+    }
 
     fn req() -> LlmRequest {
         LlmRequest {

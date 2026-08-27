@@ -4,6 +4,7 @@
 //! which tools exist, where sessions and reports are written. Nothing below
 //! the interface layer knows any of it — `app` sees port trait objects only.
 
+pub mod clipboard;
 pub mod emit;
 pub mod logging;
 pub mod tui;
@@ -447,6 +448,28 @@ pub fn run() -> CliResult {
     }
 }
 
+/// One line on rtk for `zcode config`: what it found, or why it did not.
+fn describe_rtk(cfg: &infra_config::RtkConfig) -> String {
+    if !cfg.enabled {
+        return "off (rtk.enabled = false)".to_string();
+    }
+    match tools::Rtk::detect(cfg.path.as_deref()) {
+        Some(found) => format!(
+            "{} — shell output is token-optimised  [{}]",
+            found.version(),
+            found.path().display()
+        ),
+        None if cfg.path.is_some() => {
+            format!(
+                "NOT FOUND at the configured rtk.path — {}",
+                tools::rtk::MANUAL_INSTALL_HINT
+            )
+        }
+        None if cfg.auto_install => "not installed — will be installed on the next run".to_string(),
+        None => format!("not installed — {}", tools::rtk::MANUAL_INSTALL_HINT),
+    }
+}
+
 fn load_config(
     path: Option<&Path>,
     mode: Option<AgentMode>,
@@ -730,6 +753,9 @@ fn cmd_config(args: ConfigArgs) -> CliResult {
         tools::builtin_deny_rule_count(),
         cfg.shell_denied.len()
     );
+    // Whether shell output is being shrunk before it reaches the model is a
+    // fact about every future token bill, so it is stated rather than implied.
+    println!("  {:<22} {}", "rtk", describe_rtk(&cfg.rtk));
     println!("  {:<22} {}", "mcp servers", cfg.mcp_servers.len());
 
     // LSP is on by default, so say which servers that actually resolved to —

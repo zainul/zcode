@@ -1922,6 +1922,7 @@ dependencies = [
  "infra-lsp",
  "infra-mcp",
  "infra-shell",
+ "log",
  "regex",
  "serde",
  "serde_json",

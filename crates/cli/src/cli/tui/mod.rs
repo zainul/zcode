@@ -23,12 +23,13 @@ use std::io;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
+use super::clipboard;
 use app::{AgentLoop, ExecutionRequest, ExecutionResult};
 use domain::{AgentMode, CancelFlag, Cost, UiEvent};
 use infra_config::Config;
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
+    Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 use ratatui::crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -52,6 +53,55 @@ const TICK: Duration = Duration::from_millis(80);
 /// Spinner frames, one per `SPINNER_PERIOD`.
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 const SPINNER_PERIOD: Duration = Duration::from_millis(90);
+/// A drag-selection over the conversation, in screen cells.
+///
+/// Held in screen coordinates rather than timeline positions because that is
+/// what the user is pointing at: they select what they can see, and what they
+/// can see is the wrapped, clipped, right-aligned result of a render. Mapping
+/// back to entries would mean copying text that is not on the screen.
+///
+/// The consequence is that a selection does not survive scrolling or new
+/// output, so both clear it — a highlight left behind after the rows beneath
+/// it moved would be pointing at the wrong words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Selection {
+    /// Where the drag started, (column, row).
+    pub anchor: (u16, u16),
+    /// Where the pointer is now.
+    pub head: (u16, u16),
+    /// True while the button is still down.
+    pub dragging: bool,
+}
+
+impl Selection {
+    fn new(at: (u16, u16)) -> Self {
+        Self {
+            anchor: at,
+            head: at,
+            dragging: true,
+        }
+    }
+
+    /// The selection as (first, last) in reading order, so the caller does not
+    /// have to care which way the drag went.
+    pub fn ordered(&self) -> ((u16, u16), (u16, u16)) {
+        let (a, b) = (self.anchor, self.head);
+        // Compare by row first: a drag up-and-left and one down-and-right are
+        // the same span read forwards.
+        if (a.1, a.0) <= (b.1, b.0) {
+            (a, b)
+        } else {
+            (b, a)
+        }
+    }
+
+    /// Whether anything is actually covered. A click without a drag selects
+    /// nothing, and must not clear the clipboard.
+    pub fn is_empty(&self) -> bool {
+        self.anchor == self.head
+    }
+}
+
 /// Rows one wheel notch moves the conversation. Terminals themselves scroll
 /// three, so matching it is what makes the pane feel native.
 const WHEEL_ROWS: u16 = 3;
@@ -141,6 +191,16 @@ pub struct TuiState {
     pub providers: Vec<String>,
     /// Rows scrolled back from the tail; 0 means "following the tail".
     pub scrollback: u16,
+    /// The drag in progress, or the one just finished.
+    pub selection: Option<Selection>,
+    /// The text under `selection`, lifted from the frame that drew it.
+    ///
+    /// Extracted during the draw because that is the only place the rendered
+    /// cells exist; bounded by the pane, so a screenful, not a session.
+    pub selected_text: String,
+    /// The conversation pane's area on the last frame, to tell a drag over the
+    /// transcript from one over the prompt.
+    pub pane: Rect,
     /// The largest `scrollback` the last frame could actually honour.
     ///
     /// Scrolling has to be clamped against the *rendered* height, which only
@@ -149,6 +209,14 @@ pub struct TuiState {
     /// same number of PageDowns does nothing on the way back. That reads
     /// exactly like a pane that will not scroll.
     pub max_scroll: u16,
+    /// Prompts sent this session, newest last, for `Up`/`Down` recall.
+    pub history: Vec<String>,
+    /// Index into `history`; equal to `history.len()` while editing the live
+    /// prompt, and pointing at a recalled entry otherwise.
+    pub history_cursor: usize,
+    /// The in-progress draft, stashed when history recall begins so it can be
+    /// restored when the user returns to the bottom with `Down`.
+    pub history_draft: String,
 }
 
 impl Default for TuiState {
@@ -166,13 +234,74 @@ impl Default for TuiState {
             totals: Totals::default(),
             tool_names: Vec::new(),
             providers: Vec::new(),
+            selection: None,
+            selected_text: String::new(),
+            pane: Rect::new(0, 0, 0, 0),
             scrollback: 0,
             max_scroll: 0,
+            history: Vec::new(),
+            history_cursor: 0,
+            history_draft: String::new(),
         }
     }
 }
 
 impl TuiState {
+    /// Begin a drag, if it started inside the conversation.
+    fn start_selection(&mut self, col: u16, row: u16) {
+        if inside(self.pane, col, row) {
+            self.selection = Some(Selection::new((col, row)));
+            self.selected_text.clear();
+        }
+    }
+
+    /// Extend the drag. The pointer is clamped into the pane rather than
+    /// ignored when it leaves, so dragging off the edge selects to the edge
+    /// instead of freezing halfway.
+    fn extend_selection(&mut self, col: u16, row: u16) {
+        let pane = self.pane;
+        if let Some(sel) = self.selection.as_mut() {
+            if sel.dragging {
+                sel.head = clamp_into(pane, col, row);
+            }
+        }
+    }
+
+    /// Finish the drag and put what it covered on the clipboard.
+    ///
+    /// Copying on release is the behaviour of a terminal's own selection, and
+    /// the alternative — select now, press something later — means the
+    /// highlight has to survive output arriving underneath it, which it
+    /// cannot.
+    fn finish_selection(&mut self, out: &mut impl std::io::Write) {
+        let Some(sel) = self.selection.as_mut() else {
+            return;
+        };
+        sel.dragging = false;
+        if sel.is_empty() {
+            // A plain click is how you dismiss a selection, not an empty copy.
+            self.selection = None;
+            return;
+        }
+        let text = std::mem::take(&mut self.selected_text);
+        let lines = text.lines().count().max(1);
+        match clipboard::copy(&text, out) {
+            Ok(how) => self.push_note(
+                &format!("{lines} line(s) {}", how.describe()),
+                NoteLevel::Info,
+            ),
+            Err(why) => self.push_note(&format!("could not copy: {why}"), NoteLevel::Warn),
+        }
+        self.selected_text = text;
+    }
+
+    /// Drop the highlight. Anything that moves the rows underneath it has to
+    /// call this, or it would be pointing at different words than it did.
+    fn clear_selection(&mut self) {
+        self.selection = None;
+        self.selected_text.clear();
+    }
+
     /// Scroll back by `rows`, stopping at the oldest line the last frame drew.
     ///
     /// Clamping here rather than only in the renderer is what makes the pane
@@ -180,10 +309,12 @@ impl TuiState {
     /// the view has stopped, and then swallows the first N scrolls back down.
     pub fn scroll_up(&mut self, rows: u16) {
         self.scrollback = self.scrollback.saturating_add(rows).min(self.max_scroll);
+        self.clear_selection();
     }
 
     pub fn scroll_down(&mut self, rows: u16) {
         self.scrollback = self.scrollback.saturating_sub(rows);
+        self.clear_selection();
     }
 
     /// Engine or UI commentary, shown as a note row.
@@ -379,6 +510,8 @@ impl TuiState {
             }
         }
         self.scrollback = 0;
+        // The rows the highlight covered have just moved.
+        self.clear_selection();
     }
 
     /// The status line: what the agent is doing, and what it has cost.
@@ -624,6 +757,39 @@ fn summarize_arguments(arguments: &str) -> String {
 
 fn first_line(text: &str) -> String {
     text.lines().next().unwrap_or_default().to_string()
+}
+
+/// Hand `text` to the clipboard and say what happened.
+///
+/// Reports rather than assumes: the previous version wrote an OSC 52 escape
+/// and announced success, which on a terminal that ignores the sequence —
+/// macOS Terminal.app among them — meant "copied" and an unchanged clipboard.
+fn copy_and_report(state: &mut TuiState, text: &str, what: &str) {
+    match clipboard::copy(text, &mut io::stdout()) {
+        Ok(how) => state.push_note(&format!("{what} {}", how.describe()), NoteLevel::Info),
+        Err(why) => state.push_note(&format!("could not copy {what}: {why}"), NoteLevel::Warn),
+    }
+}
+
+/// The most recent assistant message, or the in-flight stream if one is showing.
+fn last_agent_text(state: &TuiState) -> Option<String> {
+    if !state.streaming.trim().is_empty() {
+        return Some(state.streaming.clone());
+    }
+    for entry in state.timeline.entries().iter().rev() {
+        if let EntryKind::Agent(text) = &entry.kind {
+            return Some(text.to_string());
+        }
+    }
+    None
+}
+
+/// Copy the last assistant answer to the clipboard and tell the user.
+fn copy_last_answer(state: &mut TuiState) {
+    match last_agent_text(state) {
+        Some(text) => copy_and_report(state, &text, "the last answer —"),
+        None => state.push_note("nothing to copy yet", NoteLevel::Info),
+    }
 }
 
 fn render_elapsed(elapsed: Duration) -> String {
@@ -956,6 +1122,16 @@ fn render_loop(
             Event::Mouse(mouse) => match mouse.kind {
                 MouseEventKind::ScrollUp => state.scroll_up(WHEEL_ROWS),
                 MouseEventKind::ScrollDown => state.scroll_down(WHEEL_ROWS),
+                // Drag to select, release to copy — the same gesture the
+                // terminal would have given us if we were not capturing the
+                // mouse in order to scroll.
+                MouseEventKind::Down(MouseButton::Left) => {
+                    state.start_selection(mouse.column, mouse.row)
+                }
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    state.extend_selection(mouse.column, mouse.row)
+                }
+                MouseEventKind::Up(MouseButton::Left) => state.finish_selection(&mut io::stdout()),
                 _ => {}
             },
             Event::Key(key) => {
@@ -1002,7 +1178,12 @@ fn handle_key(
         }
         KeyCode::Char('d') if ctrl && state.input.is_empty() => return Flow::Quit,
         KeyCode::Esc => {
-            if state.busy() {
+            // Dismissing a highlight is the least destructive thing Esc can
+            // mean, so it goes first: cancelling a turn because you wanted to
+            // clear a selection would be an expensive misunderstanding.
+            if state.selection.is_some() {
+                state.clear_selection();
+            } else if state.busy() {
                 cancel.trigger();
                 state.phase = Phase::Cancelling;
             } else if !state.input.is_empty() {
@@ -1043,11 +1224,63 @@ fn handle_key(
         KeyCode::PageDown => state.scroll_down(PAGE_ROWS),
         KeyCode::Up if ctrl || alt => state.scroll_up(1),
         KeyCode::Down if ctrl || alt => state.scroll_down(1),
+        // Bare arrows recall prompt history; the modifiers above still scroll
+        // the conversation when the caret is in the prompt.
+        KeyCode::Up => history_prev(state),
+        KeyCode::Down => history_next(state),
 
-        KeyCode::Char(c) => state.input.insert_char(c),
+        KeyCode::Char('y') if ctrl => copy_last_answer(state),
+        KeyCode::Char(c) => {
+            // Typing while a recalled line is shown clears the recall pointer —
+            // the edited text becomes the live draft, as in a shell.
+            if state.history_cursor != state.history.len() {
+                state.history_cursor = state.history.len();
+            }
+            state.input.insert_char(c)
+        }
         _ => {}
     }
     Flow::Continue
+}
+
+/// Walk back through past prompts with `Up` (FR-IFACE-05: history recall).
+fn history_prev(state: &mut TuiState) {
+    if state.history.is_empty() {
+        return;
+    }
+    if state.history_cursor == state.history.len() {
+        state.history_draft = state.input.text().to_string();
+    }
+    if state.history_cursor > 0 {
+        state.history_cursor -= 1;
+        state.input.set(state.history[state.history_cursor].clone());
+    }
+}
+
+/// Walk forward again with `Down`; reaching the bottom restores the draft.
+fn history_next(state: &mut TuiState) {
+    if state.history_cursor == state.history.len() {
+        return;
+    }
+    state.history_cursor += 1;
+    if state.history_cursor == state.history.len() {
+        state.input.set(std::mem::take(&mut state.history_draft));
+    } else {
+        state.input.set(state.history[state.history_cursor].clone());
+    }
+}
+
+/// Record a sent prompt so it can be recalled. Consecutive duplicates are dropped
+/// so `Up` always surfaces a distinct prompt.
+fn record_history(state: &mut TuiState, prompt: &str) {
+    if prompt.trim().is_empty() {
+        return;
+    }
+    if state.history.last().is_none_or(|l| l != prompt) {
+        state.history.push(prompt.to_string());
+    }
+    state.history_cursor = state.history.len();
+    state.history_draft.clear();
 }
 
 /// Handle Enter: run a slash command, or send the prompt to the engine.
@@ -1072,6 +1305,7 @@ fn submit(state: &mut TuiState, cmd_tx: &Sender<Command>, cancel: &CancelFlag) -
     }
 
     let prompt = state.input.take();
+    record_history(state, &prompt);
     state.timeline.push_user(&prompt);
     state.scrollback = 0;
     state.phase = Phase::Working {
@@ -1200,6 +1434,33 @@ fn run_command(
                 state.push_note("nothing to stop", NoteLevel::Info);
             }
         }
+        SlashCommand::Copy(arg) => {
+            let text = match arg.as_deref() {
+                Some("all") => state
+                    .timeline
+                    .entries()
+                    .iter()
+                    .rev()
+                    .filter_map(|e| match &e.kind {
+                        EntryKind::User(t) | EntryKind::Agent(t) => Some(t.to_string()),
+                        EntryKind::Note { text, .. } => Some(text.to_string()),
+                        EntryKind::Tool { .. } => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                _ => match last_agent_text(state) {
+                    Some(t) => t,
+                    None => {
+                        state.push_note("nothing to copy yet", NoteLevel::Info);
+                        return Flow::Continue;
+                    }
+                },
+            };
+            copy_and_report(state, &text, "—");
+        }
         SlashCommand::Unknown(name) => state.push_note(
             &format!("unknown command `{name}` — /help lists them all"),
             NoteLevel::Warn,
@@ -1273,6 +1534,50 @@ fn draw_conversation(frame: &mut ratatui::Frame, state: &mut TuiState, area: Rec
     };
     let widget = Paragraph::new(rows).block(Block::default().borders(Borders::ALL).title(title));
     frame.render_widget(widget, area);
+
+    state.pane = area;
+    paint_selection(frame, state, area);
+}
+
+/// Highlight the selection and lift its text out of the frame.
+///
+/// Done against the rendered buffer rather than the `Line`s, for two reasons:
+/// the styling survives whatever colours the rows already carry, and the cells
+/// are the only place the *final* text exists — after wrapping, clipping and
+/// right-alignment. Copying anything else would hand over text the user cannot
+/// see on screen.
+fn paint_selection(frame: &mut ratatui::Frame, state: &mut TuiState, area: Rect) {
+    let Some(sel) = state.selection else {
+        return;
+    };
+    let ((from_col, from_row), (to_col, to_row)) = sel.ordered();
+    let (left, right) = (area.x + 1, area.x + area.width.saturating_sub(2));
+    let highlight = Style::default()
+        .bg(Color::White)
+        .fg(Color::Black)
+        .add_modifier(Modifier::BOLD);
+
+    let mut text = String::new();
+    let buffer = frame.buffer_mut();
+    for row in from_row..=to_row {
+        // Only the first and last rows are partial; the rest span the pane,
+        // which is how a terminal's own selection reads.
+        let start = if row == from_row { from_col } else { left };
+        let end = if row == to_row { to_col } else { right };
+        let mut line = String::new();
+        for col in start..=end.min(right) {
+            let cell = &mut buffer[(col, row)];
+            line.push_str(cell.symbol());
+            cell.set_style(highlight);
+        }
+        // Trailing padding is layout, not content — nobody wants to paste the
+        // gap between a tool name and its duration.
+        text.push_str(line.trim_end());
+        if row < to_row {
+            text.push('\n');
+        }
+    }
+    state.selected_text = text;
 }
 
 /// Turn the timeline into styled, wrapped rows.
@@ -1311,6 +1616,9 @@ fn render_timeline(
 ) -> (usize, Vec<Line<'static>>) {
     let entries = state.timeline.entries();
     let body_width = width.saturating_sub(2).max(8);
+    // Measured once for the whole frame: both walkers must agree on it or the
+    // counted height would not match the rows built.
+    let name_col = tool_name_col(entries);
     let mut rows: Vec<Line> = Vec::new();
     let mut total = 0usize;
     // Whether the row before this entry was blank, so a gap is never doubled
@@ -1334,7 +1642,8 @@ fn render_timeline(
         let previous_was_tool = i > 0 && entries[i - 1].is_tool();
         let next_is_tool = entries.get(i + 1).is_some_and(|e| e.is_tool());
         let gap = needs_gap && entry_opens_a_block(entry);
-        let height = gap as usize + entry_height(entry, body_width, width, previous_was_tool);
+        let height =
+            gap as usize + entry_height(entry, body_width, width, previous_was_tool, name_col);
 
         // Skip entries entirely above the window: count them, build nothing.
         if let Some((skip, count)) = window {
@@ -1356,6 +1665,7 @@ fn render_timeline(
             width,
             previous_was_tool,
             next_is_tool,
+            name_col,
             &mut group,
         );
         take(group, &mut total, &mut rows);
@@ -1396,6 +1706,7 @@ fn entry_height(
     body_width: usize,
     width: usize,
     previous_was_tool: bool,
+    name_col: usize,
 ) -> usize {
     match &entry.kind {
         EntryKind::User(text) | EntryKind::Agent(text) => {
@@ -1412,7 +1723,7 @@ fn entry_height(
             status,
             elapsed_ms,
         } => {
-            let room = tool_detail_room(name, *elapsed_ms, width);
+            let room = tool_detail_room(name, *elapsed_ms, width, name_col);
             let below = if detail_wraps_below(detail, *status, room) {
                 detail_height(detail, width)
             } else {
@@ -1433,6 +1744,7 @@ fn entry_rows(
     width: usize,
     previous_was_tool: bool,
     next_is_tool: bool,
+    name_col: usize,
     out: &mut Vec<Line<'static>>,
 ) {
     match &entry.kind {
@@ -1466,7 +1778,7 @@ fn entry_rows(
                 ));
             }
             let branch = if next_is_tool { "├" } else { "└" };
-            let room = tool_detail_room(name, *elapsed_ms, width);
+            let room = tool_detail_room(name, *elapsed_ms, width, name_col);
             let below = detail_wraps_below(detail, *status, room);
             out.push(tool_line(
                 branch,
@@ -1476,6 +1788,7 @@ fn entry_rows(
                 if below { "" } else { detail },
                 *elapsed_ms,
                 width,
+                name_col,
             ));
             if below {
                 push_detail(out, detail, width, *status);
@@ -1528,7 +1841,33 @@ fn push_body(rows: &mut Vec<Line<'static>>, text: &str, width: usize, style: Sty
 }
 
 /// Width of the tool-name column, before the detail begins.
-const TOOL_NAME_COL: usize = 18;
+/// Bounds on the tool-name column.
+///
+/// It used to be a flat 18, which put fourteen blank cells between `read` and
+/// what it read. The column exists so a run of rows lines up, and it only has
+/// to be as wide as the widest name actually on screen — so it is measured
+/// per frame, floored so a lone `read` still reads as a column, and capped so
+/// one `mcp__some_server__some_tool` cannot push the detail off the row.
+const TOOL_NAME_MIN: usize = 6;
+const TOOL_NAME_MAX: usize = 22;
+
+/// Width of the icon and the space after it, ahead of the name.
+const TOOL_ICON_COL: usize = 2;
+
+/// The name column for this frame: the widest tool name in the timeline,
+/// within bounds. Computed once and passed down, so the two walkers that must
+/// agree on row heights are measuring the same thing.
+fn tool_name_col(entries: &[timeline::Entry]) -> usize {
+    entries
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EntryKind::Tool { name, .. } => Some(name.chars().count()),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(TOOL_NAME_MIN)
+        .clamp(TOOL_NAME_MIN, TOOL_NAME_MAX)
+}
 
 /// `HH:MM:SS`. [`timeline::Timeline::clock`] is fixed width, which is what
 /// lets [`entry_height`] size a tool row without building it.
@@ -1539,13 +1878,13 @@ const TOOL_CLOCK_WIDTH: usize = 8;
 const TOOL_DETAIL_INDENT: usize = 6;
 
 /// Characters left for the detail on the tool row itself.
-fn tool_detail_room(name: &str, elapsed_ms: u32, width: usize) -> usize {
+fn tool_detail_room(name: &str, elapsed_ms: u32, width: usize, name_col: usize) -> usize {
     let head = TOOL_DETAIL_INDENT + TOOL_CLOCK_WIDTH + 2;
-    // A long tool name (`mcp__server__tool`) pushes the column out rather than
-    // being cut; the detail gets whatever is left.
-    let name_col = name.chars().count().max(TOOL_NAME_COL) + 1;
+    // A name past the cap pushes the column out rather than being cut; the
+    // detail gets whatever is left.
+    let names = TOOL_ICON_COL + name.chars().count().max(name_col) + 1;
     let duration = timeline::render_duration(elapsed_ms).chars().count();
-    width.saturating_sub(head + name_col + duration + 1)
+    width.saturating_sub(head + names + duration + 1)
 }
 
 /// Whether a tool row's detail has to move to its own rows underneath.
@@ -1607,6 +1946,7 @@ fn tool_line(
     detail: &str,
     elapsed_ms: u32,
     width: usize,
+    name_col: usize,
 ) -> Line<'static> {
     let colour = match status {
         ToolStatus::Running => Color::Yellow,
@@ -1617,7 +1957,11 @@ fn tool_line(
     let duration = timeline::render_duration(elapsed_ms);
     // "  ├ ✔ 14:23:02  " + name column + detail + right-aligned duration.
     let head = format!("  {branch} {} {clock}  ", status.icon());
-    let name_col = format!("{name:<TOOL_NAME_COL$} ");
+    let name_col = format!(
+        "{icon} {name:<width$} ",
+        icon = timeline::tool_icon(name),
+        width = name_col
+    );
     let used = head.chars().count() + name_col.chars().count() + duration.chars().count() + 1;
     let room = width.saturating_sub(used);
     let detail = clip(detail, room);
@@ -1704,6 +2048,32 @@ fn input_height(state: &TuiState, total_width: u16) -> u16 {
     let width = total_width.saturating_sub(4).max(1) as usize;
     let rows = wrap::wrap(state.input.text(), width).len() as u16;
     rows.clamp(1, MAX_INPUT_ROWS) + 2 // borders
+}
+
+/// Whether a screen cell is inside `area`'s border.
+fn inside(area: Rect, col: u16, row: u16) -> bool {
+    col > area.x
+        && row > area.y
+        && col < area.x.saturating_add(area.width).saturating_sub(1)
+        && row < area.y.saturating_add(area.height).saturating_sub(1)
+}
+
+/// The nearest cell inside `area`'s border, so a drag off the edge selects to
+/// the edge rather than stopping where the pointer left.
+fn clamp_into(area: Rect, col: u16, row: u16) -> (u16, u16) {
+    let left = area.x.saturating_add(1);
+    let top = area.y.saturating_add(1);
+    let right = area
+        .x
+        .saturating_add(area.width)
+        .saturating_sub(2)
+        .max(left);
+    let bottom = area
+        .y
+        .saturating_add(area.height)
+        .saturating_sub(2)
+        .max(top);
+    (col.clamp(left, right), row.clamp(top, bottom))
 }
 
 /// Scroll offset that keeps the newest lines visible, honouring scrollback.
@@ -2508,6 +2878,122 @@ mod tests {
     fn scrollback_moves_the_window_and_cannot_run_off_the_top() {
         assert_eq!(tail_offset(100, 10, 10), 80);
         assert_eq!(tail_offset(100, 10, 500), 0);
+    }
+
+    // ---- selection ---------------------------------------------------------
+
+    fn pane_state() -> TuiState {
+        let mut state = TuiState::default();
+        // A 100x20 pane at the origin: usable cells are 1..=98 by 1..=18.
+        state.pane = Rect::new(0, 0, 100, 20);
+        state
+    }
+
+    #[test]
+    fn a_drag_selects_from_where_it_started_to_where_it_is() {
+        let mut state = pane_state();
+        state.start_selection(10, 4);
+        state.extend_selection(30, 6);
+        let sel = state.selection.expect("a drag started");
+        assert_eq!(sel.ordered(), ((10, 4), (30, 6)));
+        assert!(sel.dragging);
+    }
+
+    #[test]
+    fn dragging_backwards_selects_the_same_span() {
+        // Up-and-left is the same words as down-and-right; the caller should
+        // not have to know which way the mouse went.
+        let mut a = pane_state();
+        a.start_selection(30, 6);
+        a.extend_selection(10, 4);
+        let mut b = pane_state();
+        b.start_selection(10, 4);
+        b.extend_selection(30, 6);
+        assert_eq!(
+            a.selection.unwrap().ordered(),
+            b.selection.unwrap().ordered()
+        );
+    }
+
+    #[test]
+    fn dragging_off_the_edge_selects_to_the_edge() {
+        // Not "stops responding": the pointer leaving the pane is how people
+        // select the last line.
+        let mut state = pane_state();
+        state.start_selection(10, 4);
+        state.extend_selection(500, 500);
+        let (_, end) = state.selection.unwrap().ordered();
+        assert_eq!(end, (98, 18), "clamped inside the border");
+    }
+
+    #[test]
+    fn a_drag_that_starts_on_the_prompt_is_not_a_selection() {
+        // The prompt is below the pane; dragging there is text editing, not
+        // transcript selection.
+        let mut state = pane_state();
+        state.start_selection(10, 25);
+        assert!(state.selection.is_none());
+    }
+
+    #[test]
+    fn a_click_without_a_drag_dismisses_rather_than_copies() {
+        let mut state = pane_state();
+        state.selected_text = "stale".into();
+        state.start_selection(10, 4);
+        let mut out: Vec<u8> = Vec::new();
+        state.finish_selection(&mut out);
+        assert!(state.selection.is_none(), "a bare click clears");
+        assert!(
+            !state.timeline.entries().iter().any(|e| matches!(
+                &e.kind,
+                EntryKind::Note { text, .. } if text.contains("copied")
+            )),
+            "nothing was selected, so nothing was copied"
+        );
+    }
+
+    #[test]
+    fn anything_that_moves_the_rows_drops_the_highlight() {
+        // A selection is screen coordinates. Once the rows underneath it move
+        // it is pointing at different words, so it must not survive.
+        for shift in [
+            (|s: &mut TuiState| s.scroll_up(3)) as fn(&mut TuiState),
+            |s: &mut TuiState| s.scroll_down(1),
+            |s: &mut TuiState| s.finish_turn(Err("boom".into())),
+        ] {
+            let mut state = pane_state();
+            state.max_scroll = 50;
+            state.start_selection(10, 4);
+            state.extend_selection(30, 6);
+            assert!(state.selection.is_some());
+            shift(&mut state);
+            assert!(state.selection.is_none(), "the highlight outlived its rows");
+        }
+    }
+
+    #[test]
+    fn esc_clears_a_selection_before_it_cancels_a_turn() {
+        // Cancelling a running turn because someone wanted to dismiss a
+        // highlight would be an expensive misunderstanding.
+        let mut state = pane_state();
+        state.phase = Phase::Working {
+            since: Instant::now(),
+            step: 1,
+            max: 12,
+        };
+        state.start_selection(10, 4);
+        state.extend_selection(30, 6);
+
+        let (cmd_tx, _rx) = std::sync::mpsc::channel();
+        let cancel = CancelFlag::default();
+        let key = ratatui::crossterm::event::KeyEvent::new(
+            KeyCode::Esc,
+            ratatui::crossterm::event::KeyModifiers::NONE,
+        );
+        handle_key(&mut state, key, &cancel, &cmd_tx);
+
+        assert!(state.selection.is_none());
+        assert!(state.busy(), "the turn was left alone");
     }
 
     #[test]

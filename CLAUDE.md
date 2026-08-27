@@ -146,6 +146,12 @@ boundaries), `wrap.rs`, `command.rs` (slash commands). Notes:
   `Entry` (user / agent / tool / note) and tool rows render inline under the
   message that made the call. `ToolCallStart` commits the streamed prose first,
   which is what puts the row *below* the sentence that announced it.
+- **The tool-name column is measured, not fixed.** `tool_name_col` takes the
+  widest name on screen, clamped to `[TOOL_NAME_MIN, TOOL_NAME_MAX]`, and is
+  computed once per frame so both walkers size rows identically. A flat 18 put
+  fourteen blank cells between `read` and what it read. `timeline::tool_icon`
+  prefixes each row with what was called; every glyph is one cell wide, since
+  a two-cell one would shift every column to its right.
 - **Failures wrap, successes clip.** A successful tool row is an index entry —
   the first line of the result, clipped to the row. A failure is the text the
   user has to act on, so `detail_wraps_below` sends it to `push_detail`, which
@@ -171,12 +177,20 @@ boundaries), `wrap.rs`, `command.rs` (slash commands). Notes:
   `heap_bytes()` exists so a test can hold it to a budget.
 - **Bracketed paste.** `EnableBracketedPaste` + `Event::Paste`; without it a
   multi-line paste arrives as key events and every embedded newline sends.
-- **Mouse capture, and the cost of it.** `EnableMouseCapture` is what makes the
+- **Mouse capture, and what it costs.** `EnableMouseCapture` is what makes the
   wheel scroll — the alternate screen has no terminal scrollback to fall back
-  on, so without it the pane simply does not move. The price is that a plain
-  drag no longer selects text (Shift, or Option on macOS Terminal, still does);
-  `command::MOUSE_NOTE` says so in `/help`, because unexplained it reads as
-  broken copy/paste.
+  on, so without it the pane simply does not move. It also stops the terminal
+  selecting text, so the TUI does that itself: `Selection` holds *screen*
+  cells, `paint_selection` highlights them straight in the frame buffer and
+  lifts the text from the same cells (the only place the wrapped, clipped,
+  right-aligned result exists), and release copies. Screen coordinates mean a
+  selection cannot outlive a scroll or new output — everything that moves rows
+  calls `clear_selection`.
+- **Copying reports its mechanism.** `cli::clipboard` tries `pbcopy`/`wl-copy`/
+  `xclip`/`xsel`/`clip.exe`, then OSC 52, and returns which one ran. A
+  clipboard is write-only, so "copied" with no mechanism is a guess — the
+  previous version wrote OSC 52, ignored the result, and said "copied" on
+  Terminal.app, which ignores the sequence.
 - **Scrollback is clamped, not just saturated.** `draw_conversation` records
   `max_scroll` because only the draw knows the rendered height, and
   `scroll_up` stops there. Letting the counter run past the top is not
@@ -242,6 +256,36 @@ you never have to debug it.
 child with it, keeps running, and so does the session — which is the point of
 switching mid-conversation.
 
+## rtk
+
+Shell output is routed through [rtk](https://github.com/rtk-ai/rtk) when it is
+available (`[rtk]` config, on by default). `tools::rtk` does one thing: shell
+out to `rtk rewrite "<cmd>"` and use the answer. It does **not** carry a table
+of rewritable commands — rtk's own judgement is the point (`test -f x` is not a
+test runner, `read` is a builtin, `env FOO=1 make` keeps its prefix), and a
+local copy of that table would drift and be wrong.
+
+Keyed on **stdout, not the exit code**: `rtk rewrite --help` documents `0` for a
+rewrite, and rtk 0.36.0 actually exits `3`.
+
+`GuardedShell::effective_command` applies it **after** `check()`. Both lists are
+written against the commands a person types, so rewriting first would stop
+`git (status|diff)( .*)?` matching anything. The rewrite is re-checked against
+the denylist and discarded if it trips — rtk only prepends a proxy, so it never
+should, but the command line is assembled by another program.
+
+Auto-install announces itself before running (`brew install` is slow enough to
+read as a hang) and records a failure in `~/.config/zcode/rtk-install-failed`,
+skipping retries for 24h — machine-wide, or every project would retry
+independently. `install_is_due_at` takes the path rather than reading `HOME`,
+because a unit that reads env can only be tested by moving env, which is
+process-global and breaks whatever else is running.
+
+Auto-install is **Homebrew only**. `rtk` is in homebrew-core (auditable);
+`cargo install rtk` is a *different crate* (Rust Type Kit), and upstream's
+installer is `curl … | sh`, which zcode's own denylist refuses. It only runs a
+package manager that is already present.
+
 ## Configuration
 
 Layered, each overriding the previous field by field:
@@ -289,6 +333,13 @@ Shell safety is three checks in `tools::guard`, in order:
    commands, refused **regardless of `shell_allowed`**. This is what lets the
    default allowlist be generous. `shell_denied` in config *extends* it and
    accumulates across config layers; nothing removes a built-in.
+   Recursive `rm` is **not** a pattern here: a regex sees the `-r` but not the
+   path, so it refused `rm -rf node_modules` as hard as `rm -rf /` and the only
+   way past was to disable the guard. `unbounded_recursive_rm` judges the
+   target instead (`is_bounded_delete_target`): literal, no expansion, no
+   `..`, and either relative or under `SCRATCH_ROOTS`. It scans every word, not
+   just command positions, because the regex it replaced matched anywhere —
+   `find . -exec rm -rf {} +` has to stay caught.
 3. **Allowlist** — the command is split on `;`/`|`/newline and every segment
    must match a `shell_allowed` pattern **in full** (patterns are anchored). An
    empty list denies everything.

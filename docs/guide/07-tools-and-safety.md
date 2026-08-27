@@ -125,7 +125,7 @@ and the ones that publish irreversibly.
 
 | Category | Examples |
 |----------|----------|
-| Irreversible destruction | `rm -rf`, `rm -r`, `dd … of=`, `mkfs`, `shred`, fork bombs |
+| Irreversible destruction | `rm /`, `dd … of=`, `mkfs`, `shred`, fork bombs |
 | Privilege escalation | `sudo`, `doas`, `su`, `chmod 777`, `chown root` |
 | Fetch-and-run | `curl … \| sh`, `wget … \| bash` |
 | Host state | `shutdown`, `reboot`, `halt`, `killall` |
@@ -139,6 +139,48 @@ explicitly so the model does not waste a turn trying to widen the allowlist:
 shell: error: command refused: it matches zcode's built-in denylist
 (\brm\s+(-[a-zA-Z]*\s+)*-[a-zA-Z]*[rR]), which `shell_allowed` cannot
 override: sudo rm -rf /tmp/zcode-test
+```
+
+#### Recursive deletes are judged by their target
+
+`rm -rf` is not banned outright. A rule that reads the flag and never the path
+refuses `rm -rf node_modules` exactly as hard as `rm -rf /` — which is not
+safety, it is just a reason to switch the guard off. So the target is what is
+checked, and the bar is *can a reader tell what will be gone afterwards*:
+
+| Command | |
+|---------|---|
+| `rm -rf node_modules` | ✔ a specific directory, inside the working tree |
+| `rm -rf ./target`, `rm -rf dist/` | ✔ |
+| `rm -rf src/generated` | ✔ — deleting your own source is your business |
+| `rm -rf /tmp/build-123` | ✔ scratch space, naming something *in* it |
+| `rm -rf /` | ✖ |
+| `rm -rf ~`, `rm -rf ~/Documents` | ✖ the home directory |
+| `rm -rf *`, `rm -rf build/*` | ✖ a glob the shell expands after the check |
+| `rm -rf $BUILD_DIR` | ✖ likewise a variable |
+| `rm -rf .`, `rm -rf ..`, `rm -rf ../x` | ✖ the tree itself, or out of it |
+| `rm -rf /usr`, `rm -rf /etc/nginx` | ✖ absolute, outside scratch |
+| `rm -rf /tmp` | ✖ the scratch root itself |
+| `rm -rf` | ✖ no target at all |
+
+The refusal names the offending word, not just the line, so the model can fix
+it rather than retry it:
+
+```
+command refused: `rm -r` must name a specific path, and "~/Library" does not —
+globs, `~`, `..`, `$VAR` and absolute paths outside /tmp are refused because
+what they delete cannot be read from the command: rm -rf build dist ~/Library
+  hint: name the directory itself, e.g. `rm -rf node_modules` or `rm -rf ./target`
+```
+
+It cannot be dodged by hiding the `rm`: `cd /tmp && rm -rf /`,
+`find . -exec rm -rf {} +` and `ls | xargs rm -rf /` are all refused, and so is
+`/bin/rm`. Quoting does not help either — `rm -rf "$HOME"` is the same request.
+
+If you want no recursive deletes at all, `shell_denied` still gets you there:
+
+```json
+{ "shell_denied": ["\\brm\\s+.*-[a-zA-Z]*[rR]"] }
 ```
 
 Add your own rules with `shell_denied`. They *extend* the built-ins — a project
@@ -159,7 +201,7 @@ The default allowlist covers the toolchains a coding agent actually needs:
 | Group | Covered |
 |-------|---------|
 | Inspect | `ls`, `cat`, `head`, `tail`, `wc`, `grep`, `rg`, `find`, `fd`, `tree`, `diff`, `sed`, `awk`, `jq`, `stat`, `du`, … |
-| Files | `mkdir`, `touch`, `cp`, `mv`, `ln`, `rm` (non-recursive; the denylist stops the rest) |
+| Files | `mkdir`, `touch`, `cp`, `mv`, `ln`, `rm` (recursive too, for a specific path — see above) |
 | Version control | `git`, `gh`, `glab` |
 | Rust | `cargo`, `rustc`, `rustup`, `rustfmt` |
 | Go | `go`, `gofmt`, `goimports`, `golangci-lint`, `staticcheck`, `dlv`, `air`, `templ` |
@@ -238,6 +280,111 @@ Rules worth knowing:
 
    In the TUI that message is wrapped in full underneath its tool row, never
    truncated — a refusal you cannot read is a refusal you cannot fix.
+
+## Token-optimised shell output (rtk)
+
+Every byte a shell command returns is fed into the transcript and billed on
+every subsequent turn. [rtk](https://github.com/rtk-ai/rtk) is a CLI proxy that
+runs the command you asked for and filters what comes back:
+
+| Command | Bare | Through rtk |
+|---------|------|-------------|
+| `ls -la` | 438 B | 61 B (−87%) |
+| `git status` | 234 B | 98 B (−59%) |
+
+Measured through zcode's own shell tool, on a small repository; the ratio grows
+with the output.
+
+**It is on by default when rtk is installed, and zcode will install it if it is
+not.** Nothing needs configuring.
+
+### What zcode does, and does not do
+
+zcode reimplements none of rtk's filtering. Before running a shell command it
+asks rtk one question — `rtk rewrite "<command>"` — which rtk documents as the
+single source of truth its own hooks use. If rtk answers, that is what runs.
+
+Deciding here which commands are safe to rewrite would mean duplicating rtk's
+judgement and getting it wrong. `test -f x` must not become `rtk test -f x`
+(different `test` entirely), `read` is a shell builtin, and `env FOO=1 make`
+has to keep its prefix. rtk already knows all of this, so it is asked rather
+than second-guessed.
+
+### The guard runs first
+
+The rewrite happens **after** the allowlist and denylist have passed the
+original command. Both are written against the commands a person types: a
+pattern like `git (status|diff)( .*)?` would stop matching the moment every
+command grew an `rtk ` prefix, and an allowlist that refuses everything it was
+written to permit is worse than no rtk at all.
+
+The denylist therefore judges what was *meant* — `git push --force` is refused
+before rtk ever sees it. The rewritten command is re-checked against the
+denylist anyway, and discarded in favour of the original if it somehow trips
+it. rtk only prepends a proxy, so that should never happen; "should never" is
+not a property worth assuming about a command line assembled by another
+program.
+
+### Installing
+
+| Situation | What happens |
+|-----------|--------------|
+| rtk on `PATH` | used, silently |
+| not installed, Homebrew present | `brew install rtk` — announced first, then used |
+| not installed, no Homebrew | a warning naming the command to run; zcode continues without it |
+| an install failed | not retried for 24 hours |
+| `rtk.enabled = false` | never looked for |
+
+Detection costs nothing measurable and happens once per process. The install
+happens at most once: it says what it is doing *before* it runs, because
+`brew install` can take a minute and a first run that stalls without
+explanation reads as a hang. If it fails, the failure is recorded machine-wide
+(`~/.config/zcode/rtk-install-failed`) and not retried for a day — otherwise a
+machine with no network would pay the package manager's failure cost on every
+single invocation, forever. A later success clears the record.
+
+Homebrew only, deliberately. `rtk` is in **homebrew-core** rather than a
+third-party tap, so what it installs is auditable. The alternatives are not:
+`cargo install rtk` resolves to **an unrelated crate** (Rust Type Kit, not the
+token killer), and upstream's shell installer is `curl … | sh` — the exact
+pattern [zcode's own denylist refuses](#2-the-denylist--which-shell_allowed-cannot-override).
+A tool that forbids the model from piping the network into a shell has no
+business doing it itself.
+
+Installation only ever runs a package manager that is **already present**. It
+installs a package; it does not install a package manager, and it never
+downloads a script to execute.
+
+### Configuring it
+
+```json
+{
+  "rtk": {
+    "enabled": true,
+    "auto_install": true,
+    "path": "/opt/homebrew/bin/rtk"
+  }
+}
+```
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `enabled` | `true` | Use rtk when available. `false` stops zcode looking for it |
+| `auto_install` | `true` | Install rtk when missing, via an existing package manager |
+| `path` | *(none)* | An explicit binary, for a machine where rtk is not on `PATH` |
+
+`ZCODE_RTK=0`, `ZCODE_RTK_AUTO_INSTALL=0` and `ZCODE_RTK_PATH` override these,
+for turning it off in one shell or one CI job without editing a file.
+
+`zcode config` always says which state you are in:
+
+```
+rtk                    0.36.0 — shell output is token-optimised  [/opt/homebrew/bin/rtk]
+```
+
+zcode is quiet when rtk works and loud when it does not: a line on every launch
+about an optimisation that always works is noise, but a configured `path` that
+does not resolve, or an install that fails, is a warning you will see.
 
 ## Skills
 

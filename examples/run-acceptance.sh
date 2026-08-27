@@ -123,6 +123,10 @@ expect  config-go      'shell_denied +[0-9]+ built-in'
 capture config-rust    "$RS_DEMO" "$ZCODE" config
 expect  config-rust    'project looks like rust'
 
+# rtk state is always reported: whether shell output is being shrunk before it
+# reaches the model is a fact about every future token bill.
+expect  config-go      'rtk +(([0-9]+\.[0-9]+.*token-optimised)|not installed|off )'
+
 # A broken allowlist is caught before a token is spent, and exits non-zero.
 capture config-broken  "$ROOT/examples/broken" "$ZCODE" config
 expect  config-broken  'regular expressions, not shell globs'
@@ -132,7 +136,9 @@ expect  config-broken  'exit 1'
 MULTI="$ROOT/examples/multi-provider"
 capture config-multi   "$MULTI"   "$ZCODE" config
 expect  config-multi   'provider +primary +\(openai-compatible\)'
-expect  config-multi   'providers +3'
+# Not a fixed count: a user-level config may declare providers of its own,
+# and them merging in is the feature, not a failure.
+expect  config-multi   'providers +[0-9]+'
 expect  config-multi   '▸ primary'
 expect  config-multi   'backup .*openai-compatible'
 expect  config-multi   'local .*ollama'
@@ -148,7 +154,7 @@ expect  provider-flag  '11434'
 # An unknown name is refused before any request, and says what it would take.
 capture provider-bad   "$MULTI"   "$ZCODE" run --provider nope "hi"
 expect  provider-bad   'unknown provider `nope`'
-expect  provider-bad   'configured: primary, backup, local'
+expect  provider-bad   'configured:.*primary.*backup'
 expect  provider-bad   'exit 1'
 
 # ---------------------------------------------------------------------------

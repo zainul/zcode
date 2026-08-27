@@ -7,6 +7,147 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — shell output is token-optimised through rtk, by default
+
+Every byte a shell command returns enters the transcript and is billed on every
+later turn. [rtk](https://github.com/rtk-ai/rtk) is a CLI proxy that runs the
+command and filters what comes back; zcode now uses it automatically.
+
+Measured through zcode's own shell tool:
+
+| Command | Bare | Through rtk |
+|---------|------|-------------|
+| `ls -la` | 438 B | 61 B (−87%) |
+| `git status` | 234 B | 98 B (−59%) |
+
+If rtk is installed it is used. If it is not, and Homebrew is present, zcode
+installs it. Nothing needs configuring; `rtk.enabled = false` (or `ZCODE_RTK=0`)
+turns it off.
+
+**zcode reimplements none of rtk's filtering.** Before running a command it asks
+`rtk rewrite "<command>"`, which rtk documents as the single source of truth its
+own hooks use. A local table of "commands safe to rewrite" would duplicate rtk's
+judgement and get it wrong — `test -f x` is not a test runner, `read` is a shell
+builtin, `env FOO=1 make` must keep its prefix — so rtk is asked instead of
+second-guessed. (The result is keyed on stdout, not the exit code: `rtk rewrite
+--help` documents `0` for a rewrite, and rtk 0.36.0 exits `3`.)
+
+**The guard still runs first.** The rewrite happens after the allowlist and
+denylist have passed the original, because both are written against the commands
+a person types: `git (status|diff)( .*)?` would stop matching the moment every
+command grew an `rtk ` prefix. So the denylist judges what was *meant* —
+`git push --force` is refused before rtk sees it — and the rewritten command is
+re-checked against the denylist anyway, falling back to the original if it trips.
+
+**Auto-install is Homebrew only, deliberately.** `rtk` is in homebrew-core rather
+than a third-party tap, so what it installs is auditable. `cargo install rtk`
+resolves to an unrelated crate (Rust Type Kit), and upstream's shell installer is
+`curl … | sh` — the exact pattern zcode's own denylist refuses. A tool that
+forbids the model from piping the network into a shell should not do it itself.
+Installation only ever runs a package manager that is already present.
+
+`zcode config` reports the state, and zcode is quiet when rtk works and loud when
+it does not: a broken `rtk.path` or a failed install is a warning; a working
+setup says nothing on every launch.
+
+The install announces itself *before* it runs — `brew install` can take a minute,
+and a first run that stalls without explanation reads as a hang — and a failure
+is recorded machine-wide and not retried for 24 hours, so a machine with no
+network does not pay the package manager's failure cost on every invocation. A
+later success clears the record.
+
+### Added — select text with the mouse, and copy it
+
+Capturing the mouse to get wheel scrolling took the terminal's own selection
+away. zcode now does the selection itself: **drag to select, release to copy.**
+The highlight follows the drag, spanning whole rows in between the way a
+terminal's does, and the text goes to the system clipboard.
+
+It says which mechanism reached the clipboard:
+
+```
+· 3 line(s) copied (pbcopy)
+```
+
+That is not decoration. A clipboard is write-only — nothing can read it back to
+confirm — so the alternative is announcing success and hoping. `/copy` and
+`Ctrl-Y` previously did exactly that: they wrote an OSC 52 escape, discarded
+the result, and reported "copied to the clipboard" even on terminals that
+ignore the sequence, macOS Terminal.app among them. All three paths now go
+through one `cli::clipboard` module that tries `pbcopy`, `wl-copy`, `xclip`,
+`xsel` and `clip.exe` first — exact, the same clipboard everything else uses —
+and falls back to OSC 52, which is the only thing that works over SSH.
+
+`Esc` dismisses a highlight, and does so *before* it cancels a turn: cancelling
+a running turn when you meant to clear a selection is an expensive
+misunderstanding. The selection is in screen coordinates, so scrolling or new
+output clears it rather than leaving a highlight over words that have moved.
+**Shift-drag** still gives the terminal's own selection.
+
+### Changed — tool rows are tighter, and say what was called
+
+The name column was a flat 18 characters, which put fourteen blank cells
+between `read` and what it read. It is now measured per frame — as wide as the
+widest name actually on screen, floored so a lone `read` still reads as a
+column and capped so one `mcp__some_server__some_tool` cannot push the detail
+off the row.
+
+Each row also opens with a glyph for the kind of work it did, beside the one
+that says how it went:
+
+```
+  ├ ✔ 20:21:35  ◇ read      package main                          82ms
+  ├ ✔ 20:21:35  ▪ list_dir  .zcode/                              823ms
+  ├ ✔ 20:21:36  ❯ shell     go build ./...                        1.2s
+  └ ✖ 20:21:38  ± apply_patch  hunk 2 does not match src/lib.rs
+```
+
+`◇` read · `▪` list_dir · `✎` write and str_replace_editor · `±` apply_patch ·
+`❯` shell · `✦` zcode_skill · `⌖` any `lsp__*` · `⊞` any `mcp__*`. All are one
+cell wide — a two-cell glyph would shift every column to its right, and a
+timeline that lines up only sometimes is worse than one with no icons.
+
+### Fixed — `rm -rf` could not delete anything
+
+The denylist refused every recursive `rm`, so `rm -rf node_modules` was blocked
+exactly as hard as `rm -rf /`:
+
+```
+command refused: it matches zcode's built-in denylist
+(\brm\s+(-[a-zA-Z]*\s+)*-[a-zA-Z]*[rR]), which `shell_allowed` cannot
+override: rm -rf node_modules
+```
+
+Cleaning a build directory is ordinary work, and a rule that blocks it is not
+safety — it is a reason to switch the guard off, which is what people did.
+
+The rule read the flag and never the path, because a regex cannot do otherwise.
+It has been replaced by a structural check that judges the **target**, with the
+bar being *can a reader tell what will be gone afterwards*:
+
+| Allowed | Refused |
+|---------|---------|
+| `rm -rf node_modules`, `rm -rf ./target`, `rm -rf dist/` | `rm -rf /` |
+| `rm -rf src/generated` | `rm -rf ~`, `rm -rf ~/Documents` |
+| `rm -rf /tmp/build-123` (scratch, naming a path *in* it) | `rm -rf *`, `rm -rf build/*` |
+| `rm -rf a b c` | `rm -rf $BUILD_DIR` |
+| | `rm -rf .`, `rm -rf ..`, `rm -rf ../x` |
+| | `rm -rf /usr`, `rm -rf /tmp` |
+| | `rm -rf` with no target |
+
+Globs and variables are refused because the shell expands them *after* the
+check: `rm -rf $BUILD_DIR` is a request to delete something the guard cannot
+see. The refusal names the offending word rather than the whole line, so the
+model can correct it instead of retrying it.
+
+The check scans every word, not just the start of each command, because the
+regex it replaces matched anywhere — `cd /tmp && rm -rf /`,
+`find . -exec rm -rf {} +`, `ls | xargs rm -rf /` and `/bin/rm -rf /` were all
+caught before and still are. Quoting does not evade it either.
+
+This is a default, not a policy: `{ "shell_denied": ["\\brm\\s+.*-[a-zA-Z]*[rR]"] }`
+restores a blanket ban for a project that wants one.
+
 ### Added — several providers in one config
 
 `providers` is an array of named endpoints; `provider` says which is active:

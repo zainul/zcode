@@ -32,6 +32,8 @@ pub enum SlashCommand {
     Tools,
     /// Cancel the turn in flight.
     Stop,
+    /// Copy the last answer (or `all` of the conversation) to the clipboard.
+    Copy(Option<String>),
     /// A `/word` that is not a command — reported, not sent to the model.
     Unknown(String),
 }
@@ -55,13 +57,20 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/new", "start a fresh session (clears the model's context)"),
     ("/clear", "clear the screen, keep the session"),
     ("/stop", "cancel the turn in flight (also Esc)"),
+    (
+        "/copy [all]",
+        "copy the last answer, or all of the conversation",
+    ),
 ];
 
 /// Keys worth telling the user about, for `/help`.
 pub const KEYS: &[(&str, &str)] = &[
     ("Enter", "send"),
     ("Alt-Enter", "newline without sending"),
-    ("Esc", "cancel the turn in flight, else clear the prompt"),
+    (
+        "Esc",
+        "dismiss a selection, cancel the turn, or clear the prompt",
+    ),
     ("Ctrl-C", "cancel if busy, otherwise quit"),
     ("Ctrl-A / Ctrl-E", "start / end of line"),
     ("Ctrl-W", "delete the previous word"),
@@ -71,15 +80,20 @@ pub const KEYS: &[(&str, &str)] = &[
         "scroll the conversation (also the mouse wheel)",
     ),
     ("Ctrl-Up / Ctrl-Down", "scroll one line"),
+    ("Drag", "select; releasing copies to the clipboard"),
     ("Shift-Tab", "cycle mode"),
+    ("Ctrl-Y", "copy the last answer to the clipboard"),
+    ("Up / Down", "recall the previous / next sent prompt"),
 ];
 
-/// Told to the user once, in `/help`: the mouse wheel scrolls because zcode
-/// asks the terminal for mouse events, and a terminal that is reporting the
-/// mouse no longer selects text with it. Every terminal keeps a modifier for
-/// the old behaviour, and not saying so makes it look like copy/paste broke.
-pub const MOUSE_NOTE: &str =
-    "the mouse wheel scrolls; hold Shift (Option on macOS Terminal) to select text";
+/// Told to the user once, in `/help`.
+///
+/// zcode captures the mouse so the wheel can scroll, which stops the terminal
+/// doing its own selection — so zcode does it instead: drag to select, release
+/// to copy. The terminal's own selection is still there under Shift for anyone
+/// who wants it, and saying so costs one line.
+pub const MOUSE_NOTE: &str = "drag to select and copy · wheel scrolls · \
+     Shift-drag for the terminal's own selection";
 
 /// Parse a prompt line. `None` means "this is a prompt, send it".
 pub fn parse(line: &str) -> Option<SlashCommand> {
@@ -115,6 +129,7 @@ pub fn parse(line: &str) -> Option<SlashCommand> {
         "session" | "sessions" => SlashCommand::Session,
         "tools" => SlashCommand::Tools,
         "stop" | "cancel" => SlashCommand::Stop,
+        "copy" => SlashCommand::Copy(arg.map(|a| a.trim().to_string())),
         other => SlashCommand::Unknown(format!("/{other}")),
     })
 }
@@ -143,6 +158,22 @@ mod tests {
     fn exit_has_the_spellings_people_try() {
         for line in ["/exit", "/quit", "/q", "  /EXIT  "] {
             assert_eq!(parse(line), Some(SlashCommand::Exit), "{line}");
+        }
+    }
+
+    /// `/help` is drawn into the conversation pane, which wraps. A line that
+    /// overruns breaks across two rows mid-phrase — "else clear the / prompt"
+    /// — which reads as a rendering fault rather than a long sentence.
+    #[test]
+    fn every_help_line_fits_a_standard_pane() {
+        // 98 columns of pane, less the two-space body indent.
+        const ROOM: usize = 96;
+        for line in help_lines() {
+            assert!(
+                line.chars().count() <= ROOM,
+                "{} chars, {ROOM} available: {line:?}",
+                line.chars().count()
+            );
         }
     }
 

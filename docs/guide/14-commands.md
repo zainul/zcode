@@ -203,6 +203,7 @@ it as ordinary text.
 | `/new` | `/reset` | Start a fresh session — clears the model's context |
 | `/clear` | `/cls` | Clear the screen, keep the session |
 | `/stop` | `/cancel` | Cancel the turn in flight |
+| `/copy [all]` | — | Copy the last answer, or the whole conversation |
 
 An unknown `/word` is reported rather than silently sent:
 
@@ -229,15 +230,18 @@ unknown command `/exitt` — /help lists them all
 | `Ctrl-W` | Delete the previous word |
 | `Ctrl-U` / `Ctrl-K` | Delete to start / end of line |
 | `Ctrl-L` | Clear both panes |
+| Drag | Select; releasing copies to the clipboard |
+| `Ctrl-Y` | Copy the last answer |
 | Mouse wheel | Scroll the conversation |
 | `PageUp` / `PageDown` | Scroll the conversation a page |
 | `Ctrl-↑` / `Ctrl-↓` | Scroll one line |
 | `Ctrl-Home` / `Ctrl-End` | Jump to the oldest / newest line |
 
-The wheel scrolls because zcode asks the terminal to report mouse events. The
-side effect is that a plain drag no longer selects text — every terminal keeps
-that on a modifier (**Shift**, or **Option** on macOS Terminal), and `/help`
-says so, because otherwise it looks like copy/paste broke.
+zcode asks the terminal to report mouse events so the wheel can scroll, which
+stops the terminal doing its own selection — so zcode does it: drag to select,
+release to copy, and it says which mechanism reached the clipboard. See
+[chapter 5](05-tui.md#selecting-and-copying). **Shift-drag** still gets the
+terminal's own selection.
 
 Paste works with your terminal's normal paste key (`Cmd-V`, `Ctrl-Shift-V`).
 zcode enables bracketed paste, so the entire clipboard lands in the prompt at

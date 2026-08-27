@@ -32,8 +32,9 @@ pub const DEFAULT_SHELL_ALLOWED: &[&str] = &[
     r"(cd|basename|dirname|realpath|readlink|which|type|command -v)( .*)?",
     r"(grep|egrep|fgrep|rg|ag|find|fd|tree|diff|comm|sort|uniq|cut|tr|column)( .*)?",
     r"(sed|awk|jq|yq|xargs)( .*)?",
-    // `rm` is here because build workflows delete files; the denylist above
-    // still refuses every recursive and root-targeted form.
+    // `rm` is here because build workflows delete files. Recursive forms are
+    // allowed for a specific path (`rm -rf node_modules`) and refused when the
+    // target cannot be read (`rm -rf ~`, `*`, `$VAR`) — `tools::guard`.
     r"(mkdir|touch|cp|mv|ln|rm)( .*)?",
     // -- version control -----------------------------------------------------
     r"git( .*)?",
@@ -372,6 +373,32 @@ pub struct Config {
     pub pricing: Vec<PriceEntry>,
     /// Set false to skip the built-in language-server defaults.
     pub lsp_defaults: bool,
+    /// Token-optimised shell output via rtk.
+    pub rtk: RtkConfig,
+}
+
+/// How zcode uses [rtk](https://github.com/rtk-ai/rtk), if at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RtkConfig {
+    /// Use rtk when it is available. On by default: an agent that reads less
+    /// output costs less, and rtk decides for itself which commands it can
+    /// safely improve.
+    pub enabled: bool,
+    /// Install rtk when it is missing, using a package manager the machine
+    /// already has.
+    pub auto_install: bool,
+    /// An explicit binary, for a machine where rtk is not on `PATH`.
+    pub path: Option<String>,
+}
+
+impl Default for RtkConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            auto_install: true,
+            path: None,
+        }
+    }
 }
 
 impl Default for Config {
@@ -404,6 +431,7 @@ impl Default for Config {
             rate_limit_backoff_ms: DEFAULT_RATE_LIMIT_BACKOFF_MS,
             pricing: Vec::new(),
             lsp_defaults: true,
+            rtk: RtkConfig::default(),
         }
     }
 }
@@ -680,6 +708,20 @@ struct ConfigFile {
     rate_limit_backoff_ms: Option<u64>,
     #[serde(default)]
     pricing: Option<Vec<PricingEntryFile>>,
+    #[serde(default)]
+    rtk: RtkSection,
+}
+
+/// Serde mirror of [`RtkConfig`]. Every field is optional so `[rtk]` can name
+/// only what it disagrees with.
+#[derive(Debug, Default, Deserialize)]
+struct RtkSection {
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    auto_install: Option<bool>,
+    #[serde(default)]
+    path: Option<String>,
 }
 
 /// One `providers` entry as written in the file.
@@ -782,6 +824,15 @@ impl Default for LspSection {
             servers: Vec::new(),
             defaults: true,
         }
+    }
+}
+
+/// The spellings of yes and no people actually type in an env var.
+fn parse_bool(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
     }
 }
 
@@ -982,6 +1033,15 @@ impl Loader {
             if let Some(ms) = file.rate_limit_backoff_ms {
                 config.rate_limit_backoff_ms = ms;
             }
+            if let Some(v) = file.rtk.enabled {
+                config.rtk.enabled = v;
+            }
+            if let Some(v) = file.rtk.auto_install {
+                config.rtk.auto_install = v;
+            }
+            if let Some(v) = file.rtk.path {
+                config.rtk.path = Some(v);
+            }
             if let Some(rates) = file.pricing {
                 // Later layers take precedence, so a project rate wins over a
                 // machine-wide one: prepend rather than append.
@@ -1069,6 +1129,17 @@ impl Loader {
             );
             config.shell_denied = merged.into_boxed_slice();
         }
+        // Turning rtk off is the thing someone needs to do quickly, on a
+        // machine or in a CI job, without editing a file.
+        if let Ok(v) = std::env::var("ZCODE_RTK") {
+            config.rtk.enabled = parse_bool(&v).unwrap_or(config.rtk.enabled);
+        }
+        if let Ok(v) = std::env::var("ZCODE_RTK_AUTO_INSTALL") {
+            config.rtk.auto_install = parse_bool(&v).unwrap_or(config.rtk.auto_install);
+        }
+        if let Ok(p) = std::env::var("ZCODE_RTK_PATH") {
+            config.rtk.path = Some(p);
+        }
         if let Ok(m) = std::env::var("ZCODE_MODE") {
             config.mode = m
                 .parse::<AgentMode>()
@@ -1154,6 +1225,19 @@ pub fn user_config_candidates() -> Vec<PathBuf> {
     };
     let dir = base.join("zcode");
     vec![dir.join("config.json"), dir.join("config.toml")]
+}
+
+/// The machine-wide state directory, `~/.config/zcode`.
+///
+/// Distinct from `<working_dir>/.zcode`, which is per-project. Things that are
+/// true of the *machine* — whether an auto-install has been tried — belong
+/// here, or every project would retry it independently.
+pub fn user_state_dir() -> Option<PathBuf> {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+        .map(|base| base.join("zcode"))
 }
 
 /// The machine-wide config, if one exists.
@@ -1459,6 +1543,63 @@ kind = "ollama"
         assert_eq!(cfg.provider_name, "cheap");
         assert_eq!(other.provider_name, "local");
         assert_eq!(other.model, "llama3.2");
+    }
+
+    #[test]
+    fn rtk_is_on_by_default() {
+        assert!(Config::default().rtk.enabled);
+        assert!(Config::default().rtk.auto_install);
+        assert_eq!(Config::default().rtk.path, None);
+    }
+
+    #[test]
+    fn the_rtk_section_overrides_only_what_it_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Loader::new(&write_config(&dir, "[rtk]\nauto_install = false\n"))
+            .load()
+            .unwrap();
+        assert!(cfg.rtk.enabled, "still on");
+        assert!(!cfg.rtk.auto_install, "but it will not install one");
+    }
+
+    #[test]
+    fn rtk_can_be_turned_off_entirely() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Loader::new(&write_config(&dir, "[rtk]\nenabled = false\n"))
+            .load()
+            .unwrap();
+        assert!(!cfg.rtk.enabled);
+    }
+
+    #[test]
+    fn rtk_env_overrides_beat_the_file() {
+        // Turning it off in one CI job must not need a file edit.
+        let _guard = env_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(&dir, "[rtk]\nenabled = true\n");
+
+        std::env::set_var("ZCODE_RTK", "0");
+        std::env::set_var("ZCODE_RTK_PATH", "/opt/rtk");
+        let cfg = Loader::new(&path).load().unwrap();
+        std::env::remove_var("ZCODE_RTK");
+        std::env::remove_var("ZCODE_RTK_PATH");
+
+        assert!(!cfg.rtk.enabled);
+        assert_eq!(cfg.rtk.path.as_deref(), Some("/opt/rtk"));
+    }
+
+    #[test]
+    fn the_spellings_of_no_that_people_type_all_work() {
+        for raw in ["0", "false", "no", "off", "FALSE", " Off "] {
+            assert_eq!(parse_bool(raw), Some(false), "{raw:?}");
+        }
+        for raw in ["1", "true", "yes", "on", "YES"] {
+            assert_eq!(parse_bool(raw), Some(true), "{raw:?}");
+        }
+        // Anything else leaves the configured value alone rather than
+        // guessing, which is what the caller's `unwrap_or` relies on.
+        assert_eq!(parse_bool("maybe"), None);
+        assert_eq!(parse_bool(""), None);
     }
 
     #[test]

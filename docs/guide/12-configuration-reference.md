@@ -50,6 +50,9 @@ Run `zcode config` to see which files were read and what they resolve to.
 | `lsp.servers` | array | *(auto-detected)* | — | Language servers (below); defaults are chosen from the project's own files |
 | `lsp.defaults` | bool | `true` | — | Set `false` to start no language server unless one is listed |
 | `pricing` | array | `[]` | — | Per-model rate overrides for the cost estimate (below) |
+| `rtk.enabled` | bool | `true` | `ZCODE_RTK` | Route shell output through [rtk](07-tools-and-safety.md#token-optimised-shell-output-rtk) to cut tokens |
+| `rtk.auto_install` | bool | `true` | `ZCODE_RTK_AUTO_INSTALL` | Install rtk when missing, using a package manager the machine already has |
+| `rtk.path` | path | *(none)* | `ZCODE_RTK_PATH` | Explicit rtk binary, when it is not on `PATH` |
 
 `ZCODE_SHELL_ALLOWED` and `ZCODE_SHELL_DENIED` are newline-separated so patterns
 may contain spaces. Setting `ZCODE_SHELL_ALLOWED` to the empty string denies
@@ -372,6 +375,11 @@ back to the default in the table above if you delete it.
     "servers": [
       { "language": "rust", "command": "rust-analyzer", "args": [], "env": [] }
     ]
+  },
+
+  "rtk": {
+    "enabled": true,
+    "auto_install": true
   }
 }
 ```
@@ -427,6 +435,10 @@ defaults = true
 [[lsp.servers]]
 language = "rust"
 command = "rust-analyzer"
+
+[rtk]
+enabled = true
+auto_install = true
 ```
 
 ### Keeping it small

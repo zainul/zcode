@@ -3,18 +3,18 @@ the same shape of command under "shell_allowed": [".*"]
 
 ┌────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │┌ conversation ────────────────────────────────────────────────────────────────────────────────────┐│
-││10:50:44  zcode                                                                                   ││
+││17:01:03  zcode                                                                                   ││
 ││  Ready when you are. Type /help for commands.                                                    ││
 ││                                                                                                  ││
-││10:50:46  you                                                                                     ││
+││17:01:05  you                                                                                     ││
 ││  run the pipeline                                                                                ││
 ││                                                                                                  ││
-││10:50:46  zcode                                                                                   ││
+││17:01:05  zcode                                                                                   ││
 ││  Running that for you now.                                                                       ││
 ││  tools used                                                                                      ││
-││  └ ✔ 10:50:46  shell              b                                                         28ms ││
+││  └ ✔ 17:01:05  ❯ shell  b                                                                   43ms ││
 ││                                                                                                  ││
-││10:50:46  zcode                                                                                   ││
+││17:01:05  zcode                                                                                   ││
 ││  That is what the shell had to say.                                                              ││
 ││                                                                                                  ││
 ││                                                                                                  ││

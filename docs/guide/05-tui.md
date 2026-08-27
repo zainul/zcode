@@ -60,11 +60,11 @@ shows `n/a` instead.
 `/help` lists everything, in the app:
 
 ```
-┌ conversation (scrolled ↑4, PageDown to follow) ──────────────────────────────────────────────────┐
-│10:45:28  zcode                                                                                   │
+┌hconversation (scrolled ↑8, PageDown to follow) ──────────────────────────────────────────────────┐
+│16:36:10  zcode                                                                                   │
 │  Ready when you are. Type /help for commands.                                                    │
 │                                                                                                  │
-│10:45:29  zcode                                                                                   │
+│16:36:10  zcode                                                                                   │
 │  commands:                                                                                       │
 │    /help                            show this list                                               │
 │    /exit                            quit zcode (also /quit, or Ctrl-C)                           │
@@ -77,21 +77,21 @@ shows `n/a` instead.
 │    /new                             start a fresh session (clears the model's context)           │
 │    /clear                           clear the screen, keep the session                           │
 │    /stop                            cancel the turn in flight (also Esc)                         │
+│    /copy [all]                      copy the last answer, or all of the conversation             │
 │                                                                                                  │
 │  keys:                                                                                           │
 │    Enter                            send                                                         │
 │    Alt-Enter                        newline without sending                                      │
-│    Esc                              cancel the turn in flight, else clear the prompt             │
+│    Esc                              dismiss a selection, cancel the turn, or clear the prompt    │
 │    Ctrl-C                           cancel if busy, otherwise quit                               │
 │    Ctrl-A / Ctrl-E                  start / end of line                                          │
 │    Ctrl-W                           delete the previous word                                     │
 │    Ctrl-U / Ctrl-K                  delete to start / end of line                                │
-│    PageUp / PageDown                scroll the conversation (also the mouse wheel)               │
 └──────────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌ Enter sends · Alt-Enter newline · /help ─────────────────────────────────────────────────────────┐
 │>                                                                                                 │
 └──────────────────────────────────────────────────────────────────────────────────────────────────┘
- ● ready  │  mode auto  │  openrouter/laguna-s-2.1:free  │  0 in / 0 out  │  $0.00  │  scrolled ↑4
+ ● ready  │  mode auto  │  openrouter/laguna-s-2.1:free  │  0 in / 0 out  │  $0.00  │  scrolled ↑8
 ```
 
 The full table is in the [command reference](14-commands.md#tui-slash-commands).
@@ -109,28 +109,28 @@ unknown command `/exitt` — /help lists them all
 `/mode` with no argument lists all three and marks the active one:
 
 ```
-┌ conversation ────────────────────────────────────────────────────────────────────────────────────┐
-│    /session                         current session id and where it is stored                    │
-│    /tools                           tools available in the current mode                          │
-│    /new                             start a fresh session (clears the model's context)           │
-│    /clear                           clear the screen, keep the session                           │
+┌hconversation ────────────────────────────────────────────────────────────────────────────────────┐
 │    /stop                            cancel the turn in flight (also Esc)                         │
+│    /copy [all]                      copy the last answer, or all of the conversation             │
 │                                                                                                  │
 │  keys:                                                                                           │
 │    Enter                            send                                                         │
 │    Alt-Enter                        newline without sending                                      │
-│    Esc                              cancel the turn in flight, else clear the prompt             │
+│    Esc                              dismiss a selection, cancel the turn, or clear the prompt    │
 │    Ctrl-C                           cancel if busy, otherwise quit                               │
 │    Ctrl-A / Ctrl-E                  start / end of line                                          │
 │    Ctrl-W                           delete the previous word                                     │
 │    Ctrl-U / Ctrl-K                  delete to start / end of line                                │
 │    PageUp / PageDown                scroll the conversation (also the mouse wheel)               │
 │    Ctrl-Up / Ctrl-Down              scroll one line                                              │
+│    Drag                             select; releasing copies to the clipboard                    │
 │    Shift-Tab                        cycle mode                                                   │
+│    Ctrl-Y                           copy the last answer to the clipboard                        │
+│    Up / Down                        recall the previous / next sent prompt                       │
 │                                                                                                  │
-│    the mouse wheel scrolls; hold Shift (Option on macOS Terminal) to select text                 │
+│    drag to select and copy · wheel scrolls · Shift-drag for the terminal's own selection         │
 │                                                                                                  │
-│10:45:33  zcode                                                                                   │
+│16:36:13  zcode                                                                                   │
 │  mode: auto — edits files and runs shell                                                         │
 │      planning  read-only; proposes changes                                                       │
 │      editing   edits files; no shell                                                             │
@@ -214,8 +214,8 @@ icon, the time it ran, the tool, what it acted on, and how long it took:
 20:21:35  zcode
   I'll read main.go and list the directory for you.
   tools used
-  ├ ✔ 20:21:35  read               package main                     82ms
-  └ ✔ 20:21:35  list_dir           .zcode/                         823ms
+  ├ ✔ 20:21:35  ◇ read      package main                          82ms
+  └ ✔ 20:21:35  ▪ list_dir  .zcode/                              823ms
 ```
 
 The duration is right-aligned and always carries its unit, stepping up as the
@@ -228,6 +228,26 @@ call gets longer so the number stays readable:
 | under an hour | `2m05s` |
 | beyond that | `1h25m` |
 
+Each row carries two glyphs: what was called, then how it went.
+
+| Tool | | Status | |
+|------|---|--------|---|
+| `◇` | read | `◐` | running |
+| `▪` | list_dir | `✔` | succeeded |
+| `✎` | write, str_replace_editor | `✖` | failed |
+| `±` | apply_patch | `⊘` | refused by the mode gate or the shell guard |
+| `❯` | shell | | |
+| `✦` | zcode_skill | | |
+| `⌖` | any `lsp__*` | | |
+| `⊞` | any `mcp__*` | | |
+
+The name column is measured per frame — as wide as the widest name actually on
+screen, floored so a lone `read` still reads as a column and capped so one
+`mcp__some_server__some_tool` cannot push the detail off the row. A fixed width
+put fourteen blank cells between `read` and what it read.
+
+<details><summary>The status icons, as a plain list</summary>
+
 | Icon | Meaning |
 |------|---------|
 | `◐` | running |
@@ -235,11 +255,13 @@ call gets longer so the number stays readable:
 | `✖` | failed — the message is the tool's own error |
 | `⊘` | refused by the mode gate or the shell denylist |
 
+</details>
+
 A failure or a refusal settles the same row rather than adding a second one:
 
 ```
   tools used
-  └ ⊘ 20:24:02  apply_patch        planning mode is read-only
+  └ ⊘ 20:24:02  ± apply_patch  planning mode is read-only
 ```
 
 A *successful* row is an index entry — the first line of what came back,
@@ -250,7 +272,7 @@ ellipsis:
 
 ```
   tools used
-  └ ✖ 20:24:31  shell                                               1.2s
+  └ ✖ 20:24:31  ❯ shell                                            1.2s
       command blocked by the shell allowlist (`shell_allowed` in
       zcode.json/zcode.toml): cd /workspace && go build ./... 2>&1 | head
         hint: no pattern in `shell_allowed` matches `cd`; add one, e.g.
@@ -395,11 +417,45 @@ counting past it — a counter that keeps rising after the view has stopped will
 swallow exactly that many scrolls on the way back down, which reads as a pane
 that will not scroll at all.
 
-The wheel works because zcode asks the terminal to report mouse events. The
-side effect is that a plain drag no longer selects text: hold **Shift**
-(**Option** on macOS Terminal) to select and copy as usual. `/help` says so
-too, because without being told, this looks like broken copy/paste rather than
-a trade for scrolling.
+The wheel works because zcode asks the terminal to report mouse events, which
+means the terminal stops doing its own selection. So zcode does it instead —
+see below.
+
+## Selecting and copying
+
+**Drag to select, release to copy.** The selection highlights as you drag,
+covering whole rows in between the way a terminal's own does, and on release
+the text goes to the system clipboard. zcode says which mechanism it used:
+
+```
+· 3 line(s) copied (pbcopy)
+```
+
+That line is the point. Copying to a clipboard is write-only — nothing can read
+it back to check — so the alternative to reporting the mechanism is announcing
+success and hoping. An earlier version did exactly that, and on a terminal that
+ignores the escape sequence it meant "copied" over an unchanged clipboard.
+
+Two mechanisms, tried in order:
+
+1. **A local clipboard tool** — `pbcopy`, `wl-copy`, `xclip`, `xsel`,
+   `clip.exe`. Where one exists it is exact: the same clipboard every other
+   application uses.
+2. **OSC 52** — asking the terminal to set the clipboard. The only thing that
+   works over SSH, where no local tool can help, but not universal: macOS
+   Terminal.app ignores it, and tmux and screen need it turned on.
+
+`Esc` dismisses a highlight. It does that *before* it cancels a turn, because
+cancelling a running turn when you meant to clear a selection is an expensive
+misunderstanding.
+
+The selection is in screen coordinates — it is what you can see, after
+wrapping, clipping and alignment — so scrolling or new output clears it rather
+than leaving a highlight pointing at words that have moved.
+
+You do not have to drag for the common cases: `Ctrl-Y` copies the last answer,
+`/copy` does the same, and `/copy all` takes the whole conversation. And the
+terminal's own selection is still there under **Shift-drag** if you prefer it.
 
 ## Switching provider mid-session
 

@@ -3,16 +3,16 @@ a refusal wrapped in full under its tool row
 
 ┌────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │┌ conversation ────────────────────────────────────────────────────────────────────────────────────┐│
-││10:50:39  zcode                                                                                   ││
+││17:00:58  zcode                                                                                   ││
 ││  Ready when you are. Type /help for commands.                                                    ││
 ││                                                                                                  ││
-││10:50:41  you                                                                                     ││
+││17:01:00  you                                                                                     ││
 ││  build the project                                                                               ││
 ││                                                                                                  ││
-││10:50:41  zcode                                                                                   ││
+││17:01:00  zcode                                                                                   ││
 ││  Running that for you now.                                                                       ││
 ││  tools used                                                                                      ││
-││  └ ✖ 10:50:41  shell                                                                             ││
+││  └ ✖ 17:01:00  ❯ shell                                                                           ││
 ││      command blocked by the shell allowlist (`shell_allowed` in zcode.json/zcode.toml): cd       ││
 ││      /workspace && go build ./... 2>&1 | head                                                    ││
 ││        hint: shell metacharacters (`$(`, backticks, `>`, `<`, `&&`) are not allowed under a      ││
@@ -20,7 +20,7 @@ a refusal wrapped in full under its tool row
 ││        `shell_allowed` to [".*"], which permits every command the built-in denylist does not     ││
 ││        refuse.                                                                                   ││
 ││                                                                                                  ││
-││10:50:41  zcode                                                                                   ││
+││17:01:00  zcode                                                                                   ││
 ││  That is what the shell had to say.                                                              ││
 ││                                                                                                  ││
 ││                                                                                                  ││

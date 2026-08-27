@@ -1,22 +1,22 @@
-### 17-rate-limit-recovered
-the same turn, after the retries succeeded
+### 25-selection-copied
+released: zcode says what it copied
 
 ┌────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │┌ conversation ────────────────────────────────────────────────────────────────────────────────────┐│
-││17:00:53  zcode                                                                                   ││
+││17:01:34  zcode                                                                                   ││
 ││  Ready when you are. Type /help for commands.                                                    ││
 ││                                                                                                  ││
-││17:00:55  you                                                                                     ││
-││  hello                                                                                           ││
-││  ↻ rate limited by the provider (429) — retrying in 1.0s (attempt 1/3)                           ││
-││  ↻ rate limited by the provider (429) — retrying in 1.0s (attempt 2/3)                           ││
+││17:01:36  you                                                                                     ││
+││  say something                                                                                   ││
 ││                                                                                                  ││
-││17:00:57  zcode                                                                                   ││
-││  Recovered after 2 rate limit(s).                                                                ││
-││                                                                                                  ││
-││                                                                                                  ││
-││                                                                                                  ││
-││                                                                                                  ││
+││17:01:36  zcode                                                                                   ││
+││  line 001 of 6                                                                                   ││
+││  line 002 of 6                                                                                   ││
+││  line 003 of 6                                                                                   ││
+││  line 004 of 6                                                                                   ││
+││  line 005 of 6                                                                                   ││
+││  line 006 of 6                                                                                   ││
+││  · 1 line(s) copied (pbcopy)                                                                     ││
 ││                                                                                                  ││
 ││                                                                                                  ││
 ││                                                                                                  ││
@@ -33,6 +33,6 @@ the same turn, after the retries succeeded
 │┌ Enter sends · Alt-Enter newline · /help ─────────────────────────────────────────────────────────┐│
 ││>                                                                                                 ││
 │└──────────────────────────────────────────────────────────────────────────────────────────────────┘│
-│ ● ready  │  mode auto  │  openai-compatible/gpt-4o-mini  │  120 in / 8 out  │  <$0.0001            │
+│ ● ready  │  mode auto  │  openai-compatible/gpt-4o-mini  │  40 in / 6 out  │  <$0.0001             │
 └────────────────────────────────────────────────────────────────────────────────────────────────────┘
 cursor: row 29, col 3, visible=True

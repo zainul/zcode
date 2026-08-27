@@ -3,26 +3,26 @@ after /mode planning — the status bar follows
 
 ┌────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │┌ conversation ────────────────────────────────────────────────────────────────────────────────────┐│
-││    /tools                           tools available in the current mode                          ││
-││    /new                             start a fresh session (clears the model's context)           ││
-││    /clear                           clear the screen, keep the session                           ││
-││    /stop                            cancel the turn in flight (also Esc)                         ││
+││    /copy [all]                      copy the last answer, or all of the conversation             ││
 ││                                                                                                  ││
 ││  keys:                                                                                           ││
 ││    Enter                            send                                                         ││
 ││    Alt-Enter                        newline without sending                                      ││
-││    Esc                              cancel the turn in flight, else clear the prompt             ││
+││    Esc                              dismiss a selection, cancel the turn, or clear the prompt    ││
 ││    Ctrl-C                           cancel if busy, otherwise quit                               ││
 ││    Ctrl-A / Ctrl-E                  start / end of line                                          ││
 ││    Ctrl-W                           delete the previous word                                     ││
 ││    Ctrl-U / Ctrl-K                  delete to start / end of line                                ││
 ││    PageUp / PageDown                scroll the conversation (also the mouse wheel)               ││
 ││    Ctrl-Up / Ctrl-Down              scroll one line                                              ││
+││    Drag                             select; releasing copies to the clipboard                    ││
 ││    Shift-Tab                        cycle mode                                                   ││
+││    Ctrl-Y                           copy the last answer to the clipboard                        ││
+││    Up / Down                        recall the previous / next sent prompt                       ││
 ││                                                                                                  ││
-││    the mouse wheel scrolls; hold Shift (Option on macOS Terminal) to select text                 ││
+││    drag to select and copy · wheel scrolls · Shift-drag for the terminal's own selection         ││
 ││                                                                                                  ││
-││10:49:17  zcode                                                                                   ││
+││17:00:33  zcode                                                                                   ││
 ││  mode: auto — edits files and runs shell                                                         ││
 ││      planning  read-only; proposes changes                                                       ││
 ││      editing   edits files; no shell                                                             ││

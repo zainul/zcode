@@ -18,7 +18,7 @@ Effective configuration
   providers              5  (--provider NAME, or /provider NAME in the TUI)
       fast         openrouter         anthropic/claude-sonnet-4.5
                    https://openrouter.ai/api/v1/chat/completions
-      free-openrouter openrouter         poolside/laguna-s-2.1:free
+      free-openrouter openrouter         liquid/lfm-2.5-2.6b:free
                    https://openrouter.ai/api/v1/chat/completions
       free-groq    openai-compatible  qwen/qwen3.6-27b
                    https://api.groq.com/openai/v1/chat/completions
@@ -30,13 +30,14 @@ Effective configuration
   mode                   auto
   timeout_ms             120000
   max_turns              12
-  max_tokens             163840
+  max_tokens             40000
   max_tool_output_chars  16000000
   max_retries            3
   rate_limit_backoff_ms  30000ms  (after a 429 with no Retry-After)
   skills_dir             /Users/zainul/.config/zcode/skills
   shell_allowed          9 pattern(s) — unrestricted: anything the denylist permits, pipes and `&&` included
   shell_denied           23 built-in + 0 from config
+  rtk                    0.36.0 — shell output is token-optimised  [/opt/homebrew/bin/rtk]
   mcp servers            0
   lsp servers            1  (project looks like go)
     ▸ go           /Users/zainul/go/bin/gopls  [default]

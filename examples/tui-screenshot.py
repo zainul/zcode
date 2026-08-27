@@ -44,6 +44,11 @@ PAGE_DOWN = b"\x1b[6~"
 # wheel-up and 65 wheel-down, at an arbitrary cell inside the pane.
 WHEEL_UP = b"\x1b[<64;20;10M"
 WHEEL_DOWN = b"\x1b[<65;20;10M"
+# SGR mouse: button 0 press/drag/release, for the selection checks.
+def mouse(button: int, col: int, row: int, release: bool = False) -> bytes:
+    return f"\x1b[<{button};{col};{row}{'m' if release else 'M'}".encode()
+
+
 CTRL_HOME = b"\x1b[1;5H"
 CTRL_END = b"\x1b[1;5F"
 
@@ -420,6 +425,49 @@ def _fake_provider():
     return module
 
 
+def scenario_selection():
+    """Drag must highlight, and releasing must copy.
+
+    The clipboard itself cannot be read back from here — it is write-only from
+    the app's side — so the check is what the screen shows and what zcode
+    reports it did, which is also all the user gets to see.
+    """
+    fake = _fake_provider()
+    # The port `examples/scrolling` is configured for.
+    server = fake.serve(port=8093, fail=0, status=429, lines=6)
+
+    t = Tui(ROOT / "examples" / "scrolling")
+    t.pump(2.0)
+    t.type("say something")
+    t.send(ENTER, 1.0)
+    check(t.wait_for(r"line 006", timeout=30), "there is something to select")
+
+    # Find a row with text on it, and drag across it.
+    rows = t.screen.display
+    target = next(i for i, r in enumerate(rows) if "line 003" in r)
+    start_col = rows[target].index("line 003") + 1  # 1-based columns
+    t.send(mouse(0, start_col, target + 1), 0.2)
+    t.send(mouse(32, start_col + 10, target + 1), 0.3)  # 32 = drag
+    t.shot("24-selecting", "mid-drag: the selection is highlighted")
+    check("line 003" in t.text(), "the row is still legible while selected")
+
+    t.send(mouse(0, start_col + 10, target + 1, release=True), 0.8)
+    after = t.text()
+    t.shot("25-selection-copied", "released: zcode says what it copied")
+    check(
+        re.search(r"copied \(", after) is not None,
+        f"the copy was reported: {[l for l in after.splitlines() if 'copi' in l]}",
+    )
+    check("could not copy" not in after, "the copy did not fail")
+
+    # Esc dismisses rather than cancelling anything.
+    t.send(ESC, 0.4)
+    check("line 003" in t.text(), "the transcript survived the dismiss")
+
+    t.close()
+    server.shutdown()
+
+
 def scenario_scrolling():
     """The conversation must scroll — by wheel, by page, and back to the tail.
 
@@ -599,6 +647,7 @@ SCENARIOS = {
     "ratelimit": scenario_rate_limit,
     "blocked": scenario_blocked_shell,
     "scrolling": scenario_scrolling,
+    "selection": scenario_selection,
     "providers": scenario_providers,
 }
 

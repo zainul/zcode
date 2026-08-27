@@ -3,13 +3,13 @@ Ctrl-Home, at the oldest line
 
 ┌────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │┌ conversation (scrolled ↑41, PageDown to follow) ─────────────────────────────────────────────────┐│
-││10:50:49  zcode                                                                                   ││
+││17:01:08  zcode                                                                                   ││
 ││  Ready when you are. Type /help for commands.                                                    ││
 ││                                                                                                  ││
-││10:50:51  you                                                                                     ││
+││17:01:10  you                                                                                     ││
 ││  say something long                                                                              ││
 ││                                                                                                  ││
-││10:50:51  zcode                                                                                   ││
+││17:01:10  zcode                                                                                   ││
 ││  line 001 of 60                                                                                  ││
 ││  line 002 of 60                                                                                  ││
 ││  line 003 of 60                                                                                  ││
