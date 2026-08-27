@@ -1,0 +1,28 @@
+{
+  "provider": "primary",
+  "providers": [
+    {
+      "name": "primary",
+      "kind": "openai-compatible",
+      "model": "gpt-4o-mini",
+      "base_url": "http://127.0.0.1:8095/v1/chat/completions",
+      "api_key_env": "ZCODE_API_KEY"
+    },
+    {
+      "name": "backup",
+      "kind": "openai-compatible",
+      "model": "backup-model",
+      "base_url": "http://127.0.0.1:8094/v1/chat/completions",
+      "api_key_env": "ZCODE_API_KEY"
+    },
+    {
+      "name": "local",
+      "kind": "ollama",
+      "model": "llama3.2"
+    }
+  ],
+  "max_retries": 1,
+  "shell_allowed": [
+    ".*"
+  ]
+}

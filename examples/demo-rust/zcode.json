@@ -1,0 +1,6 @@
+{
+  "provider": "openrouter",
+  "model": "poolside/laguna-s-2.1:free",
+  "mode": "auto",
+  "max_retries": 3
+}

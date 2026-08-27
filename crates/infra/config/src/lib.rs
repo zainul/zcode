@@ -2,7 +2,7 @@
 //! Secrets are read from `ZCODE_*` env vars only, never written to disk.
 //! Deps (direct): domain, serde, toml, thiserror — no `reqwest`/`regex` here (L3).
 
-use domain::AgentMode;
+use domain::{AgentMode, PriceEntry, PriceTable};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -12,8 +12,54 @@ const DEFAULT_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_MAX_TURNS: u64 = 20;
 const DEFAULT_MAX_TOKENS: u64 = 16384;
 const DEFAULT_MAX_TOOL_OUTPUT_CHARS: usize = 16000;
+/// Transient provider failures retried before a run is failed (`max_retries`).
+const DEFAULT_MAX_RETRIES: u32 = 3;
+/// Wait after a 429 that carries no `Retry-After` (`rate_limit_backoff_ms`).
+/// Rate limits are metered by the minute; a sub-second retry just spends
+/// another request to be refused again.
+const DEFAULT_RATE_LIMIT_BACKOFF_MS: u64 = 30_000;
 
-const DEFAULT_SHELL_ALLOWED: &[&str] = &["echo .*", "ls .*", "cd .*", "cat .*"];
+/// A default allowlist a coding agent can actually work under.
+///
+/// The old default (`echo`, `ls`, `cd`, `cat`) meant `go build ./...` failed
+/// on a fresh install, which trains people to set `shell_allowed = [".*"]` and
+/// switch the safety net off entirely — strictly worse than a generous default
+/// paired with [`DENIED_PATTERNS`]. Anything in this list may still be refused
+/// by the denylist.
+pub const DEFAULT_SHELL_ALLOWED: &[&str] = &[
+    // -- inspect the working tree -------------------------------------------
+    r"(ls|pwd|echo|cat|head|tail|wc|file|stat|du|df|date|env|printenv|whoami|uname)( .*)?",
+    r"(cd|basename|dirname|realpath|readlink|which|type|command -v)( .*)?",
+    r"(grep|egrep|fgrep|rg|ag|find|fd|tree|diff|comm|sort|uniq|cut|tr|column)( .*)?",
+    r"(sed|awk|jq|yq|xargs)( .*)?",
+    // `rm` is here because build workflows delete files; the denylist above
+    // still refuses every recursive and root-targeted form.
+    r"(mkdir|touch|cp|mv|ln|rm)( .*)?",
+    // -- version control -----------------------------------------------------
+    r"git( .*)?",
+    r"(gh|glab)( .*)?",
+    // -- rust ----------------------------------------------------------------
+    r"cargo( .*)?",
+    r"(rustc|rustup|rustfmt|clippy-driver)( .*)?",
+    // -- go ------------------------------------------------------------------
+    r"go( .*)?",
+    r"(gofmt|goimports|golangci-lint|staticcheck|dlv|air|templ)( .*)?",
+    // -- node / typescript / next.js -----------------------------------------
+    r"(node|npm|npx|pnpm|pnpx|yarn|bun|bunx|deno)( .*)?",
+    r"(tsc|ts-node|tsx|eslint|prettier|biome|vitest|jest|playwright|next|vite|webpack|turbo)( .*)?",
+    // -- python --------------------------------------------------------------
+    r"(python|python3|pip|pip3|uv|uvx|poetry|pipenv|conda)( .*)?",
+    r"(pytest|tox|ruff|mypy|black|isort|flake8|pylint)( .*)?",
+    // -- other toolchains ----------------------------------------------------
+    r"(make|just|task|cmake|ninja|bazel|meson)( .*)?",
+    r"(mvn|gradle|gradlew|\./gradlew|dotnet|swift|zig|elixir|mix|rebar3)( .*)?",
+    r"(ruby|bundle|rake|gem)( .*)?",
+    r"(php|composer|artisan)( .*)?",
+    // -- containers & infra (read-mostly) ------------------------------------
+    r"docker (ps|images|logs|inspect|compose (ps|logs|config|build))( .*)?",
+    r"kubectl (get|describe|logs|explain|version|config view)( .*)?",
+    r"terraform (validate|fmt|plan|version|providers)( .*)?",
+];
 
 /// Config files looked for, in order, when no `--config` is given.
 const DEFAULT_CONFIG_NAMES: &[&str] = &["zcode.json", "zcode.toml"];
@@ -91,6 +137,18 @@ impl Provider {
     }
 }
 
+/// Every provider kind zcode speaks, for diagnostics that would otherwise
+/// only be able to say what the user got wrong.
+pub const BUILTIN_PROVIDERS: &[&str] = &[
+    "openai",
+    "anthropic",
+    "openrouter",
+    "deepseek",
+    "ollama",
+    "vllm",
+    "openai-compatible",
+];
+
 impl std::str::FromStr for Provider {
     type Err = String;
 
@@ -119,6 +177,123 @@ pub struct McpServerConfig {
     pub env: Vec<(String, String)>,
 }
 
+/// Language servers zcode starts without being asked, when the binary is
+/// present (FR-LSP-03).
+///
+/// Chosen to cover the stacks the guide walks through: Go, Rust, and the
+/// TypeScript/JavaScript family (which is also what Next.js projects use —
+/// there is no separate Next.js server, so `nextjs` is an alias rather than a
+/// fourth entry). Each is opt-out via `lsp.defaults = false`, and any entry in
+/// `lsp.servers` for the same language replaces the default outright.
+pub fn default_lsp_servers() -> Vec<LspServerConfig> {
+    let stdio = |language: &str, command: &str, args: &[&str]| LspServerConfig {
+        language: language.to_string(),
+        command: command.to_string(),
+        args: args.iter().map(|a| a.to_string()).collect(),
+        env: Vec::new(),
+    };
+    vec![
+        stdio("rust", "rust-analyzer", &[]),
+        stdio("go", "gopls", &["serve"]),
+        // One server for the whole JS/TS family, Next.js included.
+        stdio("typescript", "typescript-language-server", &["--stdio"]),
+        stdio("javascript", "typescript-language-server", &["--stdio"]),
+    ]
+}
+
+/// Languages that resolve to an already-registered server rather than one of
+/// their own. Kept explicit so `zcode config` can say so.
+pub const LSP_LANGUAGE_ALIASES: &[(&str, &str)] = &[
+    ("nextjs", "typescript"),
+    ("next", "typescript"),
+    ("node", "typescript"),
+    ("nodejs", "typescript"),
+    ("ts", "typescript"),
+    ("tsx", "typescript"),
+    ("js", "javascript"),
+    ("jsx", "javascript"),
+    ("golang", "go"),
+    ("rs", "rust"),
+];
+
+/// Marker files that identify a project's primary language, most specific
+/// first: a Next.js repo has a `package.json` *and* a `next.config.*`, and a
+/// Go module inside a monorepo may sit beside one.
+const LANGUAGE_MARKERS: &[(&str, &str)] = &[
+    ("go.mod", "go"),
+    ("Cargo.toml", "rust"),
+    ("tsconfig.json", "typescript"),
+    ("next.config.js", "typescript"),
+    ("next.config.ts", "typescript"),
+    ("next.config.mjs", "typescript"),
+    ("deno.json", "typescript"),
+    ("package.json", "javascript"),
+];
+
+/// Identify the project language from its marker files. Used to decide which
+/// language server is worth starting; returns `None` when nothing matches.
+pub fn detect_project_language(root: &Path) -> Option<String> {
+    LANGUAGE_MARKERS
+        .iter()
+        .find(|(marker, _)| root.join(marker).exists())
+        .map(|(_, language)| (*language).to_string())
+}
+
+/// Resolve a language alias to the language a server is registered under.
+pub fn canonical_language(language: &str) -> String {
+    let lower = language.trim().to_ascii_lowercase();
+    LSP_LANGUAGE_ALIASES
+        .iter()
+        .find(|(alias, _)| *alias == lower)
+        .map(|(_, target)| (*target).to_string())
+        .unwrap_or(lower)
+}
+
+/// Locate an executable on `PATH`, the way a shell would. Stdlib only — this
+/// crate has no business shelling out to `which`.
+pub fn which_on_path(command: &str) -> Option<PathBuf> {
+    // An explicit path is used as given.
+    if command.contains(std::path::MAIN_SEPARATOR) {
+        let direct = PathBuf::from(command);
+        return is_executable(&direct).then_some(direct);
+    }
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join(command);
+        if is_executable(&candidate) {
+            return Some(candidate);
+        }
+        // Windows carries the extension in PATHEXT; the two we can rely on.
+        if cfg!(windows) {
+            for ext in ["exe", "cmd"] {
+                let candidate = dir.join(format!("{command}.{ext}"));
+                if is_executable(&candidate) {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn is_executable(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
 /// A stdio LSP server definition (FR-LSP-03).
 #[derive(Debug, Clone, Deserialize)]
 pub struct LspServerConfig {
@@ -130,9 +305,46 @@ pub struct LspServerConfig {
     pub env: Vec<(String, String)>,
 }
 
+/// The settings that distinguish one endpoint from another.
+///
+/// Every field is optional because each is answered by the most specific
+/// source that states it: the selected provider profile, then the top level of
+/// the config (or `ZCODE_*`), then the built-in defaults for the provider's
+/// kind. `None` means "not stated here" — never "empty".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderSettings {
+    pub model: Option<String>,
+    pub api_key_env: Option<String>,
+    pub base_url: Option<String>,
+}
+
+/// One entry of the `providers` array: a named endpoint the user can select.
+///
+/// `name` is how it is selected (`"provider": "local"`, `--provider local`)
+/// and `kind` is which wire protocol it speaks. They are usually the same
+/// word — `{ "name": "openrouter", "base_url": … }` overrides the built-in
+/// OpenRouter endpoint — but they need not be, which is what lets two
+/// profiles share a kind: a fast one and a cheap one, both OpenRouter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderProfile {
+    pub name: String,
+    pub kind: Provider,
+    pub settings: ProviderSettings,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub provider: Provider,
+    /// The name the selected provider was chosen by. Equal to
+    /// `provider.as_str()` unless a `providers` entry gave it its own name.
+    pub provider_name: String,
+    /// Every configured endpoint, in declaration order, merged across layers
+    /// by name. Empty when the config never mentions `providers`.
+    pub providers: Box<[ProviderProfile]>,
+    /// What the *top level* of the config asked for, kept apart from the
+    /// resolved values so [`Config::select_provider`] can switch endpoints
+    /// without losing it — it is the fallback for a profile that is silent.
+    pub top_level: ProviderSettings,
     pub model: String,
     pub api_key_env: String,
     pub base_url: Option<String>,
@@ -145,8 +357,21 @@ pub struct Config {
     pub mcp_servers: Box<[McpServerConfig]>,
     pub lsp_servers: Box<[LspServerConfig]>,
     pub shell_allowed: Box<[String]>,
+    /// Extra always-on deny patterns, added to zcode's built-in denylist.
+    /// Rules here cannot be removed by widening `shell_allowed`.
+    pub shell_denied: Box<[String]>,
     pub skills_dir: PathBuf,
     pub mode: AgentMode,
+    /// How many times a transient provider failure (429, 5xx, timeout) is
+    /// retried before the run fails.
+    pub max_retries: u32,
+    /// How long to wait after a rate limit that carries no `Retry-After`.
+    /// The provider's own header always wins over this.
+    pub rate_limit_backoff_ms: u64,
+    /// Per-model rate overrides for the cost estimate, ahead of the built-ins.
+    pub pricing: Vec<PriceEntry>,
+    /// Set false to skip the built-in language-server defaults.
+    pub lsp_defaults: bool,
 }
 
 impl Default for Config {
@@ -154,6 +379,9 @@ impl Default for Config {
         let working_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         Self {
             provider: Provider::Openai,
+            provider_name: Provider::Openai.as_str().to_string(),
+            providers: Box::new([]),
+            top_level: ProviderSettings::default(),
             model: DEFAULT_MODEL.to_string(),
             api_key_env: String::from("ZCODE_OPENAI_API_KEY"),
             base_url: None,
@@ -169,15 +397,162 @@ impl Default for Config {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            shell_denied: Box::new([]),
             skills_dir: PathBuf::new(),
             mode: AgentMode::default(),
+            max_retries: DEFAULT_MAX_RETRIES,
+            rate_limit_backoff_ms: DEFAULT_RATE_LIMIT_BACKOFF_MS,
+            pricing: Vec::new(),
+            lsp_defaults: true,
         }
     }
 }
 
 impl Config {
+    /// Point the configuration at one of its providers, by name.
+    ///
+    /// `name` is matched against the `providers` array first, then against the
+    /// built-in provider kinds — so `--provider ollama` works whether or not a
+    /// profile is declared for it, and a profile named `openrouter` shadows
+    /// the built-in defaults for OpenRouter, which is how you give it a URL.
+    ///
+    /// **A declared profile is complete in itself.** What it does not state
+    /// comes from the defaults for its kind, *not* from the top level of the
+    /// config: a top-level `api_key_env` was written for whichever provider
+    /// the config had at the time, and letting an unrelated gateway inherit it
+    /// produces a key variable that looks correct in `zcode config` and fails
+    /// at the first request. Top-level `model` / `api_key_env` / `base_url`
+    /// are the single-provider form, and apply when the selection is a bare
+    /// kind with no profile behind it — which is every config written before
+    /// `providers` existed.
+    pub fn select_provider(&mut self, name: &str) -> Result<(), ConfigError> {
+        let name = name.trim();
+        let (profile, declared) = match self.providers.iter().find(|p| p.name == name) {
+            Some(found) => (found.clone(), true),
+            None => {
+                let kind = name.parse::<Provider>().map_err(|_| {
+                    if self.providers.is_empty() {
+                        ConfigError::UnknownProvider(name.to_string())
+                    } else {
+                        ConfigError::UnknownProviderNamed {
+                            name: name.to_string(),
+                            configured: self.provider_names().join(", "),
+                            builtin: BUILTIN_PROVIDERS.join(", "),
+                        }
+                    }
+                })?;
+                (
+                    ProviderProfile {
+                        name: kind.as_str().to_string(),
+                        kind,
+                        settings: ProviderSettings::default(),
+                    },
+                    false,
+                )
+            }
+        };
+
+        let fallback = if declared {
+            &ProviderSettings {
+                model: None,
+                api_key_env: None,
+                base_url: None,
+            }
+        } else {
+            &self.top_level
+        };
+        let pick = |stated: Option<&String>, fallback: Option<&String>| -> Option<String> {
+            stated.or(fallback).cloned()
+        };
+        self.provider = profile.kind;
+        self.provider_name = profile.name;
+        self.base_url = pick(
+            profile.settings.base_url.as_ref(),
+            fallback.base_url.as_ref(),
+        );
+        self.api_key_env = pick(
+            profile.settings.api_key_env.as_ref(),
+            fallback.api_key_env.as_ref(),
+        )
+        .unwrap_or_else(|| profile.kind.default_api_key_env().to_string());
+        self.model = pick(profile.settings.model.as_ref(), fallback.model.as_ref())
+            .unwrap_or_else(|| profile.kind.default_model().to_string());
+        Ok(())
+    }
+
+    /// The names `--provider` accepts from this config, in declaration order.
+    pub fn provider_names(&self) -> Vec<String> {
+        self.providers.iter().map(|p| p.name.clone()).collect()
+    }
+
+    /// A view of this config as it would be with a different provider
+    /// selected, for building a second client without disturbing the first.
+    pub fn with_provider(&self, name: &str) -> Result<Self, ConfigError> {
+        let mut next = self.clone();
+        next.select_provider(name)?;
+        Ok(next)
+    }
+
     pub fn timeout(&self) -> Duration {
         Duration::from_millis(self.timeout_ms)
+    }
+
+    pub fn rate_limit_backoff(&self) -> Duration {
+        Duration::from_millis(self.rate_limit_backoff_ms)
+    }
+
+    /// Cost rates: configured overrides first, then the built-in table.
+    pub fn price_table(&self) -> PriceTable {
+        PriceTable::with_overrides(self.pricing.clone())
+    }
+
+    /// Language servers actually started: everything in `lsp.servers`, plus
+    /// any built-in default whose binary is on `PATH` and whose language the
+    /// config has not already claimed.
+    ///
+    /// Probing `PATH` is what makes "LSP on by default" tolerable — a default
+    /// that spawned a missing `gopls` on every run would print a warning per
+    /// session for the majority of users who do not write Go.
+    pub fn effective_lsp_servers(&self) -> Vec<LspServerConfig> {
+        let mut servers: Vec<LspServerConfig> = self.lsp_servers.to_vec();
+        if self.lsp_defaults {
+            for candidate in default_lsp_servers() {
+                let claimed = servers
+                    .iter()
+                    .any(|s| canonical_language(&s.language) == candidate.language);
+                if !claimed && which_on_path(&candidate.command).is_some() {
+                    servers.push(candidate);
+                }
+            }
+        }
+        // Only one server runs per session. When we can tell what the project
+        // is, run *only* a server for that language: a Go repo on a machine
+        // that also has rust-analyzer installed would otherwise start
+        // rust-analyzer, which costs a process and answers nothing. An
+        // explicitly configured server is always kept — the user asked for it.
+        let explicit: Vec<String> = self
+            .lsp_servers
+            .iter()
+            .map(|s| s.language.clone())
+            .collect();
+        match detect_project_language(&self.working_dir) {
+            Some(detected) => {
+                servers.retain(|s| {
+                    canonical_language(&s.language) == detected || explicit.contains(&s.language)
+                });
+                servers.sort_by_key(|s| canonical_language(&s.language) != detected);
+            }
+            // Nothing identifies this directory as a project of any language.
+            // Starting rust-analyzer on the off-chance costs a process and a
+            // startup failure, and can answer nothing.
+            None => servers.retain(|s| explicit.contains(&s.language)),
+        }
+        servers
+    }
+
+    /// The language of the project rooted at `working_dir`, or `None`.
+    pub fn detected_language(&self) -> Option<String> {
+        detect_project_language(&self.working_dir)
     }
 
     /// The primary skills directory (the project's own, unless overridden).
@@ -236,12 +611,29 @@ pub enum ConfigError {
     Parse(#[from] toml::de::Error),
     #[error("json parse error: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("unknown provider: {0}")]
+    /// A name that is neither a `providers` entry nor a built-in kind.
+    ///
+    /// Two spellings because the useful advice differs: with profiles
+    /// declared, the answer is usually one of them; without, the user is
+    /// either misspelling a kind or has forgotten to declare the array.
+    #[error("unknown provider `{0}` — built in: {}. Declare your own with a \
+             `providers` array.", BUILTIN_PROVIDERS.join(", "))]
     UnknownProvider(String),
+    #[error("unknown provider `{name}` — configured: {configured}; built in: {builtin}")]
+    UnknownProviderNamed {
+        name: String,
+        configured: String,
+        builtin: String,
+    },
     #[error("missing secret env var: {0}")]
     MissingSecret(String),
     #[error("invalid agent mode: {0}")]
     InvalidMode(String),
+    #[error(
+        "a `providers` entry has neither `name` nor `kind` — one of them must \
+         say which provider it is"
+    )]
+    ProviderEntryUnnamed,
 }
 
 /// Intermediate deserialization target so unknown/extra keys in the file are
@@ -252,6 +644,8 @@ struct ConfigFile {
     model: Option<String>,
     #[serde(default)]
     provider: Option<String>,
+    #[serde(default)]
+    providers: Option<Vec<ProviderFile>>,
     #[serde(default)]
     api_key_env: Option<String>,
     #[serde(default)]
@@ -275,9 +669,96 @@ struct ConfigFile {
     #[serde(default)]
     shell_allowed: Option<Vec<String>>,
     #[serde(default)]
+    shell_denied: Option<Vec<String>>,
+    #[serde(default)]
     skills_dir: Option<String>,
     #[serde(default)]
     mode: Option<String>,
+    #[serde(default)]
+    max_retries: Option<u32>,
+    #[serde(default)]
+    rate_limit_backoff_ms: Option<u64>,
+    #[serde(default)]
+    pricing: Option<Vec<PricingEntryFile>>,
+}
+
+/// One `providers` entry as written in the file.
+///
+/// `name` and `kind` both default to the other, so the short form
+/// `{ "name": "openrouter", "base_url": … }` and the explicit form
+/// `{ "name": "cheap", "kind": "openrouter", … }` both work. `provider` is
+/// accepted as a spelling of `kind` because that is the word the top level
+/// uses and people reach for it here too.
+#[derive(Debug, Clone, Deserialize)]
+struct ProviderFile {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default, alias = "provider")]
+    kind: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    api_key_env: Option<String>,
+    #[serde(default)]
+    base_url: Option<String>,
+}
+
+impl ProviderFile {
+    fn into_profile(self) -> Result<ProviderProfile, ConfigError> {
+        // Either field names the other when only one is given; a profile with
+        // neither cannot say what it talks to, so it is an error rather than
+        // a silent default to OpenAI.
+        let kind_str = self
+            .kind
+            .clone()
+            .or_else(|| self.name.clone())
+            .ok_or(ConfigError::ProviderEntryUnnamed)?;
+        let kind = kind_str
+            .parse::<Provider>()
+            .map_err(|_| ConfigError::UnknownProvider(kind_str.clone()))?;
+        Ok(ProviderProfile {
+            name: self.name.unwrap_or(kind_str),
+            kind,
+            settings: ProviderSettings {
+                model: self.model,
+                api_key_env: self.api_key_env,
+                base_url: self.base_url,
+            },
+        })
+    }
+}
+
+/// Serde mirror of `domain::PriceEntry` — `domain` carries no derives
+/// (FR-DI-01), so the bridge lives here.
+#[derive(Debug, Clone, Deserialize)]
+struct PricingEntryFile {
+    model: String,
+    #[serde(default)]
+    input_per_mtok: f64,
+    #[serde(default)]
+    output_per_mtok: f64,
+    #[serde(default)]
+    cache_per_mtok: f64,
+    /// Whether the provider counts cached tokens inside `input_tokens`
+    /// (OpenAI-style). Defaults to true, which is the common case.
+    #[serde(default = "default_true")]
+    cache_within_input: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl From<PricingEntryFile> for PriceEntry {
+    fn from(f: PricingEntryFile) -> Self {
+        PriceEntry {
+            model: f.model,
+            input_per_mtok: f.input_per_mtok,
+            output_per_mtok: f.output_per_mtok,
+            cache_per_mtok: f.cache_per_mtok,
+            cache_within_input: f.cache_within_input,
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -286,10 +767,22 @@ struct McpSection {
     servers: Vec<McpServerConfig>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 struct LspSection {
     #[serde(default)]
     servers: Vec<LspServerConfig>,
+    /// Set false to opt out of the built-in language-server defaults.
+    #[serde(default = "default_true")]
+    defaults: bool,
+}
+
+impl Default for LspSection {
+    fn default() -> Self {
+        Self {
+            servers: Vec::new(),
+            defaults: true,
+        }
+    }
 }
 
 /// Where a configuration layer came from, for `zcode config`.
@@ -396,10 +889,13 @@ impl Loader {
 
     pub fn load(&self) -> Result<Config, ConfigError> {
         let mut config = Config::default();
-        // Tracks whether these were chosen deliberately; if not, they are
-        // derived from the provider so switching provider is one edit.
-        let mut api_key_env_set = false;
-        let mut model_set = false;
+        // Connection settings are not applied as they are read: which of them
+        // wins depends on the provider finally selected, and the selection can
+        // arrive after them (a later layer, `ZCODE_PROVIDER`, `--provider`).
+        // They are collected here and resolved once, at the end.
+        let mut top_level = ProviderSettings::default();
+        let mut profiles: Vec<ProviderProfile> = Vec::new();
+        let mut selected: Option<String> = None;
         let mut working_dir_set = false;
 
         for layer in &self.layers {
@@ -410,20 +906,29 @@ impl Loader {
             let file: ConfigFile = Self::parse(&layer.path, &content)?;
 
             if let Some(m) = file.model {
-                config.model = m;
-                model_set = true;
+                top_level.model = Some(m);
             }
             if let Some(p) = file.provider {
-                config.provider = p
-                    .parse::<Provider>()
-                    .map_err(|_| ConfigError::UnknownProvider(p))?;
+                selected = Some(p);
+            }
+            if let Some(entries) = file.providers {
+                // Profiles accumulate across layers and are keyed by name, so
+                // a machine-wide file can declare the endpoints once and each
+                // project only has to say which of them it wants — while still
+                // being able to redefine one it disagrees with.
+                for entry in entries {
+                    let profile = entry.into_profile()?;
+                    match profiles.iter_mut().find(|p| p.name == profile.name) {
+                        Some(existing) => *existing = profile,
+                        None => profiles.push(profile),
+                    }
+                }
             }
             if let Some(k) = file.api_key_env {
-                config.api_key_env = k;
-                api_key_env_set = true;
+                top_level.api_key_env = Some(k);
             }
             if let Some(u) = file.base_url {
-                config.base_url = Some(u);
+                top_level.base_url = Some(u);
             }
             if let Some(wd) = file.working_dir {
                 config.working_dir = wd;
@@ -450,8 +955,18 @@ impl Loader {
             if !file.lsp.servers.is_empty() {
                 config.lsp_servers = file.lsp.servers.into_boxed_slice();
             }
+            if !file.lsp.defaults {
+                config.lsp_defaults = false;
+            }
             if let Some(v) = file.shell_allowed {
                 config.shell_allowed = v.into_boxed_slice();
+            }
+            if let Some(v) = file.shell_denied {
+                // Deny rules accumulate across layers: a machine-wide ban must
+                // not be droppable by a project file.
+                let mut merged = config.shell_denied.to_vec();
+                merged.extend(v);
+                config.shell_denied = merged.into_boxed_slice();
             }
             if let Some(s) = file.skills_dir {
                 config.skills_dir = PathBuf::from(s);
@@ -460,6 +975,19 @@ impl Loader {
                 config.mode = m
                     .parse::<AgentMode>()
                     .map_err(|_| ConfigError::InvalidMode(m))?;
+            }
+            if let Some(r) = file.max_retries {
+                config.max_retries = r;
+            }
+            if let Some(ms) = file.rate_limit_backoff_ms {
+                config.rate_limit_backoff_ms = ms;
+            }
+            if let Some(rates) = file.pricing {
+                // Later layers take precedence, so a project rate wins over a
+                // machine-wide one: prepend rather than append.
+                let mut merged: Vec<PriceEntry> = rates.into_iter().map(Into::into).collect();
+                merged.append(&mut config.pricing);
+                config.pricing = merged;
             }
         }
 
@@ -473,20 +1001,16 @@ impl Loader {
         }
 
         if let Ok(provider) = std::env::var("ZCODE_PROVIDER") {
-            config.provider = provider
-                .parse::<Provider>()
-                .map_err(|_| ConfigError::UnknownProvider(provider))?;
+            selected = Some(provider);
         }
         if let Ok(model) = std::env::var("ZCODE_MODEL") {
-            config.model = model;
-            model_set = true;
+            top_level.model = Some(model);
         }
         if let Ok(k) = std::env::var("ZCODE_API_KEY_ENV") {
-            config.api_key_env = k;
-            api_key_env_set = true;
+            top_level.api_key_env = Some(k);
         }
         if let Ok(u) = std::env::var("ZCODE_BASE_URL") {
-            config.base_url = Some(u);
+            top_level.base_url = Some(u);
         }
         if let Ok(wd) = std::env::var("ZCODE_WORKING_DIR") {
             config.working_dir = PathBuf::from(wd);
@@ -511,6 +1035,16 @@ impl Loader {
                 config.max_tool_output_chars = v;
             }
         }
+        if let Ok(t) = std::env::var("ZCODE_MAX_RETRIES") {
+            if let Ok(v) = t.parse::<u32>() {
+                config.max_retries = v;
+            }
+        }
+        if let Ok(t) = std::env::var("ZCODE_RATE_LIMIT_BACKOFF_MS") {
+            if let Ok(v) = t.parse::<u64>() {
+                config.rate_limit_backoff_ms = v;
+            }
+        }
         if let Ok(dir) = std::env::var("ZCODE_SKILLS_DIR") {
             config.skills_dir = PathBuf::from(dir);
         }
@@ -525,6 +1059,16 @@ impl Loader {
                 .map(|s| s.to_string())
                 .collect();
         }
+        if let Ok(raw) = std::env::var("ZCODE_SHELL_DENIED") {
+            let mut merged = config.shell_denied.to_vec();
+            merged.extend(
+                raw.split('\n')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string()),
+            );
+            config.shell_denied = merged.into_boxed_slice();
+        }
         if let Ok(m) = std::env::var("ZCODE_MODE") {
             config.mode = m
                 .parse::<AgentMode>()
@@ -536,15 +1080,12 @@ impl Loader {
         config.working_dir = expand_tilde(config.working_dir);
         config.skills_dir = expand_tilde(config.skills_dir);
 
-        if !api_key_env_set {
-            config.api_key_env = config.provider.default_api_key_env().to_string();
-        }
-        if !model_set {
-            let default_model = config.provider.default_model();
-            if !default_model.is_empty() {
-                config.model = default_model.to_string();
-            }
-        }
+        config.providers = profiles.into_boxed_slice();
+        config.top_level = top_level;
+        // Nothing named a provider, so keep the default kind but still run it
+        // through the same resolution — a profile may be declared for it.
+        let selected = selected.unwrap_or_else(|| config.provider.as_str().to_string());
+        config.select_provider(&selected)?;
 
         Ok(config)
     }
@@ -663,6 +1204,261 @@ mod tests {
         let path = dir.path().join("zcode.toml");
         fs::write(&path, toml_content).unwrap();
         path
+    }
+
+    // ---- multiple providers -----------------------------------------------
+
+    const MULTI: &str = r#"
+provider = "cheap"
+
+[[providers]]
+name = "cheap"
+kind = "openrouter"
+model = "poolside/laguna-s-2.1:free"
+base_url = "https://openrouter.ai/api/v1/chat/completions"
+api_key_env = "MY_OPENROUTER_KEY"
+
+[[providers]]
+name = "local"
+kind = "ollama"
+model = "llama3.2"
+base_url = "http://127.0.0.1:11434/api/chat"
+
+[[providers]]
+name = "anthropic"
+"#;
+
+    #[test]
+    fn the_named_provider_is_the_one_selected() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Loader::new(&write_config(&dir, MULTI)).load().unwrap();
+
+        assert_eq!(cfg.provider_name, "cheap");
+        assert_eq!(cfg.provider, Provider::Openrouter);
+        assert_eq!(cfg.model, "poolside/laguna-s-2.1:free");
+        assert_eq!(cfg.api_key_env, "MY_OPENROUTER_KEY");
+        assert_eq!(
+            cfg.base_url.as_deref(),
+            Some("https://openrouter.ai/api/v1/chat/completions")
+        );
+        assert_eq!(cfg.provider_names(), ["cheap", "local", "anthropic"]);
+    }
+
+    #[test]
+    fn switching_provider_takes_the_whole_profile_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Loader::new(&write_config(&dir, MULTI)).load().unwrap();
+        cfg.select_provider("local").unwrap();
+
+        assert_eq!(cfg.provider, Provider::Ollama);
+        assert_eq!(cfg.model, "llama3.2");
+        assert_eq!(
+            cfg.base_url.as_deref(),
+            Some("http://127.0.0.1:11434/api/chat")
+        );
+        // Ollama needs no key, and the profile names none, so the kind decides.
+        assert_eq!(cfg.api_key_env, "ZCODE_OLLAMA_API_KEY");
+    }
+
+    #[test]
+    fn a_profile_that_states_nothing_falls_back_to_its_kind() {
+        // `[[providers]] name = "anthropic"` names a kind and nothing else:
+        // every field must come from the built-in defaults for Anthropic, not
+        // from the profile that happened to be selected before it.
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Loader::new(&write_config(&dir, MULTI)).load().unwrap();
+        cfg.select_provider("anthropic").unwrap();
+
+        assert_eq!(cfg.provider, Provider::Anthropic);
+        assert_eq!(cfg.model, Provider::Anthropic.default_model());
+        assert_eq!(cfg.api_key_env, "ZCODE_ANTHROPIC_API_KEY");
+        assert_eq!(cfg.base_url, None, "no URL stated anywhere");
+    }
+
+    #[test]
+    fn a_builtin_kind_is_selectable_without_a_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Loader::new(&write_config(&dir, MULTI)).load().unwrap();
+        cfg.select_provider("deepseek").unwrap();
+
+        assert_eq!(cfg.provider, Provider::Deepseek);
+        assert_eq!(cfg.provider_name, "deepseek");
+        assert_eq!(cfg.model, "deepseek-chat");
+    }
+
+    #[test]
+    fn a_profile_may_give_a_builtin_provider_its_own_url() {
+        // The short form: one entry, named after the kind it overrides. This
+        // is the "let me point OpenRouter somewhere else" case.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Loader::new(&write_config(
+            &dir,
+            r#"
+provider = "openrouter"
+
+[[providers]]
+name = "openrouter"
+base_url = "https://gateway.internal/v1/chat/completions"
+"#,
+        ))
+        .load()
+        .unwrap();
+
+        assert_eq!(cfg.provider, Provider::Openrouter);
+        assert_eq!(
+            cfg.base_url.as_deref(),
+            Some("https://gateway.internal/v1/chat/completions")
+        );
+        // Everything it did not state still comes from the kind, which for a
+        // profile named after its kind is exactly what you would expect.
+        assert_eq!(cfg.model, Provider::Openrouter.default_model());
+        assert_eq!(cfg.api_key_env, "ZCODE_OPENROUTER_API_KEY");
+    }
+
+    #[test]
+    fn two_profiles_may_share_one_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Loader::new(&write_config(
+            &dir,
+            r#"
+provider = "fast"
+
+[[providers]]
+name = "fast"
+kind = "openrouter"
+model = "anthropic/claude-sonnet-4.5"
+
+[[providers]]
+name = "free"
+kind = "openrouter"
+model = "poolside/laguna-s-2.1:free"
+"#,
+        ))
+        .load()
+        .unwrap();
+
+        assert_eq!(cfg.model, "anthropic/claude-sonnet-4.5");
+        cfg.select_provider("free").unwrap();
+        assert_eq!(cfg.provider, Provider::Openrouter);
+        assert_eq!(cfg.model, "poolside/laguna-s-2.1:free");
+    }
+
+    #[test]
+    fn a_declared_profile_is_complete_in_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Loader::new(&write_config(
+            &dir,
+            r#"
+provider = "stated"
+model = "top-level-model"
+api_key_env = "TOP_LEVEL_KEY"
+
+[[providers]]
+name = "stated"
+kind = "openrouter"
+model = "profile-model"
+
+[[providers]]
+name = "silent"
+kind = "openai-compatible"
+base_url = "https://gateway.internal/v1/chat/completions"
+"#,
+        ))
+        .load()
+        .unwrap();
+
+        // Selecting a profile has to actually select its model, or the array
+        // would be decoration.
+        assert_eq!(cfg.model, "profile-model");
+        // And what a profile does not state comes from its *kind*, never from
+        // a top-level key written for a different provider: inheriting
+        // TOP_LEVEL_KEY here would read as `[set]` and then fail on the first
+        // request, which is the worst of both worlds.
+        cfg.select_provider("silent").unwrap();
+        assert_eq!(cfg.api_key_env, "ZCODE_API_KEY");
+        assert_eq!(cfg.model, Provider::OpenaiCompatible.default_model());
+    }
+
+    #[test]
+    fn top_level_settings_still_serve_a_bare_kind() {
+        // The single-provider form, which is every config written before
+        // `providers` existed — and still what `--provider ollama` gets when
+        // no profile is declared for it.
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Loader::new(&write_config(
+            &dir,
+            r#"
+provider = "openrouter"
+model = "top-level-model"
+api_key_env = "TOP_LEVEL_KEY"
+base_url = "https://gateway.internal/v1/chat/completions"
+
+[[providers]]
+name = "other"
+kind = "ollama"
+"#,
+        ))
+        .load()
+        .unwrap();
+
+        assert_eq!(cfg.model, "top-level-model");
+        assert_eq!(cfg.api_key_env, "TOP_LEVEL_KEY");
+        assert_eq!(
+            cfg.base_url.as_deref(),
+            Some("https://gateway.internal/v1/chat/completions")
+        );
+
+        cfg.select_provider("deepseek").unwrap();
+        assert_eq!(cfg.model, "top-level-model", "still a bare kind");
+        assert_eq!(cfg.api_key_env, "TOP_LEVEL_KEY");
+    }
+
+    #[test]
+    fn an_unknown_provider_name_says_what_is_available() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Loader::new(&write_config(&dir, MULTI)).load().unwrap();
+        let err = cfg.select_provider("nope").unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("cheap"), "{message}");
+        assert!(message.contains("local"), "{message}");
+        assert!(message.contains("openai-compatible"), "{message}");
+    }
+
+    #[test]
+    fn selecting_a_provider_that_no_layer_declares_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(&dir, r#"provider = "made-up""#);
+        let err = Loader::new(&path).load().unwrap_err();
+        assert!(matches!(err, ConfigError::UnknownProvider(_)), "{err:?}");
+        // Even with nothing declared, the message has to say what it would
+        // have taken — "unknown provider: local" leaves the user guessing
+        // whether they misspelled a kind or forgot to declare the array.
+        let message = err.to_string();
+        assert!(message.contains("openrouter"), "{message}");
+        assert!(message.contains("providers"), "{message}");
+    }
+
+    #[test]
+    fn a_provider_entry_must_say_what_it_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(&dir, "[[providers]]\nmodel = 'x'\n");
+        assert!(matches!(
+            Loader::new(&path).load(),
+            Err(ConfigError::ProviderEntryUnnamed)
+        ));
+    }
+
+    #[test]
+    fn with_provider_leaves_the_original_alone() {
+        // The TUI builds a second client from this without disturbing the one
+        // already running.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Loader::new(&write_config(&dir, MULTI)).load().unwrap();
+        let other = cfg.with_provider("local").unwrap();
+
+        assert_eq!(cfg.provider_name, "cheap");
+        assert_eq!(other.provider_name, "local");
+        assert_eq!(other.model, "llama3.2");
     }
 
     #[test]
@@ -1066,6 +1862,121 @@ model = "gpt-3.5-turbo"
         assert_eq!(roots.iter().filter(|r| **r == project).count(), 1);
     }
 
+    // ---- language servers -------------------------------------------------
+
+    #[test]
+    fn project_markers_identify_the_language() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(detect_project_language(dir.path()), None);
+        std::fs::write(dir.path().join("package.json"), "{}").unwrap();
+        assert_eq!(
+            detect_project_language(dir.path()),
+            Some("javascript".into())
+        );
+        // A Next.js repo has both; the more specific marker wins.
+        std::fs::write(dir.path().join("tsconfig.json"), "{}").unwrap();
+        assert_eq!(
+            detect_project_language(dir.path()),
+            Some("typescript".into())
+        );
+        // …and go.mod is more specific still.
+        std::fs::write(dir.path().join("go.mod"), "module x").unwrap();
+        assert_eq!(detect_project_language(dir.path()), Some("go".into()));
+    }
+
+    #[test]
+    fn nextjs_and_node_resolve_to_the_typescript_server() {
+        for alias in ["nextjs", "next", "node", "nodejs", "ts", "tsx"] {
+            assert_eq!(canonical_language(alias), "typescript", "{alias}");
+        }
+        assert_eq!(canonical_language("golang"), "go");
+        assert_eq!(canonical_language("Rust"), "rust");
+        // An unknown language is passed through, lowercased.
+        assert_eq!(canonical_language("Zig"), "zig");
+    }
+
+    #[test]
+    fn the_defaults_cover_the_advertised_languages() {
+        let languages: Vec<String> = default_lsp_servers()
+            .into_iter()
+            .map(|s| s.language)
+            .collect();
+        for expected in ["go", "rust", "typescript", "javascript"] {
+            assert!(languages.contains(&expected.to_string()), "{expected}");
+        }
+    }
+
+    #[test]
+    fn a_default_for_another_language_is_not_started() {
+        // Regression: a Go project on a machine with rust-analyzer installed
+        // started rust-analyzer, which can answer nothing about Go.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("go.mod"), "module x").unwrap();
+        let cfg = Config {
+            working_dir: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+        for server in cfg.effective_lsp_servers() {
+            assert_eq!(
+                canonical_language(&server.language),
+                "go",
+                "started a server for the wrong language"
+            );
+        }
+    }
+
+    #[test]
+    fn an_explicitly_configured_server_is_always_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("go.mod"), "module x").unwrap();
+        let cfg = Config {
+            working_dir: dir.path().to_path_buf(),
+            lsp_servers: Box::new([LspServerConfig {
+                language: "python".into(),
+                command: "pyright-langserver".into(),
+                args: vec!["--stdio".into()],
+                env: Vec::new(),
+            }]),
+            ..Config::default()
+        };
+        let languages: Vec<String> = cfg
+            .effective_lsp_servers()
+            .into_iter()
+            .map(|s| s.language)
+            .collect();
+        assert!(languages.contains(&"python".to_string()), "{languages:?}");
+    }
+
+    #[test]
+    fn no_project_marker_starts_no_default_server() {
+        // A bare directory is not a Rust project just because rust-analyzer
+        // happens to be installed; trying it only produces a startup warning.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            working_dir: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+        assert!(cfg.effective_lsp_servers().is_empty());
+    }
+
+    #[test]
+    fn lsp_defaults_can_be_switched_off() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]").unwrap();
+        let cfg = Config {
+            working_dir: dir.path().to_path_buf(),
+            lsp_defaults: false,
+            ..Config::default()
+        };
+        assert!(cfg.effective_lsp_servers().is_empty());
+    }
+
+    #[test]
+    fn which_finds_a_real_binary_and_not_a_fictional_one() {
+        assert!(which_on_path("sh").is_some());
+        assert!(which_on_path("definitely-not-a-real-binary-xyzzy").is_none());
+    }
+
     #[test]
     fn default_caps_match_prd() {
         let config = Config::default();
@@ -1073,8 +1984,22 @@ model = "gpt-3.5-turbo"
         assert_eq!(config.max_tokens, 16384);
         assert_eq!(config.max_tool_output_chars, 16000);
         assert_eq!(config.provider, Provider::Openai);
-        assert_eq!(config.mode, AgentMode::Build);
-        assert!(config.shell_allowed.iter().any(|s| s == "echo .*"));
+        assert_eq!(config.mode, AgentMode::Auto);
+        assert_eq!(config.max_retries, 3);
+        assert_eq!(config.rate_limit_backoff_ms, 30_000);
+        assert!(config.lsp_defaults);
+        // The default allowlist must let a coding agent actually build.
+        assert!(!config.shell_allowed.is_empty());
+    }
+
+    #[test]
+    fn the_default_allowlist_covers_the_advertised_toolchains() {
+        // Regression: the old default was `echo/ls/cd/cat`, so `go build`
+        // failed on a fresh install.
+        let joined = DEFAULT_SHELL_ALLOWED.join("\n");
+        for tool in ["go", "cargo", "npm", "next", "pytest", "make", "git"] {
+            assert!(joined.contains(tool), "{tool} missing from the default");
+        }
     }
 
     #[test]

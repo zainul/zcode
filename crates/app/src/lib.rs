@@ -82,6 +82,9 @@ pub struct ExecutionResult {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_tokens: u64,
+    /// Estimated spend for this run. `priced` is false when the model is not
+    /// in the price table, so the UI can say "n/a" rather than "$0.00".
+    pub cost: domain::Cost,
 }
 
 /// The engine contract both interfaces drive (FR-IFACE-03).
@@ -119,6 +122,9 @@ pub struct App {
     tools: Box<dyn ToolRegistryPort + Send>,
     sessions: Box<dyn SessionStorePort + Send>,
     telemetry: Box<dyn TelemetryPort + Send>,
+    /// Rates behind the cost figure the UI shows. Defaults to the built-in
+    /// table; the CLI replaces it with one carrying the config's overrides.
+    pricing: domain::PriceTable,
     logger: Box<dyn LoggerPort + Send>,
     emitter: Box<dyn Emitter + Send>,
     cancel: CancelFlag,
@@ -137,10 +143,35 @@ impl App {
             tools,
             sessions,
             telemetry,
+            pricing: domain::PriceTable::builtin(),
             logger,
             emitter: Box::new(NullEmitter),
             cancel: CancelFlag::default(),
         }
+    }
+
+    /// Point the loop at a different provider client.
+    ///
+    /// Only the client is replaced: the tool registry, and with it every MCP
+    /// and LSP child process, is left running. Restarting those to change
+    /// endpoint would cost seconds and lose their warm state, and none of them
+    /// has anything to do with which model is answering.
+    ///
+    /// The session is untouched too, so the transcript carries across the
+    /// switch — which is the point of switching mid-conversation.
+    pub fn set_llm(&mut self, llm: Box<dyn LlmPort + Send>) {
+        self.llm = llm;
+    }
+
+    /// Replace the price table, e.g. with the config's `[[pricing]]`
+    /// overrides layered ahead of the built-ins.
+    pub fn set_pricing(&mut self, pricing: domain::PriceTable) {
+        self.pricing = pricing;
+    }
+
+    pub fn with_pricing(mut self, pricing: domain::PriceTable) -> Self {
+        self.set_pricing(pricing);
+        self
     }
 
     /// Attach a rendering sink (the TUI's channel bridge, or a pretty stdout
@@ -164,20 +195,21 @@ impl App {
         self
     }
 
-    /// The tools the model may see this turn. In planning mode the
-    /// execute-side tools are withheld entirely, so the model is never even
-    /// tempted to call them (FR-MODE-01).
+    /// The tools the model may see this turn. Anything the mode would refuse
+    /// is withheld entirely, so the model is never even tempted to call it
+    /// (FR-MODE-01). The filter and the dispatch gate share
+    /// `modes::denies`, so the list shown can never disagree with the list
+    /// allowed.
     pub fn tool_specs_for(&self, mode: AgentMode) -> Box<[ToolSpec]> {
         let all = self.tools.list();
-        match mode {
-            AgentMode::Build => all,
-            AgentMode::Planning => all
-                .into_vec()
-                .into_iter()
-                .filter(|spec| !modes::is_execute_only(&spec.name))
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
+        if mode == AgentMode::Auto {
+            return all;
         }
+        all.into_vec()
+            .into_iter()
+            .filter(|spec| !modes::denies(mode, &spec.name))
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
     }
 
     /// Enumerate every tool, unfiltered (`zcode tools list`).
@@ -263,6 +295,9 @@ impl App {
     ) {
         let (input_tokens, output_tokens, cache_tokens) = totals;
         let elapsed_ms = started.elapsed().as_millis() as u64;
+        let cost = self
+            .pricing
+            .estimate(&session.model, input_tokens, output_tokens, cache_tokens);
         self.telemetry.emit(TelemetryEvent {
             kind: "finish".into(),
             model: session.model.clone(),
@@ -279,6 +314,13 @@ impl App {
                     "mode".into(),
                     ExtraField::Text(session.mode.as_str().into()),
                 ),
+                (
+                    "cost_usd".into(),
+                    match cost.priced {
+                        true => ExtraField::Number(cost.total_usd()),
+                        false => ExtraField::Null,
+                    },
+                ),
             ]),
         });
         let totals = TelemetryTotals {
@@ -291,6 +333,7 @@ impl App {
             session_id: session.id.clone(),
             finish_reason: reason_str(reason).into(),
             truncated,
+            cost_usd: cost.priced.then(|| cost.total_usd()),
         };
         if let Err(e) = self.telemetry.flush_report(&session.id, totals) {
             self.logger
@@ -429,6 +472,40 @@ impl AgentLoop for App {
                             }),
                         }
                     }
+                    LlmEvent::Retry(notice) => {
+                        // A rate-limited turn must look rate-limited rather
+                        // than hung; the client has already waited by now.
+                        //
+                        // Reported through the emitter and telemetry only, not
+                        // the logger: in the TUI the log stream is rendered
+                        // into the same pane, so logging here would print every
+                        // retry twice.
+                        self.emit_telemetry(
+                            "llm_retry",
+                            &session,
+                            steps + 1,
+                            vec![
+                                ("attempt".into(), ExtraField::Number(notice.attempt as f64)),
+                                (
+                                    "max_attempts".into(),
+                                    ExtraField::Number(notice.max_attempts as f64),
+                                ),
+                                (
+                                    "delay_ms".into(),
+                                    ExtraField::Number(notice.delay_ms as f64),
+                                ),
+                                (
+                                    "status".into(),
+                                    match notice.status {
+                                        Some(code) => ExtraField::Number(code as f64),
+                                        None => ExtraField::Null,
+                                    },
+                                ),
+                                ("reason".into(), ExtraField::Text(notice.reason.clone())),
+                            ],
+                        );
+                        self.emitter.emit(UiEvent::Retry(notice));
+                    }
                     LlmEvent::Finish(f) => {
                         finish = Some(f);
                         break;
@@ -485,10 +562,15 @@ impl AgentLoop for App {
             }
 
             for call in &tool_calls {
-                // FR-MODE-01: refuse execute-side tools in planning mode. The
-                // check is by canonical name, so no alias slips past.
-                if req.mode == AgentMode::Planning && modes::is_execute_only(&call.name) {
-                    let message = format!("tool `{}` denied in planning mode", call.name);
+                // FR-MODE-01: refuse tools the mode does not grant. The check
+                // is by canonical name, so no alias slips past, and it uses
+                // the same predicate as the spec filter above.
+                if modes::denies(req.mode, &call.name) {
+                    let message = format!(
+                        "tool `{}` denied: {}",
+                        call.name,
+                        modes::denial_reason(req.mode)
+                    );
                     self.emitter.emit(UiEvent::Error(message.clone()));
                     self.emit_telemetry(
                         "tool_denied",
@@ -496,7 +578,11 @@ impl AgentLoop for App {
                         steps,
                         vec![
                             ("tool".into(), ExtraField::Text(call.name.clone())),
-                            ("reason".into(), ExtraField::Text("planning_mode".into())),
+                            ("tool_call_id".into(), ExtraField::Text(call.id.clone())),
+                            (
+                                "reason".into(),
+                                ExtraField::Text(format!("{}_mode", req.mode.as_str())),
+                            ),
                         ],
                     );
                     self.checkpoint(&mut session, &mut history, steps)?;
@@ -517,11 +603,14 @@ impl AgentLoop for App {
                     steps,
                     vec![
                         ("tool".into(), ExtraField::Text(call.name.clone())),
+                        ("tool_call_id".into(), ExtraField::Text(call.id.clone())),
                         ("arguments".into(), ExtraField::Text(call.arguments.clone())),
                     ],
                 );
 
+                let call_started = std::time::Instant::now();
                 let outcome = self.tools.call(&call.name, &call.arguments);
+                let elapsed_ms = call_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
                 let (content, error) = match outcome {
                     Ok(result) => (result.content, result.error),
                     // A registry-level failure is reported to the model as a
@@ -542,6 +631,7 @@ impl AgentLoop for App {
                     name: call.name.clone(),
                     content: payload.clone(),
                     error: error.clone(),
+                    elapsed_ms,
                 });
                 self.emit_telemetry(
                     "tool_result",
@@ -549,6 +639,7 @@ impl AgentLoop for App {
                     steps,
                     vec![
                         ("tool".into(), ExtraField::Text(call.name.clone())),
+                        ("tool_call_id".into(), ExtraField::Text(call.id.clone())),
                         (
                             "error".into(),
                             match &error {
@@ -557,6 +648,8 @@ impl AgentLoop for App {
                             },
                         ),
                         ("truncated".into(), ExtraField::Bool(was_truncated)),
+                        ("duration_ms".into(), ExtraField::Number(elapsed_ms as f64)),
+                        ("output".into(), ExtraField::Text(payload.clone())),
                     ],
                 );
 
@@ -588,6 +681,9 @@ impl AgentLoop for App {
             started,
         );
 
+        let cost = self
+            .pricing
+            .estimate(&session.model, input_tokens, output_tokens, cache_tokens);
         Ok(ExecutionResult {
             session_id: session.id,
             final_text,
@@ -597,6 +693,7 @@ impl AgentLoop for App {
             input_tokens,
             output_tokens,
             cache_tokens,
+            cost,
         })
     }
 }
@@ -743,7 +840,7 @@ mod tests {
                     id: id.clone(),
                     created_at: "now".into(),
                     model: "fake-model".into(),
-                    mode: AgentMode::Build,
+                    mode: AgentMode::Auto,
                     last_message_at: "now".into(),
                     step_count: 0,
                     messages: Box::new([]),
@@ -940,7 +1037,7 @@ mod tests {
             "written",
         );
         let mut req = ExecutionRequest::new("do it");
-        req.mode = AgentMode::Build;
+        req.mode = AgentMode::Auto;
         h.app.execute(&ctx(), req).unwrap();
 
         assert_eq!(h.tool_calls.0.lock().unwrap()[0].0, "write");
@@ -1154,6 +1251,8 @@ mod tests {
                     UiEvent::LoopStart { .. } => "loop_start",
                     UiEvent::LoopEnd { .. } => "loop_end",
                     UiEvent::Error(_) => "error",
+                    UiEvent::Retry(_) => "retry",
+                    UiEvent::Notice(_) => "notice",
                 };
                 self.0.lock().unwrap().push(label.to_string());
             }

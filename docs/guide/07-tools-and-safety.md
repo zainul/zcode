@@ -81,31 +81,132 @@ A patch that will not fit says so precisely, and the run continues:
   rebuild the diff from its current contents
 ```
 
-## The shell allowlist
+## Shell safety
 
-Arbitrary shell access is how coding agents cause real damage, so `shell` is
-default-deny. Only commands matching `shell_allowed` run:
+Arbitrary shell access is how coding agents cause real damage. zcode applies
+three checks, in order, before a command reaches `sh -c`.
 
-```json
-{ "shell_allowed": ["echo .*", "ls .*", "cargo (build|test|check).*", "git status"] }
+### 1. Structure
+
+Substitution and unrestricted redirection are refused outright — `` ` ``,
+`$(`, `${`, `>`, `<`, `&` — because `echo hi $(rm -rf /)` would otherwise
+satisfy an `echo .*` rule.
+
+Three redirections are provably safe and are stripped before this check, so
+they work:
+
+```sh
+go build ./... 2>&1          # duplicate stderr onto stdout
+go test ./... >/dev/null     # discard
+make -s build >/dev/null 2>&1
 ```
 
-The rules:
+Nothing else does. `echo hi > /etc/passwd 2>&1` is still refused: the safe
+suffix is stripped, and what remains still contains a `>`.
 
-1. **An empty list blocks everything.** Omitting the key is different: you
-   keep the built-in defaults (`echo .*`, `ls .*`, `cd .*`, `cat .*`). To lock
-   the agent out of the shell entirely, set `"shell_allowed": []` explicitly.
-2. **Patterns are anchored.** `ls .*` must match a whole command segment;
-   `sudo ls /` does not match.
-3. **Every segment must pass.** The command is split on `;` and `|`, and each
-   part is checked independently — `echo hi; rm -rf /` is refused because of
-   the second half.
-4. **Substitution and redirection are refused outright.** Any command
-   containing `` ` ``, `$(`, `${`, `>`, `<` or `&` is blocked, because
-   `echo hi $(rm -rf /)` would otherwise satisfy an `echo .*` rule.
-5. **These are regular expressions, not shell globs.** `*` on its own is not a
-   valid regex and makes every run fail; `.*` is what matches any text. An
-   invalid pattern is reported with a hint:
+**This check is skipped when the allowlist is unrestricted.** If any pattern in
+`shell_allowed` already matches every possible command — `".*"` being the one
+people write — there is nothing left to smuggle past, and
+
+```sh
+cd /workspace && go build ./... 2>&1 | head
+```
+
+runs. Structure exists to stop a *narrow* pattern being widened by text the
+shell expands later; once you have allowed everything, checking the text a
+second time only produces refusals you did not ask for. The denylist below is
+not skipped.
+
+### 2. The denylist — which `shell_allowed` cannot override
+
+A short list of commands is refused regardless of configuration: the ones with
+no undo, the ones that escalate, the ones that pipe the network into a shell,
+and the ones that publish irreversibly.
+
+| Category | Examples |
+|----------|----------|
+| Irreversible destruction | `rm -rf`, `rm -r`, `dd … of=`, `mkfs`, `shred`, fork bombs |
+| Privilege escalation | `sudo`, `doas`, `su`, `chmod 777`, `chown root` |
+| Fetch-and-run | `curl … \| sh`, `wget … \| bash` |
+| Host state | `shutdown`, `reboot`, `halt`, `killall` |
+| Irreversible publication | `git push --force`, `git reset --hard`, `git clean -f`, `npm publish`, `cargo publish` |
+| Credential exfiltration | `~/.ssh/id_*`, `~/.aws/credentials` |
+
+Even with `"shell_allowed": [".*"]`, these are refused, and the error says so
+explicitly so the model does not waste a turn trying to widen the allowlist:
+
+```
+shell: error: command refused: it matches zcode's built-in denylist
+(\brm\s+(-[a-zA-Z]*\s+)*-[a-zA-Z]*[rR]), which `shell_allowed` cannot
+override: sudo rm -rf /tmp/zcode-test
+```
+
+Add your own rules with `shell_denied`. They *extend* the built-ins — a project
+file cannot remove a rule set machine-wide:
+
+```json
+{ "shell_denied": ["\\bterraform apply\\b", "\\bkubectl delete\\b"] }
+```
+
+### 3. The allowlist
+
+Every segment of the command must match a pattern in `shell_allowed` **in
+full**. The command is split on `;`, `|`, and newlines, and each part is checked
+independently, so `echo hi; rm -rf /` fails on its second half.
+
+The default allowlist covers the toolchains a coding agent actually needs:
+
+| Group | Covered |
+|-------|---------|
+| Inspect | `ls`, `cat`, `head`, `tail`, `wc`, `grep`, `rg`, `find`, `fd`, `tree`, `diff`, `sed`, `awk`, `jq`, `stat`, `du`, … |
+| Files | `mkdir`, `touch`, `cp`, `mv`, `ln`, `rm` (non-recursive; the denylist stops the rest) |
+| Version control | `git`, `gh`, `glab` |
+| Rust | `cargo`, `rustc`, `rustup`, `rustfmt` |
+| Go | `go`, `gofmt`, `goimports`, `golangci-lint`, `staticcheck`, `dlv`, `air`, `templ` |
+| Node / TS / Next.js | `node`, `npm`, `npx`, `pnpm`, `yarn`, `bun`, `deno`, `tsc`, `eslint`, `prettier`, `vitest`, `jest`, `next`, `vite`, `turbo` |
+| Python | `python`, `pip`, `uv`, `poetry`, `pytest`, `ruff`, `mypy`, `black` |
+| Build | `make`, `just`, `task`, `cmake`, `ninja`, `bazel`, `gradle`, `mvn`, `dotnet` |
+| Containers (read-mostly) | `docker ps/images/logs/inspect/compose`, `kubectl get/describe/logs`, `terraform validate/fmt/plan` |
+
+This is deliberately generous. The old default was `echo`, `ls`, `cd`, `cat`,
+which meant `go build ./...` failed on a fresh install — and the fix everyone
+reached for was `"shell_allowed": ["*"]`, switching the safety net off
+entirely. A workable default paired with a denylist is strictly safer than a
+useless default people disable.
+
+It is still an allowlist: `ssh`, `scp`, `nc`, `systemctl`, `crontab` are not in
+it. `kubectl delete` and `terraform apply` are not either.
+
+### Configuring it
+
+```json
+{
+  "shell_allowed": ["echo .*", "go( .*)?", "git (status|diff|log)( .*)?"],
+  "shell_denied": ["\\bgo run\\b"]
+}
+```
+
+Rules worth knowing:
+
+1. **An empty list blocks everything.** Omitting the key keeps the defaults
+   above. To lock the agent out of the shell entirely, set
+   `"shell_allowed": []` explicitly — or just use `--mode editing`, which
+   withholds the tool.
+2. **Patterns are anchored.** `ls .*` must match a whole segment; `sudo ls /`
+   does not match it.
+3. **`".*"` means everything.** A pattern that matches any command switches off
+   the structure check as well, so `&&`, pipes and redirection all work. The
+   denylist stays on — this widens what may run, it never removes a built-in
+   rule. `zcode config` says so plainly, so the state is never a surprise:
+
+   ```
+   shell_allowed          1 pattern(s) — unrestricted: anything the denylist
+                                         permits, pipes and `&&` included
+   shell_denied           23 built-in + 0 from config
+   ```
+4. **These are regular expressions, not shell globs.** `*` alone is not a valid
+   regex and makes every run fail; `.*` is what matches any text. An invalid
+   pattern is reported with a hint:
 
    ```
    invalid shell_allowed pattern "*": error: repetition operator missing expression
@@ -113,24 +214,30 @@ The rules:
            every command (which disables the safety net entirely)
    ```
 
-   `zcode config` catches this before you spend a token on it.
+   `zcode config` catches this before you spend a token on it, and exits 1.
+5. **A block explains itself.** The model is told what to do about it, so it
+   fixes the command instead of retrying it verbatim:
 
-In practice:
+   ```
+   shell: error: command blocked by the shell allowlist (`shell_allowed` in
+   zcode.json/zcode.toml): go build ./...
+     hint: no pattern in `shell_allowed` matches `go`; add one, e.g. "go( .*)?"
+   ```
 
-```
-· shell
-  shell: main.rs
-· shell
-  shell: error: command blocked by the shell allowlist (`shell_allowed` in zcode.json/zcode.toml): rm -rf /
-Done.
-```
+   A command refused for its *structure* is pointed at the escape hatch
+   instead:
 
-The first command was allowed and ran; the second was refused, the refusal was
-handed back to the model, and it carried on. Blocking a command never crashes a
-run.
+   ```
+   shell: error: command blocked by the shell allowlist (`shell_allowed` in
+   zcode.json/zcode.toml): cd /workspace && go build ./...
+     hint: shell metacharacters (`$(`, backticks, `>`, `<`, `&&`) are not
+           allowed under a narrow allowlist; only `2>&1` and `>/dev/null` are.
+           Run the command without them, or set `shell_allowed` to [".*"],
+           which permits every command the built-in denylist does not refuse.
+   ```
 
-Start narrow and widen as you learn what your workflow needs. `cargo test.*` is
-usually safe; `rm .*` rarely is.
+   In the TUI that message is wrapped in full underneath its tool row, never
+   truncated — a refusal you cannot read is a refusal you cannot fix.
 
 ## Skills
 

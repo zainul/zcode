@@ -1,0 +1,38 @@
+### 07-wrap
+a 250-character line wraps inside the prompt box
+
+┌────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│┌ conversation ────────────────────────────────────────────────────────────────────────────────────┐│
+││10:49:22  zcode                                                                                   ││
+││  Ready when you are. Type /help for commands.                                                    ││
+││                                                                                                  ││
+││                                                                                                  ││
+││                                                                                                  ││
+││                                                                                                  ││
+││                                                                                                  ││
+││                                                                                                  ││
+││                                                                                                  ││
+││                                                                                                  ││
+││                                                                                                  ││
+││                                                                                                  ││
+││                                                                                                  ││
+││                                                                                                  ││
+││                                                                                                  ││
+││                                                                                                  ││
+││                                                                                                  ││
+│└──────────────────────────────────────────────────────────────────────────────────────────────────┘│
+│┌ Enter sends · Alt-Enter newline · /help ─────────────────────────────────────────────────────────┐│
+││  *http.Request) {                                                                                ││
+││      ctx := r.Context()                                                                          ││
+││      if err := svc.Do(ctx); err != nil {                                                         ││
+││          http.Error(w, err.Error(), 500)                                                         ││
+││          return                                                                                  ││
+││      }                                                                                           ││
+││  }                                                                                               ││
+││  xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx││
+││  xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx││
+││  xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx                                      ││
+│└──────────────────────────────────────────────────────────────────────────────────────────────────┘│
+│ ● ready  │  mode auto  │  openrouter/poolside/laguna-s-2.1:free  │  0 in / 0 out  │  $0.00         │
+└────────────────────────────────────────────────────────────────────────────────────────────────────┘
+cursor: row 29, col 61, visible=True

@@ -1,0 +1,38 @@
+### 18-shell-blocked
+a refusal wrapped in full under its tool row
+
+┌────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│┌ conversation ────────────────────────────────────────────────────────────────────────────────────┐│
+││10:50:39  zcode                                                                                   ││
+││  Ready when you are. Type /help for commands.                                                    ││
+││                                                                                                  ││
+││10:50:41  you                                                                                     ││
+││  build the project                                                                               ││
+││                                                                                                  ││
+││10:50:41  zcode                                                                                   ││
+││  Running that for you now.                                                                       ││
+││  tools used                                                                                      ││
+││  └ ✖ 10:50:41  shell                                                                             ││
+││      command blocked by the shell allowlist (`shell_allowed` in zcode.json/zcode.toml): cd       ││
+││      /workspace && go build ./... 2>&1 | head                                                    ││
+││        hint: shell metacharacters (`$(`, backticks, `>`, `<`, `&&`) are not allowed under a      ││
+││        narrow allowlist; only `2>&1` and `>/dev/null` are. Run the command without them, or set  ││
+││        `shell_allowed` to [".*"], which permits every command the built-in denylist does not     ││
+││        refuse.                                                                                   ││
+││                                                                                                  ││
+││10:50:41  zcode                                                                                   ││
+││  That is what the shell had to say.                                                              ││
+││                                                                                                  ││
+││                                                                                                  ││
+││                                                                                                  ││
+││                                                                                                  ││
+││                                                                                                  ││
+││                                                                                                  ││
+││                                                                                                  ││
+│└──────────────────────────────────────────────────────────────────────────────────────────────────┘│
+│┌ Enter sends · Alt-Enter newline · /help ─────────────────────────────────────────────────────────┐│
+││>                                                                                                 ││
+│└──────────────────────────────────────────────────────────────────────────────────────────────────┘│
+│ ● ready  │  mode auto  │  openai-compatible/gpt-4o-mini  │  230 in / 27 out  │  <$0.0001           │
+└────────────────────────────────────────────────────────────────────────────────────────────────────┘
+cursor: row 29, col 3, visible=True

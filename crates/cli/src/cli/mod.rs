@@ -5,6 +5,7 @@
 //! the interface layer knows any of it — `app` sees port trait objects only.
 
 pub mod emit;
+pub mod logging;
 pub mod tui;
 
 use std::io::Write;
@@ -17,10 +18,12 @@ use clap::{Parser, Subcommand};
 
 use app::{AgentLoop, App, AppError, ExecutionRequest, NullEmitter};
 use domain::{AgentMode, CancelFlag, ImageRef, LogLevel, LoggerPort, SessionStorePort};
-use infra_config::{user_config_candidates, Config, LayerKind, Loader, Provider};
-use infra_llm::{AnthropicLlm, DeepSeekLlm, OllamaLlm, OpenAiLlm, OpenRouterLlm, VllmLlm};
+use infra_config::{user_config_candidates, which_on_path, Config, LayerKind, Loader, Provider};
+use infra_llm::{
+    AnthropicLlm, DeepSeekLlm, OllamaLlm, OpenAiLlm, OpenRouterLlm, RetryPolicy, VllmLlm,
+};
 use infra_session::UuidSessionStore;
-use infra_telemetry::JsonTelemetry;
+use infra_telemetry::{JsonTelemetry, OpencodeTelemetry};
 use tools::ToolRegistry;
 
 use emit::PrettyEmitter;
@@ -93,9 +96,13 @@ pub struct RunArgs {
     /// Attach an image for vision-capable models. Repeatable.
     #[arg(long = "image", value_name = "FILE")]
     pub images: Vec<PathBuf>,
-    /// planning = read-only, proposes changes; build = edits directly.
+    /// planning (read-only) | editing (edits files) | auto (edits and runs shell).
     #[arg(long, value_parser = parse_mode)]
     pub mode: Option<AgentMode>,
+    /// Which provider to use: a name from the `providers` array, or a
+    /// built-in kind (openai, anthropic, openrouter, ollama, …).
+    #[arg(long, value_name = "NAME")]
+    pub provider: Option<String>,
     /// Resume an existing session id.
     #[arg(long)]
     pub session: Option<String>,
@@ -103,6 +110,10 @@ pub struct RunArgs {
     /// Stream one JSON object per event to stdout (JSONL).
     #[arg(long)]
     pub json: bool,
+    /// Event schema for `--json`: zcode's own flat log, or opencode's
+    /// `session.next.*` envelopes for consumers written against opencode.
+    #[arg(long = "json-format", value_name = "FORMAT", default_value = "zcode")]
+    pub json_format: JsonFormat,
     /// Config file to use instead of ./zcode.json or ./zcode.toml.
     #[arg(long, value_name = "FILE")]
     pub config: Option<PathBuf>,
@@ -121,9 +132,13 @@ pub struct ConfigArgs {
 
 #[derive(clap::Args)]
 pub struct ReplArgs {
-    /// planning = read-only, proposes changes; build = edits directly.
+    /// planning (read-only) | editing (edits files) | auto (edits and runs shell).
     #[arg(long, value_parser = parse_mode)]
     pub mode: Option<AgentMode>,
+    /// Which provider to start on: a name from the `providers` array, or a
+    /// built-in kind. Switch again in the TUI with `/provider <name>`.
+    #[arg(long, value_name = "NAME")]
+    pub provider: Option<String>,
     /// Config file to use instead of ./zcode.json or ./zcode.toml.
     #[arg(long, value_name = "FILE")]
     pub config: Option<PathBuf>,
@@ -148,6 +163,9 @@ pub enum SessionCmd {
         /// Stream one JSON object per event to stdout (JSONL).
         #[arg(long)]
         json: bool,
+        /// Event schema for `--json`: `zcode` or `opencode`.
+        #[arg(long = "json-format", value_name = "FORMAT", default_value = "zcode")]
+        json_format: JsonFormat,
     },
     // FR-SESSION-03
     /// Branch a session into an independent copy.
@@ -179,6 +197,16 @@ pub enum SessionCmd {
 pub enum ListCmd {
     /// List everything available.
     List,
+}
+
+/// Which event schema `--json` writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum JsonFormat {
+    /// zcode's own flat JSONL: one object per event, documented in the guide.
+    Zcode,
+    /// opencode's event envelopes (`session.next.*`), for tools written
+    /// against opencode's bus.
+    Opencode,
 }
 
 fn parse_mode(raw: &str) -> Result<AgentMode, String> {
@@ -225,7 +253,7 @@ impl LoggerPort for StdLogger {
 
 /// Build the provider client named by the configuration (FR-MODEL-01..06).
 /// An unusable combination is a typed error, never a panic (NFR-REL-02).
-fn build_llm(cfg: &Config) -> Result<Box<dyn domain::LlmPort + Send>, AppError> {
+pub(crate) fn build_llm(cfg: &Config) -> Result<Box<dyn domain::LlmPort + Send>, AppError> {
     // Local/self-hosted providers are keyless; hosted ones fail fast so the
     // user learns about a missing key before a request is attempted.
     let api_key = if cfg.provider.requires_api_key() {
@@ -252,29 +280,51 @@ fn build_llm(cfg: &Config) -> Result<Box<dyn domain::LlmPort + Send>, AppError> 
             .unwrap_or_else(|| provider.default_endpoint().unwrap_or_default().to_string())
     };
 
+    // Every client gets the same retry policy, so a 429 behaves the same way
+    // whichever provider issued it.
+    let retries = RetryPolicy::default()
+        .with_max_retries(cfg.max_retries)
+        .with_rate_limit_backoff(cfg.rate_limit_backoff());
     let llm: Box<dyn domain::LlmPort + Send> = match cfg.provider {
-        Provider::Openai => Box::new(OpenAiLlm::with_timeout(
-            &endpoint_or_default(Provider::Openai),
-            &api_key,
-            &cfg.model,
-            timeout,
-        )),
-        Provider::Anthropic => Box::new(AnthropicLlm::with_timeout(&api_key, &cfg.model, timeout)),
-        Provider::Openrouter => {
-            Box::new(OpenRouterLlm::with_timeout(&api_key, &cfg.model, timeout))
+        Provider::Openai => {
+            let mut client = OpenAiLlm::with_timeout(
+                &endpoint_or_default(Provider::Openai),
+                &api_key,
+                &cfg.model,
+                timeout,
+            );
+            client.set_retry_policy(retries);
+            Box::new(client)
         }
-        Provider::Deepseek => Box::new(DeepSeekLlm::with_timeout(&api_key, &cfg.model, timeout)),
-        Provider::Ollama => Box::new(OllamaLlm::with_timeout(
-            &endpoint_or_default(Provider::Ollama),
-            &cfg.model,
-            timeout,
-        )),
-        Provider::Vllm | Provider::OpenaiCompatible => Box::new(VllmLlm::with_timeout(
-            &base_url()?,
-            &api_key,
-            &cfg.model,
-            timeout,
-        )),
+        Provider::Anthropic => {
+            let mut client = AnthropicLlm::with_timeout(&api_key, &cfg.model, timeout);
+            client.set_retry_policy(retries);
+            Box::new(client)
+        }
+        Provider::Openrouter => {
+            let mut client = OpenRouterLlm::with_timeout(&api_key, &cfg.model, timeout);
+            client.set_retry_policy(retries);
+            Box::new(client)
+        }
+        Provider::Deepseek => {
+            let mut client = DeepSeekLlm::with_timeout(&api_key, &cfg.model, timeout);
+            client.set_retry_policy(retries);
+            Box::new(client)
+        }
+        Provider::Ollama => {
+            let mut client = OllamaLlm::with_timeout(
+                &endpoint_or_default(Provider::Ollama),
+                &cfg.model,
+                timeout,
+            );
+            client.set_retry_policy(retries);
+            Box::new(client)
+        }
+        Provider::Vllm | Provider::OpenaiCompatible => {
+            let mut client = VllmLlm::with_timeout(&base_url()?, &api_key, &cfg.model, timeout);
+            client.set_retry_policy(retries);
+            Box::new(client)
+        }
     };
     Ok(llm)
 }
@@ -285,6 +335,18 @@ fn build_llm(cfg: &Config) -> Result<Box<dyn domain::LlmPort + Send>, AppError> 
 /// `telemetry_out` is stdout for `--json` and a sink otherwise; the report
 /// file is written either way (FR-OUTPUT-02).
 pub fn wire(cfg: &Config, telemetry_out: Box<dyn Write + Send>) -> Result<App, AppError> {
+    wire_with_format(cfg, telemetry_out, JsonFormat::Zcode)
+}
+
+/// As [`wire`], choosing which event schema is written to `telemetry_out`.
+///
+/// The run report is written either way: it is a record of what happened, not
+/// a rendering choice, so it does not follow `--json-format`.
+pub fn wire_with_format(
+    cfg: &Config,
+    telemetry_out: Box<dyn Write + Send>,
+    format: JsonFormat,
+) -> Result<App, AppError> {
     let llm = build_llm(cfg)?;
 
     let registry = ToolRegistry::from_config(cfg).map_err(|e| AppError::Config(e.to_string()))?;
@@ -295,15 +357,49 @@ pub fn wire(cfg: &Config, telemetry_out: Box<dyn Write + Send>) -> Result<App, A
 
     let ag_dir = cfg.working_dir.join(".zcode");
     let sessions = UuidSessionStore::new(ag_dir.join("sessions"));
-    let telemetry = JsonTelemetry::new(telemetry_out, ag_dir.join("reports"));
+    let telemetry: Box<dyn domain::TelemetryPort + Send> = match format {
+        JsonFormat::Zcode => Box::new(JsonTelemetry::new(telemetry_out, ag_dir.join("reports"))),
+        // opencode's stream goes to stdout; the report still needs writing, so
+        // the standard emitter runs alongside it over a sink.
+        JsonFormat::Opencode => Box::new(TeeTelemetry {
+            stream: Box::new(OpencodeTelemetry::new(telemetry_out)),
+            report: Box::new(JsonTelemetry::new(
+                Box::new(std::io::sink()),
+                ag_dir.join("reports"),
+            )),
+        }),
+    };
 
     Ok(App::new(
         llm,
         Box::new(registry),
         Box::new(sessions),
-        Box::new(telemetry),
+        telemetry,
         Box::new(StdLogger::new()),
-    ))
+    )
+    .with_pricing(cfg.price_table()))
+}
+
+/// Sends every event to two ports. Only `report` writes the report file, so
+/// the run leaves exactly one on disk however the stream is rendered.
+struct TeeTelemetry {
+    stream: Box<dyn domain::TelemetryPort + Send>,
+    report: Box<dyn domain::TelemetryPort + Send>,
+}
+
+impl domain::TelemetryPort for TeeTelemetry {
+    fn emit(&mut self, ev: domain::TelemetryEvent) {
+        self.stream.emit(ev.clone());
+        self.report.emit(ev);
+    }
+
+    fn flush_report(
+        &mut self,
+        session_id: &str,
+        total: domain::TelemetryTotals,
+    ) -> Result<PathBuf, domain::BoxError> {
+        self.report.flush_report(session_id, total)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -311,7 +407,7 @@ pub fn wire(cfg: &Config, telemetry_out: Box<dyn Write + Send>) -> Result<App, A
 // ---------------------------------------------------------------------------
 
 pub fn run() -> CliResult {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+    logging::init();
     // `--help` and `--version` arrive as clap "errors". They are successful
     // output, not failures: print them as clap intends and exit 0, rather than
     // routing them through the error handler with a `zcode:` prefix and exit 1.
@@ -328,7 +424,7 @@ pub fn run() -> CliResult {
     };
     match cli.command {
         None => {
-            let cfg = load_config(None, None)?;
+            let cfg = load_config(None, None, None)?;
             let cancel = install_signal_handler();
             tui::run_tui(cfg, cancel, None)?;
             Ok(ExitCode::SUCCESS)
@@ -339,7 +435,7 @@ pub fn run() -> CliResult {
         }
         Some(Commands::Run(args)) => cmd_run(args),
         Some(Commands::Repl(args)) => {
-            let cfg = load_config(args.config.as_deref(), args.mode)?;
+            let cfg = load_config(args.config.as_deref(), args.mode, args.provider.as_deref())?;
             let cancel = install_signal_handler();
             tui::run_tui(cfg, cancel, args.session)?;
             Ok(ExitCode::SUCCESS)
@@ -354,11 +450,17 @@ pub fn run() -> CliResult {
 fn load_config(
     path: Option<&Path>,
     mode: Option<AgentMode>,
+    provider: Option<&str>,
 ) -> Result<Config, Box<dyn std::error::Error + Send + Sync>> {
     let mut cfg = Loader::with_default().load_with_override(path)?;
     // A CLI flag beats both the file and the environment (FR-MODE-01/02).
     if let Some(mode) = mode {
         cfg.mode = mode;
+    }
+    // Re-resolves model, key variable and URL from the chosen profile, so
+    // `--provider local` is one word rather than four overrides.
+    if let Some(name) = provider {
+        cfg.select_provider(name)?;
     }
     Ok(cfg)
 }
@@ -377,7 +479,7 @@ fn install_signal_handler() -> CancelFlag {
 }
 
 fn cmd_run(args: RunArgs) -> CliResult {
-    let cfg = load_config(args.config.as_deref(), args.mode)?;
+    let cfg = load_config(args.config.as_deref(), args.mode, args.provider.as_deref())?;
     let cancel = install_signal_handler();
 
     let telemetry_out: Box<dyn Write + Send> = if args.json {
@@ -385,7 +487,7 @@ fn cmd_run(args: RunArgs) -> CliResult {
     } else {
         Box::new(std::io::sink())
     };
-    let mut app = wire(&cfg, telemetry_out)?;
+    let mut app = wire_with_format(&cfg, telemetry_out, args.json_format)?;
     app.set_cancel(cancel);
     if args.json {
         // JSONL is the output; a second pretty layer would corrupt it.
@@ -414,11 +516,12 @@ fn cmd_run(args: RunArgs) -> CliResult {
             if !args.json {
                 // Summary on stderr keeps stdout to the model's answer.
                 eprintln!(
-                    "\n[{} step(s) · {} in / {} out / {} cached tokens · session {}]",
+                    "\n[{} step(s) · {} in / {} out / {} cached tokens · {} · session {}]",
                     result.steps,
                     result.input_tokens,
                     result.output_tokens,
                     result.cache_tokens,
+                    result.cost.render(),
                     result.session_id
                 );
             }
@@ -433,21 +536,28 @@ fn cmd_run(args: RunArgs) -> CliResult {
 }
 
 fn cmd_session(command: SessionCmd) -> CliResult {
-    let cfg = load_config(None, None)?;
+    let cfg = load_config(None, None, None)?;
     let mut store = UuidSessionStore::new(cfg.working_dir.join(".zcode").join("sessions"));
 
     match command {
         SessionCmd::Create => {
             println!("{}", store.create()?);
         }
-        SessionCmd::Continue { id, prompt, json } => {
+        SessionCmd::Continue {
+            id,
+            prompt,
+            json,
+            json_format,
+        } => {
             return match prompt {
                 Some(prompt) => cmd_run(RunArgs {
                     prompt,
                     images: Vec::new(),
                     mode: None,
+                    provider: None,
                     session: Some(id),
                     json,
+                    json_format,
                     config: None,
                     timeout: None,
                 }),
@@ -533,10 +643,60 @@ fn cmd_config(args: ConfigArgs) -> CliResult {
     });
 
     println!("\nEffective configuration");
-    println!("  {:<22} {}", "provider", cfg.provider.as_str());
+    // When a profile was selected, its name is what the user typed and the
+    // kind is what it speaks — showing only one of them would leave them
+    // guessing which endpoint they are actually pointed at.
+    if cfg.provider_name == cfg.provider.as_str() {
+        println!("  {:<22} {}", "provider", cfg.provider.as_str());
+    } else {
+        println!(
+            "  {:<22} {}  ({})",
+            "provider",
+            cfg.provider_name,
+            cfg.provider.as_str()
+        );
+    }
     println!("  {:<22} {}", "model", cfg.model);
     println!("  {:<22} {}  [{key_state}]", "api_key_env", cfg.api_key_env);
     println!("  {:<22} {}", "endpoint", base_url);
+    // Every endpoint the user can switch to, in the same shape as the LSP
+    // list below: the key, then one indented row each.
+    if !cfg.providers.is_empty() {
+        println!(
+            "  {:<22} {}  (--provider NAME, or /provider NAME in the TUI)",
+            "providers",
+            cfg.providers.len()
+        );
+        for profile in cfg.providers.iter() {
+            let marker = if profile.name == cfg.provider_name {
+                "▸"
+            } else {
+                " "
+            };
+            let model = profile
+                .settings
+                .model
+                .clone()
+                .unwrap_or_else(|| profile.kind.default_model().to_string());
+            let endpoint = profile
+                .settings
+                .base_url
+                .clone()
+                .or_else(|| profile.kind.default_endpoint().map(str::to_string))
+                .unwrap_or_else(|| "NO ENDPOINT — set base_url".to_string());
+            println!(
+                "    {marker} {:<12} {:<18} {}",
+                profile.name,
+                profile.kind.as_str(),
+                if model.is_empty() {
+                    "(no default model)"
+                } else {
+                    &model
+                }
+            );
+            println!("      {:<12} {endpoint}", "");
+        }
+    }
     println!("  {:<22} {}", "working_dir", cfg.working_dir.display());
     println!("  {:<22} {}", "mode", cfg.mode.as_str());
     println!("  {:<22} {}", "timeout_ms", cfg.timeout_ms);
@@ -546,6 +706,11 @@ fn cmd_config(args: ConfigArgs) -> CliResult {
         "  {:<22} {}",
         "max_tool_output_chars", cfg.max_tool_output_chars
     );
+    println!("  {:<22} {}", "max_retries", cfg.max_retries);
+    println!(
+        "  {:<22} {}ms  (after a 429 with no Retry-After)",
+        "rate_limit_backoff_ms", cfg.rate_limit_backoff_ms
+    );
     println!("  {:<22} {}", "skills_dir", cfg.skills_dir().display());
     println!(
         "  {:<22} {} pattern(s){}",
@@ -553,16 +718,78 @@ fn cmd_config(args: ConfigArgs) -> CliResult {
         cfg.shell_allowed.len(),
         if cfg.shell_allowed.is_empty() {
             " — every shell command is denied"
+        } else if tools::allowlist_is_unrestricted(&cfg.shell_allowed) {
+            " — unrestricted: anything the denylist permits, pipes and `&&` included"
         } else {
             ""
         }
     );
+    println!(
+        "  {:<22} {} built-in + {} from config",
+        "shell_denied",
+        tools::builtin_deny_rule_count(),
+        cfg.shell_denied.len()
+    );
     println!("  {:<22} {}", "mcp servers", cfg.mcp_servers.len());
-    println!("  {:<22} {}", "lsp servers", cfg.lsp_servers.len());
+
+    // LSP is on by default, so say which servers that actually resolved to —
+    // "2 configured" is useless when the interesting number is what starts.
+    let lsp = cfg.effective_lsp_servers();
+    let detected = cfg.detected_language();
+    println!(
+        "  {:<22} {}{}",
+        "lsp servers",
+        lsp.len(),
+        match &detected {
+            Some(language) => format!("  (project looks like {language})"),
+            None => String::new(),
+        }
+    );
+    for (i, server) in lsp.iter().enumerate() {
+        let marker = if i == 0 { "▸" } else { " " };
+        let source = if cfg
+            .lsp_servers
+            .iter()
+            .any(|s| s.language == server.language && s.command == server.command)
+        {
+            "config"
+        } else {
+            "default"
+        };
+        let path = which_on_path(&server.command)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| format!("{} — NOT on PATH", server.command));
+        println!("    {marker} {:<12} {path}  [{source}]", server.language);
+    }
+    if lsp.is_empty() && cfg.lsp_defaults {
+        println!("    (none — no language server for this project is installed)");
+    }
+
+    let rates = cfg.price_table();
+    match rates.lookup(&cfg.model) {
+        Some(entry) => println!(
+            "  {:<22} ${}/${} per Mtok in/out (matched `{}`)",
+            "pricing", entry.input_per_mtok, entry.output_per_mtok, entry.model
+        ),
+        // Ask the table rather than assuming: a `:free` route has no entry but
+        // is still priced, and reporting it as unknown here would contradict
+        // the `$0.00` every run prints.
+        None if rates.knows(&cfg.model) => {
+            println!("  {:<22} free route — cost will show as $0.00", "pricing")
+        }
+        None => println!(
+            "  {:<22} no rate for `{}` — cost will show as n/a",
+            "pricing", cfg.model
+        ),
+    }
 
     // Catch the mistakes that would otherwise only surface on the first run.
     let mut problems: Vec<String> = Vec::new();
-    if let Err(e) = tools::GuardedShell::new(infra_shell::StdShell::new(), &cfg.shell_allowed) {
+    if let Err(e) = tools::GuardedShell::with_denylist(
+        infra_shell::StdShell::new(),
+        &cfg.shell_allowed,
+        &cfg.shell_denied,
+    ) {
         problems.push(e.to_string());
     }
     if cfg.provider.requires_api_key() && cfg.resolve_api_key().is_err() {
@@ -600,7 +827,7 @@ fn cmd_config(args: ConfigArgs) -> CliResult {
 }
 
 fn cmd_tools_list() -> CliResult {
-    let cfg = load_config(None, None)?;
+    let cfg = load_config(None, None, None)?;
     // No LLM is constructed here, so `zcode tools list` works without an API key.
     let registry = ToolRegistry::from_config(&cfg)?;
     for warning in registry.warnings() {
@@ -621,7 +848,7 @@ fn cmd_tools_list() -> CliResult {
 }
 
 fn cmd_skills_list() -> CliResult {
-    let cfg = load_config(None, None)?;
+    let cfg = load_config(None, None, None)?;
     let roots = cfg.skills_dirs();
     let index = tools::SkillIndex::discover(&roots);
 

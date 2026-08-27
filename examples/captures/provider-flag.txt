@@ -1,0 +1,5 @@
+$ cd ./examples/multi-provider && /Users/zainul/rust/zcode/target/release/zcode run --provider local hi
+
+zcode: llm error: ollama request failed: error sending request for url (http://localhost:11434/api/chat)
+
+[exit 1]

@@ -1,0 +1,38 @@
+### 02-help
+/help — the pane follows the tail, so the keys are shown
+
+┌────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│┌ conversation ────────────────────────────────────────────────────────────────────────────────────┐│
+││  commands:                                                                                       ││
+││    /help                            show this list                                               ││
+││    /exit                            quit zcode (also /quit, or Ctrl-C)                           ││
+││    /mode [planning|editing|auto]    show or change what the agent is allowed to do               ││
+││    /cost                            token usage and estimated spend for this session             ││
+││    /model                           provider, model, and config source                           ││
+││    /provider [NAME]                 list the configured providers, or switch to one              ││
+││    /session                         current session id and where it is stored                    ││
+││    /tools                           tools available in the current mode                          ││
+││    /new                             start a fresh session (clears the model's context)           ││
+││    /clear                           clear the screen, keep the session                           ││
+││    /stop                            cancel the turn in flight (also Esc)                         ││
+││                                                                                                  ││
+││  keys:                                                                                           ││
+││    Enter                            send                                                         ││
+││    Alt-Enter                        newline without sending                                      ││
+││    Esc                              cancel the turn in flight, else clear the prompt             ││
+││    Ctrl-C                           cancel if busy, otherwise quit                               ││
+││    Ctrl-A / Ctrl-E                  start / end of line                                          ││
+││    Ctrl-W                           delete the previous word                                     ││
+││    Ctrl-U / Ctrl-K                  delete to start / end of line                                ││
+││    PageUp / PageDown                scroll the conversation (also the mouse wheel)               ││
+││    Ctrl-Up / Ctrl-Down              scroll one line                                              ││
+││    Shift-Tab                        cycle mode                                                   ││
+││                                                                                                  ││
+││    the mouse wheel scrolls; hold Shift (Option on macOS Terminal) to select text                 ││
+│└──────────────────────────────────────────────────────────────────────────────────────────────────┘│
+│┌ Enter sends · Alt-Enter newline · /help ─────────────────────────────────────────────────────────┐│
+││>                                                                                                 ││
+│└──────────────────────────────────────────────────────────────────────────────────────────────────┘│
+│ ● ready  │  mode auto  │  openrouter/poolside/laguna-s-2.1:free  │  0 in / 0 out  │  $0.00         │
+└────────────────────────────────────────────────────────────────────────────────────────────────────┘
+cursor: row 29, col 3, visible=True

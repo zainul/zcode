@@ -1,0 +1,5 @@
+$ cd ./examples/multi-provider && /Users/zainul/rust/zcode/target/release/zcode run --provider nope hi
+
+zcode: unknown provider `nope` — configured: fast, free-openrouter, free-groq, gateway, local, primary, backup; built in: openai, anthropic, openrouter, deepseek, ollama, vllm, openai-compatible
+
+[exit 1]

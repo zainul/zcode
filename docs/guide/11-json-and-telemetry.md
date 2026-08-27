@@ -31,7 +31,7 @@ One JSON object per line, nothing else on stdout:
 | `loop_start` | Beginning of each step | `mode` |
 | `llm_delta` | Each chunk of model text | `text` |
 | `tool_call` | The model asked for a tool | `tool`, `arguments` |
-| `tool_result` | The tool returned | `tool`, `error`, `truncated` |
+| `tool_result` | The tool returned | `tool`, `error`, `truncated`, `duration_ms`, `output` |
 | `tool_denied` | Refused by planning mode | `tool`, `reason` |
 | `finish` | End of the run | `reason`, `truncated`, `mode` |
 

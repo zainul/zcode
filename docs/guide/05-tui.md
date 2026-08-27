@@ -12,7 +12,7 @@ $ zcode                                   # no subcommand → TUI
 $ zcode repl                              # the same thing, explicitly
 $ zcode repl --mode planning              # start read-only
 $ zcode repl --session <id>               # resume an existing session
-$ zcode repl --config ci/zcode.json          # a specific config
+$ zcode repl --config ci/zcode.json       # a specific config
 ```
 
 The TUI needs a real terminal. Without one it exits cleanly rather than
@@ -25,47 +25,440 @@ zcode: Device not configured (os error 6)
 
 ## The screen
 
+Every screen in this chapter is a real capture, taken by driving the binary on
+a pseudo-terminal (`examples/tui-screenshot.py`). They were recorded against
+OpenRouter's free `poolside/laguna-s-2.1:free` route, which is why the cost
+reads `$0.00` — that is a *known* zero, not an unknown one. An unpriced model
+shows `n/a` instead.
+
 ```
-┌ conversation ─────────────────────────────────────────────┐
-│ zcode: ready when you are.                                   │
-│ you: add a farewell function to src/main.rs               │
-│ zcode: I'll add the function.                                │
-│ zcode: Added `farewell` to src/main.rs.                      │
-│                                                           │
-└───────────────────────────────────────────────────────────┘
-┌ tools ────────────────────────────────────────────────────┐
-│ · apply_patch                                             │
-│   apply_patch: patched src/main.rs (1 hunk(s))            │
-└───────────────────────────────────────────────────────────┘
-┌ ready · 2 step(s) · 2490 in / 110 out tokens · session 01a…┐
-│ > _                                                       │
-└───────────────────────────────────────────────────────────┘
+┌ conversation ────────────────────────────────────────────────────────────────────────────────────┐
+│20:20:43  zcode                                                                                   │
+│  Ready when you are. Type /help for commands.                                                    │
+│                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ Enter sends · Alt-Enter newline · /help ─────────────────────────────────────────────────────────┐
+│>                                                                                                 │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+ ● ready  │  mode auto  │  openrouter/poolside/laguna-s-2.1:free  │  0 in / 0 out  │  $0.00
 ```
 
-- **conversation** — your prompts and the model's replies, streaming live.
-- **tools** — each tool call and a one-line summary of its result, so tool
-  noise never buries the conversation.
-- **input bar** — the title doubles as a status line: which provider and model,
-  the current step while thinking, and the token totals when idle.
+- **conversation** — one timeline: your prompts, the model's replies, and the
+  tools that served them, in the order they happened. Each block is stamped
+  with the local wall-clock time. Your name is green, zcode's is cyan, errors
+  are red.
+- **prompt** — grows as you type, up to ten rows. The caret is real and visible,
+  and the title tells you what Enter will do.
+- **status bar** — state, mode, provider/model, running token totals, and the
+  estimated cost so far. It adapts to the terminal width: on a narrow window the
+  vendor namespace goes first, then the model name, then the cache count, then
+  the token totals. State, mode, and **cost** always survive, because the cost
+  is the field you cannot recompute by looking at the screen.
 
-## Keys
+## Slash commands
+
+`/help` lists everything, in the app:
+
+```
+┌ conversation (scrolled ↑4, PageDown to follow) ──────────────────────────────────────────────────┐
+│10:45:28  zcode                                                                                   │
+│  Ready when you are. Type /help for commands.                                                    │
+│                                                                                                  │
+│10:45:29  zcode                                                                                   │
+│  commands:                                                                                       │
+│    /help                            show this list                                               │
+│    /exit                            quit zcode (also /quit, or Ctrl-C)                           │
+│    /mode [planning|editing|auto]    show or change what the agent is allowed to do               │
+│    /cost                            token usage and estimated spend for this session             │
+│    /model                           provider, model, and config source                           │
+│    /provider [NAME]                 list the configured providers, or switch to one              │
+│    /session                         current session id and where it is stored                    │
+│    /tools                           tools available in the current mode                          │
+│    /new                             start a fresh session (clears the model's context)           │
+│    /clear                           clear the screen, keep the session                           │
+│    /stop                            cancel the turn in flight (also Esc)                         │
+│                                                                                                  │
+│  keys:                                                                                           │
+│    Enter                            send                                                         │
+│    Alt-Enter                        newline without sending                                      │
+│    Esc                              cancel the turn in flight, else clear the prompt             │
+│    Ctrl-C                           cancel if busy, otherwise quit                               │
+│    Ctrl-A / Ctrl-E                  start / end of line                                          │
+│    Ctrl-W                           delete the previous word                                     │
+│    Ctrl-U / Ctrl-K                  delete to start / end of line                                │
+│    PageUp / PageDown                scroll the conversation (also the mouse wheel)               │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ Enter sends · Alt-Enter newline · /help ─────────────────────────────────────────────────────────┐
+│>                                                                                                 │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+ ● ready  │  mode auto  │  openrouter/laguna-s-2.1:free  │  0 in / 0 out  │  $0.00  │  scrolled ↑4
+```
+
+The full table is in the [command reference](14-commands.md#tui-slash-commands).
+Anything that is not a recognised command goes to the model, so
+`what is in /usr/local/bin?` still works. A typo does not:
+
+```
+unknown command `/exitt` — /help lists them all
+```
+
+`/exit` (or `/quit`, `/q`, or Ctrl-C) leaves.
+
+## Modes
+
+`/mode` with no argument lists all three and marks the active one:
+
+```
+┌ conversation ────────────────────────────────────────────────────────────────────────────────────┐
+│    /session                         current session id and where it is stored                    │
+│    /tools                           tools available in the current mode                          │
+│    /new                             start a fresh session (clears the model's context)           │
+│    /clear                           clear the screen, keep the session                           │
+│    /stop                            cancel the turn in flight (also Esc)                         │
+│                                                                                                  │
+│  keys:                                                                                           │
+│    Enter                            send                                                         │
+│    Alt-Enter                        newline without sending                                      │
+│    Esc                              cancel the turn in flight, else clear the prompt             │
+│    Ctrl-C                           cancel if busy, otherwise quit                               │
+│    Ctrl-A / Ctrl-E                  start / end of line                                          │
+│    Ctrl-W                           delete the previous word                                     │
+│    Ctrl-U / Ctrl-K                  delete to start / end of line                                │
+│    PageUp / PageDown                scroll the conversation (also the mouse wheel)               │
+│    Ctrl-Up / Ctrl-Down              scroll one line                                              │
+│    Shift-Tab                        cycle mode                                                   │
+│                                                                                                  │
+│    the mouse wheel scrolls; hold Shift (Option on macOS Terminal) to select text                 │
+│                                                                                                  │
+│10:45:33  zcode                                                                                   │
+│  mode: auto — edits files and runs shell                                                         │
+│      planning  read-only; proposes changes                                                       │
+│      editing   edits files; no shell                                                             │
+│    ▸ auto      edits files and runs shell                                                        │
+│    (/mode <name>, or Shift-Tab to cycle)                                                         │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ Enter sends · Alt-Enter newline · /help ─────────────────────────────────────────────────────────┐
+│>                                                                                                 │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+ ● ready  │  mode auto  │  openrouter/poolside/laguna-s-2.1:free  │  0 in / 0 out  │  $0.00
+```
+
+`Shift-Tab` cycles through them. The status bar follows immediately, and the
+tool set changes on the next turn. See [chapter 8](08-agent-modes.md).
+
+## Editing the prompt
+
+The prompt is a real editor, not a single line of appended characters.
 
 | Key | Action |
 |-----|--------|
-| `Enter` | Send the prompt |
-| `Backspace` | Delete a character |
-| `Esc` | Cancel the turn in flight; if idle, quit |
-| `Ctrl-C` | Quit |
-| `q` | Quit — only when the input line is empty and no turn is running, so it never swallows typing |
+| `←` `→`, `Home` `End`, `Ctrl-A` `Ctrl-E` | Move |
+| `Ctrl-←` `Ctrl-→` (or `Alt-`) | Move by word |
+| `Ctrl-W` | Delete the previous word |
+| `Ctrl-U` `Ctrl-K` | Delete to start / end of line |
+| `Alt-Enter`, `Ctrl-J` | Newline without sending |
+| `Ctrl-L` | Clear both panes |
 
-Cancelling with `Esc` stops the current turn and checkpoints the session; the
-REPL stays open and the next prompt starts clean.
+Two presses of `Ctrl-W` on `cargo test --workspace --all-features`:
+
+```
+┌ conversation ────────────────────────────────────────────────────────────────────────────────────┐
+│20:20:59  zcode                                                                                   │
+│  Ready when you are. Type /help for commands.                                                    │
+│                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ Enter sends · Alt-Enter newline · /help ─────────────────────────────────────────────────────────┐
+│> cargo test                                                                                      │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+ ● ready  │  mode auto  │  openrouter/poolside/laguna-s-2.1:free  │  0 in / 0 out  │  $0.00
+```
+
+## Pasting
+
+Paste with your terminal's normal key (`Cmd-V`, `Ctrl-Shift-V`). zcode enables
+bracketed paste, so the **entire** clipboard arrives in one piece at the caret —
+newlines included, nothing truncated, and no accidental send on an embedded
+newline. The box grows and long lines wrap with their indentation preserved:
+
+```
+┌ conversation ────────────────────────────────────────────────────────────────────────────────────┐
+│20:20:54  zcode                                                                                   │
+│  Ready when you are. Type /help for commands.                                                    │
+│                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ Enter sends · Alt-Enter newline · /help ─────────────────────────────────────────────────────────┐
+│> Here is a long paste that must arrive whole. func handler(w http.ResponseWriter, r              │
+│  *http.Request) {                                                                                │
+│      ctx := r.Context()                                                                          │
+│      if err := svc.Do(ctx); err != nil {                                                         │
+│          http.Error(w, err.Error(), 500)                                                         │
+│          return                                                                                  │
+│      }                                                                                           │
+│  }                                                                                               │
+│  The final line proves nothing was truncated: SENTINEL-END                                       │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+ ● ready  │  mode auto  │  openrouter/poolside/laguna-s-2.1:free  │  0 in / 0 out  │  $0.00
+```
+
+`SENTINEL-END` is the last line of the pasted payload — it is there, so nothing
+was lost.
+
+## Tools, inline
+
+A tool call belongs between the sentence that announced it and the sentence
+that reported its result — not in a separate pane you have to correlate by eye.
+Each run of calls is labelled and bracketed, and every row carries a status
+icon, the time it ran, the tool, what it acted on, and how long it took:
+
+```
+20:21:35  zcode
+  I'll read main.go and list the directory for you.
+  tools used
+  ├ ✔ 20:21:35  read               package main                     82ms
+  └ ✔ 20:21:35  list_dir           .zcode/                         823ms
+```
+
+The duration is right-aligned and always carries its unit, stepping up as the
+call gets longer so the number stays readable:
+
+| Range | Reads as |
+|-------|----------|
+| under a second | `82ms` |
+| under a minute | `1.2s` |
+| under an hour | `2m05s` |
+| beyond that | `1h25m` |
+
+| Icon | Meaning |
+|------|---------|
+| `◐` | running |
+| `✔` | succeeded |
+| `✖` | failed — the message is the tool's own error |
+| `⊘` | refused by the mode gate or the shell denylist |
+
+A failure or a refusal settles the same row rather than adding a second one:
+
+```
+  tools used
+  └ ⊘ 20:24:02  apply_patch        planning mode is read-only
+```
+
+A *successful* row is an index entry — the first line of what came back,
+clipped to fit, because the output itself is not what you are scanning for. An
+error is the opposite: it is the thing you have to read. So when a failure has
+more to say than fits, it wraps below the row in full instead of ending in an
+ellipsis:
+
+```
+  tools used
+  └ ✖ 20:24:31  shell                                               1.2s
+      command blocked by the shell allowlist (`shell_allowed` in
+      zcode.json/zcode.toml): cd /workspace && go build ./... 2>&1 | head
+        hint: no pattern in `shell_allowed` matches `cd`; add one, e.g.
+        "cd( .*)?"
+```
+
+Engine notes sit inline too, with their own markers: `↻` for a retry, `!` for a
+warning, `·` for information.
+
+## Watching a turn
+
+While the model is working, the status bar spins, counts steps, and shows
+elapsed time. The prompt title changes to say what Esc does:
+
+```
+┌ conversation ────────────────────────────────────────────────────────────────────────────────────┐
+│20:21:28  zcode                                                                                   │
+│  Ready when you are. Type /help for commands.                                                    │
+│                                                                                                  │
+│20:21:30  you                                                                                     │
+│  Read main.go, then list this directory, then stop. Use the tools.                               │
+│                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ Esc cancels ─────────────────────────────────────────────────────────────────────────────────────┐
+│>                                                                                                 │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+ ⠇ working · step 1/12 · 1.5s  │  mode auto  │  laguna-s-2.1:free  │  0 in / 0 out  │  $0.00
+```
+
+When it finishes, the timeline holds the record and the status bar carries the
+totals:
+
+```
+┌ conversation ────────────────────────────────────────────────────────────────────────────────────┐
+│  Ready when you are. Type /help for commands.                                                    │
+│                                                                                                  │
+│20:21:30  you                                                                                     │
+│  Read main.go, then list this directory, then stop. Use the tools.                               │
+│                                                                                                  │
+│20:21:35  zcode                                                                                   │
+│  I'll read main.go and list the directory for you.                                               │
+│  tools used                                                                                      │
+│  ├ ✔ 20:21:35  read               package main                                                   │
+│  └ ✔ 20:21:35  list_dir           .zcode/                                                        │
+│                                                                                                  │
+│20:21:41  zcode                                                                                   │
+│  I've read the main.go file and listed the current directory. Here's what I found:               │
+│                                                                                                  │
+│  **main.go contents:**                                                                           │
+│  - A simple Go program with `greet` and `farewell` functions                                     │
+│  - The `main` function prints greetings for "world"                                              │
+│                                                                                                  │
+│  **Directory contents:**                                                                         │
+│  - `.zcode/` - A hidden directory (likely configuration)                                         │
+│  - `demo` - A directory or file named "demo"                                                     │
+│  - `go.mod` - Go module file                                                                     │
+│  - `main.go` - The main Go source file                                                           │
+│  - `zcode.json` - A JSON configuration file                                                      │
+│                                                                                                  │
+│  I've completed the requested tasks and will stop here as instructed.                            │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ Enter sends · Alt-Enter newline · /help ─────────────────────────────────────────────────────────┐
+│>                                                                                                 │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+ ● ready  │  mode auto  │  openrouter/poolside/laguna-s-2.1:free  │  5261 in / 189 out  │  $0.00
+```
+
+`/cost` breaks the estimate down.
+
+## When the provider is rate limiting you
+
+A 429 used to look identical to a hang. Now the client backs off and says so.
+
+The wait matters as much as the message. A provider that just refused you is
+still refusing you 600ms later, and free or shared tiers meter by the minute —
+so a rate limit waits a flat **30 seconds** by default before trying again,
+while an ordinary transient error still retries in half a second and backs off
+from there.
+The provider's own `Retry-After` always wins over both. Tune it with
+`rate_limit_backoff_ms`.
+
+```
+┌ conversation ────────────────────────────────────────────────────────────────────────────────────┐
+│20:22:18  zcode                                                                                   │
+│  Ready when you are. Type /help for commands.                                                    │
+│                                                                                                  │
+│20:22:20  you                                                                                     │
+│  hello                                                                                           │
+│  ↻ rate limited by the provider (429) — retrying in 1.0s (attempt 1/3)                           │
+│  ↻ rate limited by the provider (429) — retrying in 1.0s (attempt 2/3)                           │
+│                                                                                                  │
+│20:22:22  zcode                                                                                   │
+│  Recovered after 2 rate limit(s).                                                                │
+│                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ Enter sends · Alt-Enter newline · /help ─────────────────────────────────────────────────────────┐
+│>                                                                                                 │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+ ● ready  │  mode auto  │  openai-compatible/gpt-4o-mini  │  120 in / 8 out  │  <$0.0001
+```
+
+The status bar turns amber, the timeline keeps the record, and the turn carries
+on when the provider recovers. `max_retries` (default 3) sets the
+budget.
+
+## When something fails
+
+A provider error is shown in the conversation *and* on the status bar in red,
+where it stays until the next turn starts:
+
+```
+┌ conversation ────────────────────────────────────────────────────────────────────────────────────┐
+│20:22:14  zcode                                                                                   │
+│  Ready when you are. Type /help for commands.                                                    │
+│                                                                                                  │
+│20:22:16  you                                                                                     │
+│  hello                                                                                           │
+│  ! llm error: openrouter request failed (400 Bad Request): "acme/does-not-exist is not a valid   │
+│    model ID"                                                                                     │
+│                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ Enter sends · Alt-Enter newline · /help ─────────────────────────────────────────────────────────┐
+│>                                                                                                 │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+ ✖ error: llm error: openrouter request failed (400 Bad Request): "acme/does-not-exist is not a vali
+```
+
+Warnings from MCP or LSP servers appear inline as `!` note rows. They are
+deliberately not written to stderr while the TUI is up: stderr is the same
+terminal, and a stray log line would paint over the interface.
+
+## Scrolling
+
+The **mouse wheel** scrolls, three rows a notch. `PageUp` / `PageDown` move a
+page, `Ctrl-↑` / `Ctrl-↓` a line, and `Ctrl-Home` / `Ctrl-End` jump to either
+end. While you are scrolled back the title says so, and new output does not
+yank you to the bottom; scrolling to the end resumes following the tail.
+
+Scrolling is computed on *wrapped* rows, not logical lines, so a long answer
+scrolls by what you actually see. It also stops at the oldest line rather than
+counting past it — a counter that keeps rising after the view has stopped will
+swallow exactly that many scrolls on the way back down, which reads as a pane
+that will not scroll at all.
+
+The wheel works because zcode asks the terminal to report mouse events. The
+side effect is that a plain drag no longer selects text: hold **Shift**
+(**Option** on macOS Terminal) to select and copy as usual. `/help` says so
+too, because without being told, this looks like broken copy/paste rather than
+a trade for scrolling.
+
+## Switching provider mid-session
+
+When the config declares several [providers](12-configuration-reference.md#multiple-providers),
+`/provider` lists them and `/provider <name>` switches:
+
+```
+┌ conversation ────────────────────────────────────────────────────────────────────────────────────┐
+│10:43:26  zcode                                                                                   │
+│  Ready when you are. Type /help for commands.                                                    │
+│                                                                                                  │
+│10:43:28  zcode                                                                                   │
+│  3 provider(s) configured:                                                                       │
+│    ▸ primary                                                                                     │
+│      backup                                                                                      │
+│      local                                                                                       │
+│    (/provider <name> to switch)                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ Enter sends · Alt-Enter newline · /help ─────────────────────────────────────────────────────────┐
+│>                                                                                                 │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+ ● ready  │  mode auto  │  primary/gpt-4o-mini  │  0 in / 0 out  │  $0.00
+```
+
+Only the model client is replaced. The conversation, the session, and every
+MCP and LSP child process stay exactly as they were — so you can start a task
+on a cheap model, hit something hard, and finish it on a better one without
+losing the context that got you there.
+
+The new client is built *before* the old one is dropped, so a typo or a missing
+key leaves the working provider in place and reports the problem instead of
+stranding the session with nothing to talk to. The status bar always names the
+provider actually in use.
 
 ## How it stays responsive
 
 The engine is synchronous, so it runs on a dedicated worker thread and streams
 events back over a channel while the main thread does nothing but render. A
-long provider call never freezes the UI, and `Esc` is always live.
+long provider call never freezes the UI, and Esc is always live.
+
+Events and turn results share **one** channel, so a result can never overtake
+the last few tokens of its own answer.
 
 Both panes are capped at 500 lines. A tool that dumps a huge file cannot grow
 the process without bound.

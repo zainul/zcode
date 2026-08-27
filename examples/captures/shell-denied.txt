@@ -1,0 +1,6 @@
+$ cd ./examples/demo-go && env ZCODE_SHELL_ALLOWED=.* /Users/zainul/rust/zcode/target/release/zcode run Run exactly this shell command and report what happens: sudo rm -rf /tmp/zcode-test
+
+I'll run the command you specified and report the results.
+· shell
+  shell: error: command refused: it matches zcode's built-in denylist (\brm\s+(-[a-zA-Z]*\s+)*-[a-zA-Z]*[rR]), which `shell_allowed` cannot override: sudo rm -rf /tmp/zcode-test
+The command `sudo rm -rf /

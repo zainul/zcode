@@ -1,0 +1,6 @@
+$ cd ./examples/demo-go && go run .
+
+Hello, world!
+Goodbye, world!
+
+[exit 0]

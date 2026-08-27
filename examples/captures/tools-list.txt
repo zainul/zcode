@@ -1,0 +1,15 @@
+$ cd ./examples/demo-go && /Users/zainul/rust/zcode/target/release/zcode tools list
+
+read                         Read a UTF-8 text file and return its full contents.
+write                        Create or overwrite a file with the given contents (atomic).
+str_replace_editor           Edit files in place. `view` shows a file, `create` writes one, `str_replace` swaps an exact string, `list_dir` lists a directory.
+apply_patch                  Apply a unified diff to the working tree. Supports multiple files, creation (`--- /dev/null`) and deletion (`+++ /dev/null`). Line numbers need not be exact — hunks are located by their context. Nothing is written unless every hunk applies.
+list_dir                     List the entries of a directory (directories end with `/`).
+shell                        Run a shell command. Only commands permitted by the configured allowlist are executed; anything else is refused.
+zcode_skill                  Load a skill: project-specific guidance, conventions or checklists, as markdown. Call this before starting work when one is relevant, and follow what it says. Available skills:
+lsp__goto_definition         Resolve the definition site of the symbol at a position.
+lsp__find_references         List every reference to the symbol at a position.
+lsp__hover                   Type and documentation for the symbol at a position.
+lsp__rename_symbol           Compute the edits that rename a symbol. The edits are advice — apply them with str_replace_editor.
+
+[exit 0]

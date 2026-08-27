@@ -1,0 +1,38 @@
+### 23-provider-switched
+after /provider backup
+
+┌────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│┌ conversation ────────────────────────────────────────────────────────────────────────────────────┐│
+││10:51:04  zcode                                                                                   ││
+││  Ready when you are. Type /help for commands.                                                    ││
+││                                                                                                  ││
+││10:51:06  zcode                                                                                   ││
+││  3 provider(s) configured:                                                                       ││
+││    ▸ primary                                                                                     ││
+││      backup                                                                                      ││
+││      local                                                                                       ││
+││    (/provider <name> to switch)                                                                  ││
+││  ! unknown provider `nope` — configured: primary, backup, local; built in: openai, anthropic,    ││
+││    openrouter, deepseek, ollama, vllm, openai-compatible                                         ││
+││  · provider: backup (openai-compatible) · model: backup-model                                    ││
+││                                                                                                  ││
+││                                                                                                  ││
+││                                                                                                  ││
+││                                                                                                  ││
+││                                                                                                  ││
+││                                                                                                  ││
+││                                                                                                  ││
+││                                                                                                  ││
+││                                                                                                  ││
+││                                                                                                  ││
+││                                                                                                  ││
+││                                                                                                  ││
+││                                                                                                  ││
+││                                                                                                  ││
+│└──────────────────────────────────────────────────────────────────────────────────────────────────┘│
+│┌ Enter sends · Alt-Enter newline · /help ─────────────────────────────────────────────────────────┐│
+││>                                                                                                 ││
+│└──────────────────────────────────────────────────────────────────────────────────────────────────┘│
+│ ● ready  │  mode auto  │  backup/backup-model  │  0 in / 0 out  │  n/a                             │
+└────────────────────────────────────────────────────────────────────────────────────────────────────┘
+cursor: row 29, col 3, visible=True

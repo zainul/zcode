@@ -1,0 +1,22 @@
+$ cd ./examples/demo-go && bash -c 
+  set -e
+  id=$(/Users/zainul/rust/zcode/target/release/zcode session create | tail -1)
+  echo "created $id"
+  /Users/zainul/rust/zcode/target/release/zcode session continue "$id" 'Remember the number 42. Just acknowledge.' >/dev/null 2>&1
+  /Users/zainul/rust/zcode/target/release/zcode session fork "$id" --as acceptance-fork
+  /Users/zainul/rust/zcode/target/release/zcode session export "$id" --to /tmp/zcode-export.json
+  echo 'exported:'; head -c 200 /tmp/zcode-export.json
+
+
+created 01a0412a-7879-7a90-a6fe-fea9cc20b8ab
+acceptance-fork
+/tmp/zcode-export.json
+exported:
+{
+  "version": 1,
+  "id": "01a0412a-7879-7a90-a6fe-fea9cc20b8ab",
+  "created_at": "2026-08-27T03:01:37Z",
+  "model": "poolside/laguna-s-2.1:free",
+  "mode": "auto",
+  "last_message_at": "2026-08-27T03
+[exit 0]

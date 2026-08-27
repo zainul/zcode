@@ -1,11 +1,10 @@
 //! Rendering sinks for engine events (FR-IFACE-04).
 //!
 //! `zcode run --json` needs no emitter — the telemetry port already writes JSONL
-//! to stdout. The pretty printer is for humans, and the channel emitter
-//! bridges the engine's worker thread to the TUI renderer.
+//! to stdout. The pretty printer here is for humans; the TUI has its own
+//! bridge onto its message channel (`tui::EventBridge`).
 
 use std::io::Write;
-use std::sync::mpsc::Sender;
 
 use domain::{Emitter, UiEvent};
 
@@ -71,19 +70,19 @@ impl<W: Write> Emitter for PrettyEmitter<W> {
                     let _ = writeln!(self.out, "! stopped at the turn/token cap");
                 }
             }
+            UiEvent::Retry(notice) => {
+                self.break_line();
+                // Written to stdout, not just the log: a headless run that
+                // pauses for 30s should say why.
+                let _ = writeln!(self.out, "↻ {}", notice.render());
+            }
+            UiEvent::Notice(message) => {
+                self.break_line();
+                let _ = writeln!(self.out, "· {}", sanitize(&message));
+            }
             UiEvent::ToolCallArgs { .. } | UiEvent::Finish(_) | UiEvent::LoopStart { .. } => {}
         }
         let _ = self.out.flush();
-    }
-}
-
-/// Forwards events to the TUI renderer. A closed channel (the user quit) is
-/// ignored so the worker thread can wind down on its own terms.
-pub struct ChannelEmitter(pub Sender<UiEvent>);
-
-impl Emitter for ChannelEmitter {
-    fn emit(&mut self, ev: UiEvent) {
-        let _ = self.0.send(ev);
     }
 }
 
@@ -150,6 +149,7 @@ mod tests {
                 name: "read".into(),
                 content: "line one\nline two\nline three".into(),
                 error: None,
+                elapsed_ms: 12,
             },
         ]);
         assert!(out.contains("thinking\n· read\n"));
@@ -163,6 +163,7 @@ mod tests {
             name: "shell".into(),
             content: String::new(),
             error: Some("blocked by allowlist".into()),
+            elapsed_ms: 12,
         }]);
         assert!(out.contains("shell: error: blocked by allowlist"));
     }
@@ -199,6 +200,27 @@ mod tests {
     }
 
     #[test]
+    fn a_retry_is_reported_so_a_pause_is_explicable() {
+        // A headless run that stops for 30s must say why, not look hung.
+        let out = render(vec![UiEvent::Retry(domain::RetryNotice {
+            attempt: 1,
+            max_attempts: 3,
+            delay_ms: 2_000,
+            status: Some(429),
+            reason: "rate limited by the provider".into(),
+        })]);
+        assert!(out.contains("rate limited"), "{out}");
+        assert!(out.contains("429"), "{out}");
+    }
+
+    #[test]
+    fn notices_are_printed_and_sanitised() {
+        let out = render(vec![UiEvent::Notice("\u{1b}[2Jheads up".into())]);
+        assert!(out.contains("heads up"));
+        assert!(!out.contains('\u{1b}'));
+    }
+
+    #[test]
     fn strips_terminal_escapes_from_tool_output() {
         // A tool result must not be able to repaint the terminal (NFR-SEC-04).
         let out = render(vec![UiEvent::ToolResult {
@@ -206,6 +228,7 @@ mod tests {
             name: "shell".into(),
             content: "\u{1b}[2Jcleared\u{7}".into(),
             error: None,
+            elapsed_ms: 12,
         }]);
         assert!(!out.contains('\u{1b}'));
         assert!(!out.contains('\u{7}'));

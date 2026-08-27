@@ -1,0 +1,73 @@
+$ cd ./examples/demo-go && /Users/zainul/rust/zcode/target/release/zcode skills list
+
+Searched
+  /Users/zainul/rust/zcode/examples/demo-go/.zcode/skills  (missing)
+  /Users/zainul/.config/zcode/skills
+
+64 skill(s) offered to the model
+  backend-api-idl                  Covers contract-first API design using Interface Definition Languages
+  backend-golang-development       Master reference for building production-grade Go backend services end-to-end.
+  configuration-best-practices     Universal configuration management patterns for production systems — environment variables, secrets, validation, multi-environment support, and twelve-factor co…
+  frontend-accessibility           Accessibility (a11y) ensures your application is usable by everyone —
+  frontend-aesthetics              Covers visual design principles, modern UI aesthetics, animation patterns,
+  frontend-api-integration         Covers patterns for connecting React / Next.js frontends to backend APIs
+  frontend-code-convention         Consistent coding conventions for React / Next.js / TypeScript projects
+  frontend-component-architecture  Covers production patterns for building maintainable, reusable, and composable
+  frontend-data-visualization      Covers data visualization patterns for dashboards and analytics — shadcn/ui
+  frontend-development             Master reference for building production-grade React / Next.js frontends
+  frontend-forms-validation        Covers form handling in React — shadcn/ui Form components, React Hook
+  frontend-nextjs                  Covers Next.js 15 App Router patterns with shadcn/ui — routing, data
+  frontend-performance             Covers performance optimization for React / Next.js — Core Web Vitals,
+  frontend-security                Covers client-side security for React / Next.js — XSS prevention, CSRF,
+  frontend-shadcn-ui               Covers shadcn/ui setup, CLI workflow, component catalog, customization
+  frontend-state-management        Covers state management patterns for React / Next.js — local state, context,
+  frontend-styling                 Covers Tailwind CSS, shadcn/ui theming, CSS custom properties, CVA variant
+  frontend-testing                 Covers testing patterns for React / Next.js — unit tests, component tests,
+  frontend-typescript              TypeScript is mandatory for production frontends. Covers type safety,
+  golang-api-design                Covers REST API design patterns for production Go services — URL structure,
+  golang-code-convention           Consistent naming, formatting, and documentation conventions reduce cognitive
+  golang-code-structure            A well-structured Go project separates concerns into layers with strict
+  golang-concurrency               Concurrency is Go's defining feature. This document covers goroutines,
+  golang-configuration             Covers patterns for loading, validating, and managing application configuration
+  golang-context                   `context.Context` is Go''s mechanism for propagating deadlines, cancellation
+  golang-data-structures           Choosing the right data structure determines correctness, performance,
+  golang-database                  Covers idiomatic Go patterns for relational databases (GORM / `database/sql`),
+  golang-debugging                 Covers debugging techniques for Go services — from print debugging to
+  golang-dependency-management     Covers Go modules (`go.mod` / `go.sum`), dependency hygiene, versioning,
+  golang-error-handling            Go treats errors as values. This document covers production-grade patterns
+  golang-generics                  Go generics (Go 1.18+) enable writing type-safe, reusable code without
+  golang-gorm                      Covers advanced GORM patterns for production Go services — model design,
+  golang-graceful-shutdown         Graceful shutdown ensures in-flight requests complete, resources are
+  golang-grpc                      Covers production-grade patterns for building and consuming gRPC services
+  golang-high-performance-code     Covers techniques for writing Go code that performs efficiently under
+  golang-http                      Covers building production-grade HTTP APIs in Go — server setup, routing,
+  golang-interface                 Interfaces are Go's mechanism for abstraction, polymorphism, and testability.
+  golang-local-memory-cache        Covers in-process memory caching patterns for Go services — cache selection,
+  golang-logging                   Logging is the foundation of production observability. This document
+  golang-message-queue             Covers production-grade message queue patterns in Go — NATS/JetStream,
+  golang-middleware                Middleware (interceptors) provide cross-cutting functionality that wraps
+  golang-mock                      Mocking is essential for unit testing Go services. This document covers
+  golang-network                   Covers production-grade networking patterns in Go — HTTP client/server
+  golang-observability             Production services need three pillars of observability: **metrics**, **traces**, and **structured logs**. This document covers how to instrument Go services co…
+  golang-panic-recover             Covers defensive programming patterns for Go services — understanding
+  golang-reliability-connection    Covers production-grade patterns for building reliable TCP/UDP connections
+  golang-safety-and-security       Security is not a feature — it''s a property of the entire system. This
+  golang-stability                 Covers production stability patterns for Go services — circuit breaker,
+  golang-stable-library            Curated, production-proven Go library catalogue. Use this as the first
+  golang-testing                   Comprehensive testing patterns for production Go services — unit tests,
+  rust-async-await                 Async/await is Rust's primary concurrency model. This document covers tokio runtime, spawning tasks, async traits, streams, cancellation, and production pattern…
+  rust-code-structure              A well-structured Rust project separates concerns into modules with clear dependency rules. This document defines the standard project layout, module responsibi…
+  rust-concurrency                 Concurrency in Rust uses async/await with ownership semantics. This document covers tokio runtime, async channels, synchronization primitives, task spawning, se…
+  rust-config                      Covers patterns for loading, validating, and managing application configuration in Rust — environment variables, config structs, secrets, defaults, and multi-en…
+  rust-data-structures             Choosing the right data structure determines correctness, performance, and memory efficiency. This document covers idiomatic Rust patterns for Vec, HashMap, spe…
+  rust-database                    Covers idiomatic Rust patterns for database access — SQLx (async, compile-time checked), Diesel (ORM), connection pooling, query safety, transactions, migration…
+  rust-error-handling              Rust uses Result<T, E> for recoverable errors. This document covers production-grade patterns for creating, propagating, and handling errors — including thiserr…
+  rust-http                        Covers building production-grade HTTP APIs in Rust — Axum/Actix-web setup, routing, middleware chains, request handling, response formatting, graceful shutdown,…
+  rust-logging                     Logging is the foundation of production observability. This document covers structured logging with `tracing` (the modern standard), log levels, spans, instrume…
+  rust-observability               Production services need three pillars of observability — metrics, traces, and structured logs. This document covers how to instrument Rust services using OpenT…
+  rust-performance                 Covers techniques for writing Rust code that performs efficiently under production load — memory management, zero-copy patterns, profiling, benchmarking, and av…
+  rust-safety-security             Security is not a feature — it's a property of the entire system. This document covers secure coding patterns for Rust production services — input validation, a…
+  rust-stable-library              Curated, production-proven Rust crate catalogue. Use this as the first reference when selecting a dependency. Prefer crates already adopted before introducing n…
+  rust-testing                     Comprehensive testing patterns for production Rust services — unit tests, integration tests, property-based testing with proptest, mocking with mockall, test co…
+
+[exit 0]

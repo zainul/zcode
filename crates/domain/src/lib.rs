@@ -15,6 +15,7 @@ pub mod model;
 pub mod modes;
 pub mod naming;
 pub mod ports;
+pub mod pricing;
 pub mod tokens;
 
 pub use error::DomainError;
@@ -28,9 +29,11 @@ pub use ports::CompletionChunk;
 pub use ports::{
     Emitter, ExtraField, FileSystemPort, LlmEvent, LlmFinish, LlmFinishReason, LlmMessage, LlmPort,
     LlmRequest, LlmResponse, LlmRole, LlmToolCall, LlmToolResult, LogLevel, LoggerPort, LspPort,
-    McpPort, McpToolDef, PluginRegistryPort, Session, SessionStorePort, ShellPort, TelemetryEvent,
-    TelemetryPort, TelemetryTotals, Tool, ToolRegistryPort, ToolResult, ToolSpec, UiEvent,
+    McpPort, McpToolDef, PluginRegistryPort, RetryNotice, Session, SessionStorePort, ShellPort,
+    TelemetryEvent, TelemetryPort, TelemetryTotals, Tool, ToolRegistryPort, ToolResult, ToolSpec,
+    UiEvent,
 };
+pub use pricing::{Cost, PriceEntry, PriceTable};
 
 /// Shorthand for the canonical domain error box: `Send + Sync` so it crosses
 /// thread boundaries (the engine runs on a worker thread in the TUI).

@@ -1,0 +1,26 @@
+$ cd . && /Users/zainul/rust/zcode/target/release/zcode --help
+
+zcode runs coding tasks against an LLM with native file, shell, MCP and LSP tools.
+
+Configure it with zcode.json or zcode.toml; API keys are read from the environment by the name given in `api_key_env`.
+
+Usage: zcode [COMMAND]
+
+Commands:
+  version  Print the version, git commit, and build profile
+  run      Run a single task and exit
+  repl     Open the interactive TUI
+  session  Create, resume, fork, import, or export saved sessions
+  tools    Inspect the tool registry
+  config   Show where configuration is read from and what it resolves to
+  skills   List the markdown skills the agent can load
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+
+[exit 0]

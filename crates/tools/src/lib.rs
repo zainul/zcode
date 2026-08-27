@@ -25,7 +25,7 @@ use domain::{
     ToolRegistryPort, ToolResult, ToolSpec,
 };
 
-pub use guard::{GuardedShell, ShellToolError};
+pub use guard::{allowlist_is_unrestricted, builtin_deny_rule_count, GuardedShell, ShellToolError};
 pub use native::{
     ApplyPatchTool, ListDirTool, ReadTool, ShellTool, SkillTool, StrReplaceTool, WriteTool,
     TOOL_APPLY_PATCH, TOOL_LIST_DIR, TOOL_READ, TOOL_SHELL, TOOL_SKILL, TOOL_STR_REPLACE,
@@ -150,7 +150,11 @@ impl ToolRegistry {
     /// a warning (FR-MCP-05); the agent still runs.
     pub fn from_config(cfg: &infra_config::Config) -> Result<Self, ShellToolError> {
         let root = cfg.working_dir.clone();
-        let shell = GuardedShell::new(infra_shell::StdShell::new(), &cfg.shell_allowed)?;
+        let shell = GuardedShell::with_denylist(
+            infra_shell::StdShell::new(),
+            &cfg.shell_allowed,
+            &cfg.shell_denied,
+        )?;
 
         // `mut` is only used by the feature-gated MCP/LSP blocks below.
         #[allow(unused_mut)]
@@ -188,10 +192,12 @@ impl ToolRegistry {
             }
         }
 
-        // One language server per run: the first configured server that starts
-        // wins. Multi-server routing by file extension is a v0.3 concern.
+        // One language server per run: the first server that starts wins, and
+        // `effective_lsp_servers` has already sorted the project's own
+        // language to the front. Multi-server routing by file extension is a
+        // v0.3 concern.
         #[cfg(feature = "lsp")]
-        for server in cfg.lsp_servers.iter() {
+        for server in cfg.effective_lsp_servers().iter() {
             match infra_lsp::LspClient::start_with_timeout(
                 &server.command,
                 &server.args,

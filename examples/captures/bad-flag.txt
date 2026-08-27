@@ -1,0 +1,11 @@
+$ cd . && /Users/zainul/rust/zcode/target/release/zcode run --nonsense hi
+
+error: unexpected argument '--nonsense' found
+
+  tip: to pass '--nonsense' as a value, use '-- --nonsense'
+
+Usage: zcode run [OPTIONS] <PROMPT>
+
+For more information, try '--help'.
+
+[exit 2]
