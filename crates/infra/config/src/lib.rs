@@ -551,22 +551,24 @@ impl Config {
         Ok(next)
     }
 
-    /// Point the configuration at a model, optionally switching provider with
-    /// it.
+    /// Point the configuration at a model, given as `<provider>/<model>`.
     ///
-    /// `spec` is either a bare model id (`gpt-4o`, `z-ai/glm-4.6`) or a
-    /// `<provider>/<model>` pair (`openrouter/z-ai/glm-4.6`). The leading
-    /// segment is read as a provider **only when it names one** — a
-    /// `providers` entry or a built-in kind — because most model ids are
-    /// themselves `vendor/model` and splitting them unconditionally would
-    /// leave `z-ai/glm-4.6` asking for the model `glm-4.6` from a provider
-    /// called `z-ai`.
+    /// This is the spelling opencode and most agent CLIs use, and it is read
+    /// the same way: **split at the first `/`, the leading segment is the
+    /// provider, everything after it is the model id** — slashes and all. So
+    /// `openrouter/z-ai/glm-4.6` is the provider `openrouter` and the model
+    /// `z-ai/glm-4.6`, which is exactly how OpenRouter spells that id.
     ///
-    /// That test still cannot separate the OpenRouter id
-    /// `anthropic/claude-sonnet-4.5` from the pair
-    /// `anthropic` + `claude-sonnet-4.5`, and it resolves the ambiguity
-    /// towards the pair. Naming the provider separately is the way to say the
-    /// other thing: see [`Config::set_model`], which never splits.
+    /// There is no guessing. An earlier version read the prefix as a provider
+    /// only when it happened to name one, which made the meaning of an
+    /// argument depend on what the config declared: adding a `providers` entry
+    /// could silently change where an existing command sent its request.
+    /// A leading segment that names no provider is now an error that says what
+    /// to write instead.
+    ///
+    /// The one shorthand is a spec with **no** `/` at all: an id on the
+    /// provider already selected. It cannot be mistaken for a pair, and
+    /// "same endpoint, different model" is too common to require the prefix.
     ///
     /// The provider is selected *first*, so the model given here outranks the
     /// one the profile carries — which is the whole point of stating both.
@@ -575,45 +577,40 @@ impl Config {
         if spec.is_empty() {
             return Err(ConfigError::EmptyModel);
         }
-        if let Some((prefix, rest)) = spec.split_once('/') {
-            if self.knows_provider(prefix) {
-                let model = rest.trim();
-                if model.is_empty() {
-                    return Err(ConfigError::ModelWithoutId {
-                        spec: spec.to_string(),
-                        provider: prefix.to_string(),
-                    });
-                }
-                // Order matters: `select_provider` resolves the profile's own
-                // model, so it has to run before the override is written.
-                self.select_provider(prefix)?;
-                self.model = model.to_string();
-                return Ok(());
-            }
-        }
-        self.model = spec.to_string();
-        Ok(())
-    }
-
-    /// Set the model id verbatim, with no `<provider>/<model>` reading.
-    ///
-    /// This is what an explicitly named provider asks for: once the endpoint
-    /// is settled, the rest is an id in that provider's own spelling, and
-    /// OpenRouter's ids routinely begin with a name zcode also knows as a
-    /// provider (`anthropic/…`, `openai/…`, `deepseek/…`).
-    pub fn set_model(&mut self, model: &str) -> Result<(), ConfigError> {
+        let Some((provider, model)) = spec.split_once('/') else {
+            self.model = spec.to_string();
+            return Ok(());
+        };
         let model = model.trim();
         if model.is_empty() {
-            return Err(ConfigError::EmptyModel);
+            return Err(ConfigError::ModelWithoutId {
+                spec: spec.to_string(),
+                provider: provider.to_string(),
+            });
         }
+        if !self.knows_provider(provider) {
+            // The likely mistake is a model id written without its provider,
+            // so the message shows that exact command with the provider
+            // already selected — `z-ai/glm-4.6` becomes `openrouter/z-ai/glm-4.6`.
+            return Err(ConfigError::UnknownProviderInModel {
+                spec: spec.to_string(),
+                provider: provider.to_string(),
+                configured: self.provider_names().join(", "),
+                builtin: BUILTIN_PROVIDERS.join(", "),
+                suggestion: format!("{}/{spec}", self.provider_name),
+            });
+        }
+        // Order matters: `select_provider` resolves the profile's own model,
+        // so it has to run before the override is written.
+        self.select_provider(provider)?;
         self.model = model.to_string();
         Ok(())
     }
 
     /// Whether `name` selects a provider: a `providers` entry — including one
     /// that failed to parse, so [`Config::select_provider`] can report *why*
-    /// rather than the prefix being silently read as part of a model id — or
-    /// a built-in kind.
+    /// it is unusable rather than the name being rejected as unknown — or a
+    /// built-in kind.
     pub fn knows_provider(&self, name: &str) -> bool {
         self.providers.iter().any(|p| p.name == name)
             || self.invalid_providers.iter().any(|(n, _)| n == name)
@@ -767,6 +764,22 @@ pub enum ConfigError {
     EmptyModel,
     #[error("`{spec}` names the provider `{provider}` but no model — write `{provider}/<model>`")]
     ModelWithoutId { spec: String, provider: String },
+    /// The leading segment of a `<provider>/<model>` spec names no provider.
+    ///
+    /// Almost always a model id written without its provider, so the message
+    /// leads with that command rather than with a list to read through.
+    #[error(
+        "unknown provider `{provider}` in `{spec}` — a model is written \
+         `<provider>/<model>`. If `{spec}` is the model id, name the provider \
+         too: `{suggestion}`. Configured: {configured}; built in: {builtin}"
+    )]
+    UnknownProviderInModel {
+        spec: String,
+        provider: String,
+        configured: String,
+        builtin: String,
+        suggestion: String,
+    },
 }
 
 /// Intermediate deserialization target so unknown/extra keys in the file are
@@ -1818,7 +1831,8 @@ kind = "not-a-provider"
     // ---- model selection --------------------------------------------------
 
     #[test]
-    fn a_bare_model_id_leaves_the_provider_alone() {
+    fn a_model_id_with_no_slash_stays_on_the_selected_provider() {
+        // The one shorthand: "same endpoint, different model".
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = Loader::new(&write_config(&dir, MULTI)).load().unwrap();
         cfg.select_model("gpt-4o-mini").unwrap();
@@ -1829,29 +1843,30 @@ kind = "not-a-provider"
     }
 
     #[test]
-    fn a_vendor_prefixed_model_id_is_not_a_provider() {
-        // The common case, and the one an unconditional split would ruin:
-        // `z-ai` is an OpenRouter vendor namespace, not a zcode provider.
+    fn the_split_is_at_the_first_slash_and_the_rest_is_the_id() {
+        // `openrouter/z-ai/glm-4.6` is the provider `openrouter` and the model
+        // `z-ai/glm-4.6` — the id keeps every slash after the first.
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = Loader::new(&write_config(&dir, MULTI)).load().unwrap();
-        cfg.select_model("z-ai/glm-4.6").unwrap();
+        cfg.select_model("openrouter/z-ai/glm-4.6").unwrap();
 
+        assert_eq!(cfg.provider, Provider::Openrouter);
+        assert_eq!(cfg.provider_name, "openrouter");
         assert_eq!(cfg.model, "z-ai/glm-4.6");
-        assert_eq!(cfg.provider_name, "cheap");
     }
 
     #[test]
-    fn a_provider_prefix_switches_provider_and_keeps_the_rest_as_the_model() {
+    fn a_provider_prefix_brings_the_whole_profile_with_it() {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = Loader::new(&write_config(&dir, MULTI)).load().unwrap();
         cfg.select_model("local/qwen2.5-coder").unwrap();
 
-        assert_eq!(cfg.provider, Provider::Ollama, "the profile was selected");
+        assert_eq!(cfg.provider, Provider::Ollama);
         assert_eq!(cfg.provider_name, "local");
         assert_eq!(
             cfg.base_url.as_deref(),
             Some("http://127.0.0.1:11434/api/chat"),
-            "the whole profile came with it"
+            "endpoint came with the profile"
         );
         assert_eq!(
             cfg.model, "qwen2.5-coder",
@@ -1860,26 +1875,17 @@ kind = "not-a-provider"
     }
 
     #[test]
-    fn a_provider_prefix_may_be_a_builtin_kind_with_no_profile() {
-        // `--model openrouter/z-ai/glm-4.6`: only the *first* segment is the
-        // provider; everything after it is the id, slashes and all.
+    fn a_builtin_kind_needs_no_profile_to_be_a_prefix() {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = Loader::new(&write_config(&dir, MULTI)).load().unwrap();
         cfg.select_model("deepseek/deepseek-reasoner").unwrap();
+
         assert_eq!(cfg.provider, Provider::Deepseek);
         assert_eq!(cfg.model, "deepseek-reasoner");
-
-        let mut cfg = Loader::new(&write_config(&dir, MULTI)).load().unwrap();
-        cfg.select_model("openrouter/z-ai/glm-4.6").unwrap();
-        assert_eq!(cfg.provider, Provider::Openrouter);
-        assert_eq!(cfg.provider_name, "openrouter");
-        assert_eq!(cfg.model, "z-ai/glm-4.6");
     }
 
     #[test]
-    fn a_named_provider_shadows_the_builtin_of_the_same_name() {
-        // `[[providers]] name = "anthropic"` is what the prefix has to resolve
-        // through, for the same reason `--provider anthropic` does.
+    fn a_named_profile_shadows_the_builtin_of_the_same_name() {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = Loader::new(&write_config(&dir, MULTI)).load().unwrap();
         cfg.select_model("anthropic/claude-haiku-4-5").unwrap();
@@ -1888,16 +1894,29 @@ kind = "not-a-provider"
         assert_eq!(cfg.model, "claude-haiku-4-5");
     }
 
+    /// The rule that replaced the guessing: a leading segment naming no
+    /// provider is refused, never folded back into the model id. Otherwise the
+    /// meaning of an argument would depend on what the config declares.
     #[test]
-    fn set_model_never_reads_a_provider_out_of_the_id() {
-        // What `--provider X --model Y` uses: the endpoint is already settled,
-        // so an id that happens to start with a provider name stays an id.
+    fn a_leading_segment_that_names_no_provider_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = Loader::new(&write_config(&dir, MULTI)).load().unwrap();
-        cfg.set_model("anthropic/claude-sonnet-4.5").unwrap();
+        let before = cfg.model.clone();
+        let err = cfg.select_model("z-ai/glm-4.6").unwrap_err();
 
-        assert_eq!(cfg.model, "anthropic/claude-sonnet-4.5");
-        assert_eq!(cfg.provider_name, "cheap", "provider untouched");
+        let ConfigError::UnknownProviderInModel {
+            provider,
+            suggestion,
+            ..
+        } = &err
+        else {
+            panic!("got {err:?}");
+        };
+        assert_eq!(provider, "z-ai");
+        // The likely fix, spelled out: keep the provider already selected.
+        assert_eq!(suggestion, "cheap/z-ai/glm-4.6");
+        assert!(err.to_string().contains("`<provider>/<model>`"));
+        assert_eq!(cfg.model, before, "nothing was written");
     }
 
     #[test]
@@ -1908,7 +1927,6 @@ kind = "not-a-provider"
             cfg.select_model("   "),
             Err(ConfigError::EmptyModel)
         ));
-        assert!(matches!(cfg.set_model(""), Err(ConfigError::EmptyModel)));
         assert_eq!(cfg.model, before, "a rejected value is not written");
     }
 
@@ -1926,8 +1944,8 @@ kind = "not-a-provider"
 
     #[test]
     fn a_prefix_naming_a_broken_profile_reports_why() {
-        // Reading it as part of a model id instead would send the request to
-        // the wrong endpoint and never mention the config mistake.
+        // Reading it as "unknown provider" would send the user hunting for a
+        // typo in a name that is right there in their config.
         let dir = tempfile::tempdir().unwrap();
         let cfg_text = r#"
 [[providers]]

@@ -116,10 +116,10 @@ pub struct RunArgs {
     pub provider: Option<String>,
     // Beyond FR-IFACE-01's flag set: the model was settable only in the
     // config file and `ZCODE_MODEL`, so trying one meant editing a file.
-    /// Model id, optionally prefixed with a provider: `gpt-4o`,
-    /// `z-ai/glm-4.6`, or `openrouter/z-ai/glm-4.6`. With `--provider` given,
-    /// the value is used as an id exactly as written.
-    #[arg(long, value_name = "MODEL")]
+    /// Model as `<provider>/<model>`, e.g. `openrouter/z-ai/glm-4.6` — split
+    /// at the first slash. A value with no slash is an id on the current
+    /// provider.
+    #[arg(long, short = 'm', value_name = "PROVIDER/MODEL")]
     pub model: Option<String>,
     /// Resume an existing session id.
     #[arg(long)]
@@ -157,10 +157,10 @@ pub struct ReplArgs {
     /// built-in kind. Switch again in the TUI with `/provider <name>`.
     #[arg(long, value_name = "NAME")]
     pub provider: Option<String>,
-    /// Model id to start on, optionally prefixed with a provider: `gpt-4o`,
-    /// `z-ai/glm-4.6`, or `openrouter/z-ai/glm-4.6`. With `--provider` given,
-    /// the value is used as an id exactly as written.
-    #[arg(long, value_name = "MODEL")]
+    /// Model to start on, as `<provider>/<model>`, e.g.
+    /// `openrouter/z-ai/glm-4.6` — split at the first slash. A value with no
+    /// slash is an id on the current provider.
+    #[arg(long, short = 'm', value_name = "PROVIDER/MODEL")]
     pub model: Option<String>,
     /// Config file to use instead of ./zcode.json or ./zcode.toml.
     #[arg(long, value_name = "FILE")]
@@ -569,16 +569,44 @@ fn load_config(
     // exactly the case where the flag has to win.
     if let Some(spec) = over.model {
         if over.provider.is_some() {
-            // The endpoint is already named, so the value is an id and only an
-            // id. OpenRouter spells ids `anthropic/claude-sonnet-4.5`, and
-            // reading that prefix as a provider would quietly send the request
-            // somewhere else.
-            cfg.set_model(spec)?;
-        } else {
-            cfg.select_model(spec)?;
+            check_provider_agreement(&cfg, spec)?;
         }
+        cfg.select_model(spec)?;
     }
     Ok(cfg)
+}
+
+/// Refuse `--provider a --model b/...` when `a` and `b` are different
+/// providers.
+///
+/// Both name one, so one of them has to lose, and whichever rule we picked
+/// would be invisible at the call site. Saying so costs a line and removes the
+/// question. Agreeing is fine and common — `--provider openrouter --model
+/// openrouter/z-ai/glm-4.6` is what a shell history plus a copied model id
+/// looks like.
+fn check_provider_agreement(
+    cfg: &Config,
+    spec: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let Some((named, _)) = spec.trim().split_once('/') else {
+        return Ok(());
+    };
+    if !cfg.knows_provider(named) {
+        // Not a provider at all: `select_model` reports that, with the fix.
+        return Ok(());
+    }
+    // Compare what each *resolves* to, not what was typed: `lm-studio` and
+    // `lmstudio` are the same endpoint and must not read as a disagreement.
+    let resolved = cfg.with_provider(named)?.provider_name;
+    if resolved != cfg.provider_name {
+        return Err(format!(
+            "--provider selected `{}` but --model names `{named}` — \
+             give the provider once",
+            cfg.provider_name
+        )
+        .into());
+    }
+    Ok(())
 }
 
 /// Flip a shared flag on SIGINT so the engine can checkpoint and exit cleanly
@@ -1223,13 +1251,34 @@ mod tests {
             .unwrap();
         assert_eq!(cfg.provider_name, "openrouter");
         assert_eq!(cfg.model, "deepseek/deepseek-chat");
+    }
 
-        // What `--provider X --model Y` does instead: no splitting.
+    #[test]
+    fn a_provider_named_twice_must_agree() {
         let mut cfg = Config::default();
         cfg.select_provider("openrouter").unwrap();
-        cfg.set_model("deepseek/deepseek-chat").unwrap();
-        assert_eq!(cfg.provider_name, "openrouter");
-        assert_eq!(cfg.model, "deepseek/deepseek-chat");
+
+        // Agreeing is a shell history plus a copied model id — allow it.
+        check_provider_agreement(&cfg, "openrouter/z-ai/glm-4.6").unwrap();
+        // No slash: nothing is claimed, so nothing can disagree.
+        check_provider_agreement(&cfg, "gpt-4o-mini").unwrap();
+        // Not a provider: `select_model` owns that error, with the fix in it.
+        check_provider_agreement(&cfg, "z-ai/glm-4.6").unwrap();
+
+        let err = check_provider_agreement(&cfg, "anthropic/claude-haiku-4-5")
+            .expect_err("two different providers");
+        let msg = err.to_string();
+        assert!(msg.contains("openrouter"), "{msg}");
+        assert!(msg.contains("anthropic"), "{msg}");
+    }
+
+    /// `lm-studio` and `lmstudio` are one endpoint spelled two ways; comparing
+    /// the typed strings would report a disagreement that does not exist.
+    #[test]
+    fn provider_agreement_compares_resolved_names_not_spellings() {
+        let mut cfg = Config::default();
+        cfg.select_provider("lm-studio").unwrap();
+        check_provider_agreement(&cfg, "lmstudio/some-model").unwrap();
     }
 
     #[test]

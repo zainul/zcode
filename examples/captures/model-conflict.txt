@@ -1,0 +1,5 @@
+$ cd ./examples/multi-provider && /Users/zainul/rust/zcode/target/release/zcode run --provider local -m backup/some-model hi
+
+zcode: --provider selected `local` but --model names `backup` — give the provider once
+
+[exit 1]

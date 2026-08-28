@@ -1,4 +1,4 @@
-$ cd ./examples/multi-provider && /Users/zainul/rust/zcode/target/release/zcode run --model local/ hi
+$ cd ./examples/multi-provider && /Users/zainul/rust/zcode/target/release/zcode run -m local/ hi
 
 zcode: `local/` names the provider `local` but no model — write `local/<model>`
 

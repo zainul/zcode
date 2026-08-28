@@ -310,16 +310,17 @@ $ ZCODE_MODEL=openai/gpt-4o-mini ZCODE_MODE=planning zcode run "review this modu
 
 The full list is in the [configuration reference](12-configuration-reference.md).
 
-Flags beat both. `--provider` and `--model` set the endpoint and the model for
-one run:
+Flags beat both. `--model` (or `-m`) takes `<provider>/<model>`, the spelling
+opencode and most agent CLIs use — split at the first slash, so the provider
+comes first and the rest is the id, slashes and all:
 
 ```sh
-$ zcode run --model openrouter/z-ai/glm-4.6 "review this module"
+$ zcode run -m openrouter/z-ai/glm-4.6 "review this module"
+$ zcode run -m gpt-4o-mini "review this module"   # no slash: same endpoint
 ```
 
-See [chapter 14](14-commands.md#--model--pick-a-model-for-one-run) for how a
-`<provider>/<model>` prefix is told apart from a model id that simply contains
-a slash.
+Note that the file's `model` key is *not* written that way — it sits next to
+`provider`. See [chapter 14](14-commands.md#--model--pick-a-provider-and-model-for-one-run).
 
 ## What `zcode` writes to disk
 

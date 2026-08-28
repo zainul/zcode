@@ -6,7 +6,12 @@ visibly different answers.
 
 `local` is there to show a profile whose kind supplies its own endpoint: it
 states no `base_url`, so it inherits Ollama's. That is also what makes it
-useful for `--model local/qwen2.5-coder`: the acceptance run asserts the request
-went to port 11434 and *not* to `primary`'s 8095, which is the whole claim the
-prefix makes. `--model z-ai/glm-4.6` in the same directory has to stay on
-8095 — a leading segment that names no provider is part of the model id.
+useful for `-m local/qwen2.5-coder`: the acceptance run asserts the request went
+to port 11434 and *not* to `primary`'s 8095, which is the whole claim the
+prefix makes.
+
+The same directory pins the rest of the `<provider>/<model>` format:
+`-m primary/z-ai/glm-4.6` splits at the first slash only and must reach 8095,
+`-m some-model` has no slash and must stay on the selected provider, and
+`-m z-ai/glm-4.6` must be refused — `z-ai` names no provider here, and the
+error has to suggest `primary/z-ai/glm-4.6`.

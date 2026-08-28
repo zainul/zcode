@@ -33,7 +33,7 @@ export ZCODE_OPENROUTER_API_KEY=sk-or-v1-...
 zcode run "add a doc comment to every public fn in crates/domain/src/model.rs"
 zcode run --json "list the files in crates"     # JSONL for scripts/CI
 zcode run --mode planning "how would you split this crate?"
-zcode run --model openrouter/z-ai/glm-4.6 "…"   # provider and model for one run
+zcode run -m openrouter/z-ai/glm-4.6 "…"        # <provider>/<model>, opencode style
 zcode                                           # interactive TUI
 ```
 
@@ -57,8 +57,8 @@ and every feature step by step.**
 | Command | Interface | Purpose |
 |---------|-----------|---------|
 | `zcode version` | headless | Build metadata (version, git SHA, profile). |
-| `zcode run "<prompt>"` | headless | One agent run. `--json`, `--json-format`, `--mode`, `--provider`, `--model`, `--image`, `--session`, `--timeout`, `--config`. |
-| `zcode` / `zcode repl` | TUI | Interactive session with live tool output. `--mode`, `--provider`, `--model`, `--session`, `--config`. |
+| `zcode run "<prompt>"` | headless | One agent run. `--json`, `--json-format`, `--mode`, `--provider`, `--model`/`-m`, `--image`, `--session`, `--timeout`, `--config`. |
+| `zcode` / `zcode repl` | TUI | Interactive session with live tool output. `--mode`, `--provider`, `--model`/`-m`, `--session`, `--config`. |
 | `zcode session create` | headless | Allocate a session id (UUIDv7). |
 | `zcode session continue <id> [prompt]` | headless/TUI | Resume; without a prompt it opens the TUI. |
 | `zcode session fork <id> [--as <new>]` | headless | Branch a transcript. |
