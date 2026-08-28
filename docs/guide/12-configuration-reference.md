@@ -31,7 +31,7 @@ Run `zcode config` to see which files were read and what they resolve to.
 |-----|------|---------|--------------|---------|
 | `provider` | string | `openai` | `ZCODE_PROVIDER` | Which endpoint to use: a name from `providers`, or a built-in kind (`openai`, `anthropic`, `openrouter`, `deepseek`, `ollama`, `vllm`, `lmstudio`, `openai-compatible`) |
 | `providers` | array | `[]` | — | Named endpoints to switch between (below) |
-| `model` | string | per provider | `ZCODE_MODEL` | Model id as the provider spells it |
+| `model` | string | per provider | `ZCODE_MODEL` | Model id as the provider spells it. `--model` overrides it, and may name a provider with it — see [chapter 14](14-commands.md#--model--pick-a-model-for-one-run) |
 | `api_key_env` | string | per provider | `ZCODE_API_KEY_ENV` | **Name** of the variable holding the key — never the key |
 | `base_url` | string | per provider | `ZCODE_BASE_URL` | Endpoint override, honoured by every provider; required for `vllm` and `openai-compatible` |
 | `working_dir` | path | directory of the project config | `ZCODE_WORKING_DIR` | Root for file tools and `.zcode/`; `~` expanded |
@@ -198,6 +198,10 @@ providers              4  (--provider NAME, or /provider NAME in the TUI)
 
 There is no `ZCODE_PROVIDERS`: an array of endpoints is a thing you write down,
 not a thing you export. `ZCODE_PROVIDER` still selects one by name.
+
+`--provider NAME` selects one for a single run, and `--model
+NAME/<model>` selects one *and* the model to use on it — both beat the file
+and the environment.
 
 ## Provider defaults
 

@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — `--model`, which can name the provider with it
+
+The model was settable in the config file and through `ZCODE_MODEL`; trying one
+for a single run meant editing a file or exporting a variable. It is now a flag
+on `zcode run` and `zcode repl`:
+
+```sh
+zcode run --model gpt-4o-mini "explain this"
+zcode --model openrouter/z-ai/glm-4.6
+```
+
+It is applied *after* `--provider`, so it beats the model the selected profile
+carries — stating both is exactly the case where the flag has to win.
+
+**A leading `<provider>/` is read as a provider only when it names one**, an
+entry in `providers` or a built-in kind. Most model ids are themselves
+`vendor/model`, and splitting them unconditionally would leave `z-ai/glm-4.6`
+asking a provider called `z-ai` for `glm-4.6`. What that test cannot do is
+separate the OpenRouter id `anthropic/claude-sonnet-4.5` from the pair
+`anthropic` + `claude-sonnet-4.5`; it resolves the ambiguity towards the pair,
+and naming the provider yourself says the other thing — with `--provider`
+given, `--model` is an id exactly as written and is never split.
+
+`ZCODE_MODEL` keeps its old meaning and is never split, so an environment that
+already exports an OpenRouter id still points where it did.
+
+### Fixed — the bare invocation takes the flags it was documented to take
+
+`zcode --provider local` was in the guide and had never parsed: the flags lived
+on `zcode repl` only, while the bare command — the normal way to open the TUI —
+accepted none. `--mode`, `--provider`, `--model`, `--session` and `--config`
+now work on both spellings.
+
+A flag written *before* a subcommand (`zcode --mode planning run "…"`) parses
+onto the bare form, where nothing reads it. That is now a usage error rather
+than a run with the mode silently dropped.
+
 ### Added — a run of tool calls folds into one line
 
 A long session was mostly tool rows. A run of consecutive calls now collapses

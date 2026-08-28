@@ -4,7 +4,7 @@ zcode runs coding tasks against an LLM with native file, shell, MCP and LSP tool
 
 Configure it with zcode.json or zcode.toml; API keys are read from the environment by the name given in `api_key_env`.
 
-Usage: zcode [COMMAND]
+Usage: zcode [OPTIONS] [COMMAND]
 
 Commands:
   version  Print the version, git commit, and build profile
@@ -17,6 +17,21 @@ Commands:
   help     Print this message or the help of the given subcommand(s)
 
 Options:
+      --mode <MODE>
+          planning (read-only) | editing (edits files) | auto (edits and runs shell)
+
+      --provider <NAME>
+          Which provider to start on: a name from the `providers` array, or a built-in kind. Switch again in the TUI with `/provider <name>`
+
+      --model <MODEL>
+          Model id to start on, optionally prefixed with a provider: `gpt-4o`, `z-ai/glm-4.6`, or `openrouter/z-ai/glm-4.6`. With `--provider` given, the value is used as an id exactly as written
+
+      --config <FILE>
+          Config file to use instead of ./zcode.json or ./zcode.toml
+
+      --session <SESSION>
+          Resume an existing session id
+
   -h, --help
           Print help (see a summary with '-h')
 

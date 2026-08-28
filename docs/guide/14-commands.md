@@ -48,6 +48,7 @@ The prompt is a positional argument; quote it.
 |------|-------|---------|--------------|
 | `--mode` | `planning` \| `editing` \| `auto` | from config | What the agent is allowed to do — see [chapter 8](08-agent-modes.md) |
 | `--provider` | name or kind | from config | Which endpoint to use — see [chapter 12](12-configuration-reference.md#multiple-providers) |
+| `--model` | model id | from config | Which model to use, optionally prefixed with a provider — see [`--model`](#--model--pick-a-model-for-one-run) |
 | `--session` | session id | new session | Resume an existing session so its context carries over |
 | `--json` | — | off | Emit one JSON object per event to stdout (JSONL) instead of prose |
 | `--json-format` | `zcode` \| `opencode` | `zcode` | Event schema for `--json` — see [chapter 15](15-events.md) |
@@ -91,10 +92,15 @@ zcode repl [OPTIONS]
 |------|-------|--------------|
 | `--mode` | `planning` \| `editing` \| `auto` | Starting mode; change it later with `/mode` |
 | `--provider` | name or kind | Starting provider; change it later with `/provider` |
+| `--model` | model id | Starting model, optionally prefixed with a provider |
 | `--session` | session id | Resume an existing session |
 | `--config` | file path | Use this config file |
 
-Running `zcode` with no subcommand does the same thing.
+Running `zcode` with no subcommand does the same thing, and takes the same
+flags: `zcode --model openrouter/z-ai/glm-4.6` and
+`zcode repl --model openrouter/z-ai/glm-4.6` are one command written two ways.
+They belong *after* any subcommand, though — `zcode --mode planning run "…"`
+is refused rather than run with the mode quietly dropped.
 
 ---
 
@@ -142,6 +148,42 @@ have accepted:
 zcode: unknown provider `nope` — configured: free, fast, local, gateway;
 built in: openai, anthropic, openrouter, deepseek, ollama, vllm, openai-compatible
 ```
+
+---
+
+## `--model` — pick a model for one run
+
+```sh
+zcode run --model gpt-4o-mini "explain this"       # same provider, other model
+zcode --model openrouter/z-ai/glm-4.6              # provider and model at once
+```
+
+It outranks the config file, `ZCODE_MODEL`, and the model the selected provider
+profile carries — stating both `--provider` and `--model` is exactly the case
+where the flag has to win.
+
+**A leading `<provider>/` is read as a provider only when it names one** — an
+entry in your `providers` array, or a built-in kind. Most model ids are
+themselves `vendor/model`, so anything else stays whole:
+
+| Written | Provider | Model |
+|---------|----------|-------|
+| `--model gpt-4o-mini` | unchanged | `gpt-4o-mini` |
+| `--model z-ai/glm-4.6` | unchanged (`z-ai` is not a provider) | `z-ai/glm-4.6` |
+| `--model openrouter/z-ai/glm-4.6` | `openrouter` | `z-ai/glm-4.6` |
+| `--model local/qwen2.5-coder` | your `local` profile, endpoint and all | `qwen2.5-coder` |
+
+That test cannot separate the OpenRouter id `anthropic/claude-sonnet-4.5` from
+the pair `anthropic` + `claude-sonnet-4.5`, and it resolves the ambiguity
+towards the pair. **Naming the provider yourself says the other thing:** with
+`--provider` given, `--model` is an id exactly as written, never split.
+
+```sh
+zcode run --provider openrouter --model anthropic/claude-sonnet-4.5 "…"
+```
+
+`ZCODE_MODEL` is never split either — it is an id and only an id, so a config
+that already exports `ZCODE_MODEL=anthropic/claude-sonnet-4.5` keeps working.
 
 ---
 

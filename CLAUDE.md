@@ -297,6 +297,17 @@ across kinds produced an `api_key_env` that read `[set]` in `zcode config` and
 then failed at the first request — a quiet wrong beats a loud wrong only if
 you never have to debug it.
 
+`Config::select_model` is the same idea for the model: `--model` takes either a
+bare id or `<provider>/<model>`, and the leading segment is read as a provider
+**only when `knows_provider` says so** — most ids are `vendor/model`, so
+`z-ai/glm-4.6` must stay whole. The ambiguous case (`anthropic/claude-…` is
+both a valid OpenRouter id and a valid pair) resolves towards the pair;
+`Config::set_model` is the never-split variant, and is what the CLI uses once
+`--provider` has named the endpoint. `ZCODE_MODEL` also never splits — it
+predates the flag and an environment exporting an OpenRouter id must keep
+working. The flag is applied after `select_provider` so it outranks the
+profile's own model.
+
 `App::set_llm` swaps just the client: the tool registry, and every MCP/LSP
 child with it, keeps running, and so does the session — which is the point of
 switching mid-conversation.

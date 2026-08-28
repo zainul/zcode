@@ -310,6 +310,17 @@ $ ZCODE_MODEL=openai/gpt-4o-mini ZCODE_MODE=planning zcode run "review this modu
 
 The full list is in the [configuration reference](12-configuration-reference.md).
 
+Flags beat both. `--provider` and `--model` set the endpoint and the model for
+one run:
+
+```sh
+$ zcode run --model openrouter/z-ai/glm-4.6 "review this module"
+```
+
+See [chapter 14](14-commands.md#--model--pick-a-model-for-one-run) for how a
+`<provider>/<model>` prefix is told apart from a model id that simply contains
+a slash.
+
 ## What `zcode` writes to disk
 
 Relative to `working_dir` (the current directory unless you set it):

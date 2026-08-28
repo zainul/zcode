@@ -15,6 +15,7 @@ Options:
       --image <FILE>          Attach an image for vision-capable models. Repeatable
       --mode <MODE>           planning (read-only) | editing (edits files) | auto (edits and runs shell)
       --provider <NAME>       Which provider to use: a name from the `providers` array, or a built-in kind
+      --model <MODEL>         Model id, optionally prefixed with a provider
       --session <SESSION>     Resume an existing session id
       --json                  Stream one JSON object per event to stdout (JSONL)
       --json-format <FORMAT>  Event schema for `--json`: `zcode` (default) or `opencode`
@@ -54,6 +55,15 @@ $ zcode run --config ci/zcode.cheap.json "regenerate the fixture files"
 
 # A different provider for one run — model, key variable and URL move together
 $ zcode run --provider local "summarise this diff"
+
+# A different model on the provider already configured
+$ zcode run --model gpt-4o-mini "summarise this diff"
+
+# Provider and model in one argument
+$ zcode run --model openrouter/z-ai/glm-4.6 "summarise this diff"
+
+# An id that starts with a provider name: name the provider and it is not split
+$ zcode run --provider openrouter --model anthropic/claude-sonnet-4.5 "…"
 
 # Machine-readable in opencode's schema, for a consumer written against it
 $ zcode run --json --json-format opencode "list the crates"

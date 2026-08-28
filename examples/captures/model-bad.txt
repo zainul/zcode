@@ -1,0 +1,5 @@
+$ cd ./examples/multi-provider && /Users/zainul/rust/zcode/target/release/zcode run --model local/ hi
+
+zcode: `local/` names the provider `local` but no model — write `local/<model>`
+
+[exit 1]

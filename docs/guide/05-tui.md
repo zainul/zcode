@@ -13,7 +13,14 @@ $ zcode repl                              # the same thing, explicitly
 $ zcode repl --mode planning              # start read-only
 $ zcode repl --session <id>               # resume an existing session
 $ zcode repl --config ci/zcode.json       # a specific config
+$ zcode repl --provider local             # start on a different endpoint
+$ zcode repl --model openrouter/z-ai/glm-4.6   # endpoint and model at once
 ```
+
+Both spellings take the same flags: `zcode --mode planning` and `zcode repl
+--mode planning` are one command written two ways. They belong after any
+subcommand, though — `zcode --mode planning run "…"` is refused rather than run
+with the mode quietly dropped.
 
 The TUI needs a real terminal. Without one it exits cleanly rather than
 hanging:

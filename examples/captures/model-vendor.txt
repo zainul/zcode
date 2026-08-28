@@ -1,0 +1,5 @@
+$ cd ./examples/multi-provider && /Users/zainul/rust/zcode/target/release/zcode run --model z-ai/glm-4.6 hi
+
+zcode: llm error: openai-compatible request failed: error sending request for url (http://127.0.0.1:8095/v1/chat/completions)
+
+[exit 1]
