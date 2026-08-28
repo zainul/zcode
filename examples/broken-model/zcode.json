@@ -1,0 +1,5 @@
+{
+  "provider": "openrouter",
+  "model": "acme/does-not-exist",
+  "mode": "auto"
+}

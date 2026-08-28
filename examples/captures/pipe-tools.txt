@@ -1,0 +1,5 @@
+$ cd ./examples/demo-go && sh -c /Users/zainul/rust/zcode/target/release/zcode tools list 2>&1 | head -1
+
+read                         Read a UTF-8 text file and return its full contents.
+
+[exit 0]

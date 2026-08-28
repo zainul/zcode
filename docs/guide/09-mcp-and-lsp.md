@@ -4,7 +4,8 @@
 
 Two ways to extend what the agent can reach: **MCP** for external data and
 services, **LSP** for semantic understanding of code. Both are configured
-declaratively and appear as ordinary tools.
+declaratively **in the same config file as everything else** — there is no
+separate MCP or LSP config — and both appear as ordinary tools.
 
 Both are compiled in by default. `cargo build --release --no-default-features`
 drops them if you want the smallest binary.
@@ -75,17 +76,85 @@ killed when `zcode` exits.
 Language servers let the agent ask what a symbol *means* rather than grepping
 for it.
 
+### It is on by default
+
+You do not have to configure anything. zcode works out what kind of project it
+is in, and starts the matching language server if that server is installed:
+
+| Project marker | Language | Server started |
+|----------------|----------|----------------|
+| `go.mod` | Go | `gopls serve` |
+| `Cargo.toml` | Rust | `rust-analyzer` |
+| `tsconfig.json`, `next.config.*`, `deno.json` | TypeScript / Next.js | `typescript-language-server --stdio` |
+| `package.json` | JavaScript | `typescript-language-server --stdio` |
+
+Next.js is not a separate entry: a Next.js project is a TypeScript project, and
+`typescript-language-server` is the server for it. The aliases `nextjs`, `next`,
+`node`, `nodejs`, `ts`, `tsx` all resolve to `typescript`; `golang` resolves to
+`go`.
+
+`zcode config` shows exactly what resolved:
+
+```sh
+$ zcode config
+...
+  lsp servers            1  (project looks like go)
+    ▸ go           /Users/you/go/bin/gopls  [default]
+```
+
+Two rules keep this from being annoying:
+
+- **A default is only started if its binary is on `PATH`.** No warning per
+  session for the majority of people who do not write Go.
+- **Only a server for *this* project's language is started.** A Go repo on a
+  machine that also has `rust-analyzer` installed does not get `rust-analyzer`
+  — it could answer nothing about Go, and would cost a process. If no marker
+  identifies the directory at all, no default server is started.
+
+Install the server for your stack and it just works:
+
+```sh
+go install golang.org/x/tools/gopls@latest          # Go
+rustup component add rust-analyzer                  # Rust
+npm i -g typescript-language-server typescript      # TS / JS / Next.js
+```
+
+### Overriding the defaults
+
+Naming a server for a language replaces the default for that language. An
+explicitly configured server is always started, even if its language is not the
+one detected:
+
 ```json
 {
   "lsp": {
     "servers": [
-      { "language": "rust", "command": "rust-analyzer", "args": [] }
+      { "language": "python", "command": "pyright-langserver", "args": ["--stdio"] },
+      { "language": "rust",   "command": "rust-analyzer", "args": [], "env": [["RA_LOG", "error"]] }
     ]
   }
 }
 ```
 
-That adds four tools:
+Turn the built-ins off entirely with `"defaults": false`:
+
+```json
+{ "lsp": { "defaults": false } }
+```
+
+In TOML:
+
+```toml
+[lsp]
+defaults = false
+
+[[lsp.servers]]
+language = "python"
+command = "pyright-langserver"
+args = ["--stdio"]
+```
+
+### The tools
 
 | Tool | Arguments | Answers |
 |------|-----------|---------|
@@ -112,9 +181,10 @@ Two design points:
   new text is pushed to the language server, so subsequent lookups reflect the
   current state rather than the version on disk at startup.
 
-Currently the first server that starts successfully is used for the whole run;
-per-extension routing across several servers is not implemented yet. A missing
-language server is reported and skipped, exactly like MCP.
+One server runs per session — the project's own. Per-extension routing across
+several servers at once is not implemented yet. A language server that fails to
+start is reported and skipped, exactly like MCP; in the TUI that warning appears
+as a note row in the timeline rather than over the interface.
 
 ## Choosing between them
 

@@ -1,0 +1,38 @@
+### 11-finished
+back to ready, with tokens and cost on the status bar
+
+┌────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│┌ conversation ────────────────────────────────────────────────────────────────────────────────────┐│
+││  import "fmt"                                                                                    ││
+││                                                                                                  ││
+││  func greet(name string) string {                                                                ││
+││      return fmt.Sprintf("Hello, %s!", name)                                                      ││
+││  }                                                                                               ││
+││                                                                                                  ││
+││  func farewell(name string) string {                                                             ││
+││      return fmt.Sprintf("Goodbye, %s!", name)                                                    ││
+││  }                                                                                               ││
+││                                                                                                  ││
+││  func main() {                                                                                   ││
+││      fmt.Println(greet("world"))                                                                 ││
+││      fmt.Println(farewell("world"))                                                              ││
+││  }                                                                                               ││
+││  ```                                                                                             ││
+││                                                                                                  ││
+││  **Directory contents:**                                                                         ││
+││  - `.zcode/` (directory)                                                                         ││
+││  - `demo` (file or directory)                                                                    ││
+││  - `go.mod`                                                                                      ││
+││  - `main.go`                                                                                     ││
+││  - `zcode.json`                                                                                  ││
+││                                                                                                  ││
+││  As requested, I'm stopping here. The main.go file contains a simple Go program with two         ││
+││  functions (`greet` and `farewell`) that are called from the `main` function to print greeting   ││
+││  and farewell messages.                                                                          ││
+│└──────────────────────────────────────────────────────────────────────────────────────────────────┘│
+│┌ Enter sends · Alt-Enter newline · /help ─────────────────────────────────────────────────────────┐│
+││>                                                                                                 ││
+│└──────────────────────────────────────────────────────────────────────────────────────────────────┘│
+│ ● ready  │  mode auto  │  openrouter/poolside/laguna-s-2.1:free  │  5261 in / 250 out  │  $0.00    │
+└────────────────────────────────────────────────────────────────────────────────────────────────────┘
+cursor: row 29, col 3, visible=True

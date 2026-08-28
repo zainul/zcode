@@ -10,6 +10,7 @@ domain = { path = "../domain", version = "0.2.0" }
 infra-shell = { path = "../infra/shell", version = "0.2.0" }
 infra-filesystem = { path = "../infra/filesystem", version = "0.2.0" }
 infra-config = { path = "../infra/config", version = "0.2.0" }
+log = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

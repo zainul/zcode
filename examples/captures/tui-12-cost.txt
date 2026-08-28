@@ -1,0 +1,38 @@
+### 12-cost
+/cost breaks the estimate down
+
+┌────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│┌ conversation ────────────────────────────────────────────────────────────────────────────────────┐│
+││  func farewell(name string) string {                                                             ││
+││      return fmt.Sprintf("Goodbye, %s!", name)                                                    ││
+││  }                                                                                               ││
+││                                                                                                  ││
+││  func main() {                                                                                   ││
+││      fmt.Println(greet("world"))                                                                 ││
+││      fmt.Println(farewell("world"))                                                              ││
+││  }                                                                                               ││
+││  ```                                                                                             ││
+││                                                                                                  ││
+││  **Directory contents:**                                                                         ││
+││  - `.zcode/` (directory)                                                                         ││
+││  - `demo` (file or directory)                                                                    ││
+││  - `go.mod`                                                                                      ││
+││  - `main.go`                                                                                     ││
+││  - `zcode.json`                                                                                  ││
+││                                                                                                  ││
+││  As requested, I'm stopping here. The main.go file contains a simple Go program with two         ││
+││  functions (`greet` and `farewell`) that are called from the `main` function to print greeting   ││
+││  and farewell messages.                                                                          ││
+││                                                                                                  ││
+││10:50:03  zcode                                                                                   ││
+││  session: 1 turn(s), 2 step(s)                                                                   ││
+││  tokens:  5261 in, 250 out, 0 cached                                                             ││
+││  cost:    $0.00 (input 0.0000, output 0.0000, cache 0.0000) — estimated from list prices, not a  ││
+││  bill                                                                                            ││
+│└──────────────────────────────────────────────────────────────────────────────────────────────────┘│
+│┌ Enter sends · Alt-Enter newline · /help ─────────────────────────────────────────────────────────┐│
+││>                                                                                                 ││
+│└──────────────────────────────────────────────────────────────────────────────────────────────────┘│
+│ ● ready  │  mode auto  │  openrouter/poolside/laguna-s-2.1:free  │  5261 in / 250 out  │  $0.00    │
+└────────────────────────────────────────────────────────────────────────────────────────────────────┘
+cursor: row 29, col 3, visible=True

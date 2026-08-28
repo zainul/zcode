@@ -50,17 +50,29 @@ pub struct AgentContext {
     pub env: Vec<(String, String)>,
 }
 
-/// Agent operating mode (FR-MODE-01/02). `Planning` restricts the engine to
-/// read-only tools; `Build` allows destructive/execute-side tools.
+/// Agent operating mode (FR-MODE-01/02).
+///
+/// Three rungs of autonomy, each a strict superset of the one before:
+///
+/// | mode       | read | edit files | run shell |
+/// |------------|------|------------|-----------|
+/// | `planning` | yes  | no         | no        |
+/// | `editing`  | yes  | yes        | no        |
+/// | `auto`     | yes  | yes        | yes       |
+///
+/// `editing` exists because "may rewrite my source" and "may execute arbitrary
+/// commands" are genuinely different grants of trust: an agent that can edit a
+/// file leaves a reviewable diff, one that can run a command does not.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentMode {
     Planning,
-    Build,
+    Editing,
+    Auto,
 }
 
 impl Default for AgentMode {
     fn default() -> Self {
-        Self::Build
+        Self::Auto
     }
 }
 
@@ -68,10 +80,15 @@ impl std::str::FromStr for AgentMode {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "planning" | "Planning" => Ok(Self::Planning),
-            "build" | "Build" => Ok(Self::Build),
-            other => Err(format!("invalid agent mode: {other}")),
+        match s.trim().to_ascii_lowercase().as_str() {
+            "planning" | "plan" | "read-only" | "readonly" => Ok(Self::Planning),
+            "editing" | "edit" => Ok(Self::Editing),
+            // `build` is the v0.1 spelling of what is now `auto`; configs and
+            // scripts in the wild still say it, so it keeps working.
+            "auto" | "auto-run" | "autorun" | "build" => Ok(Self::Auto),
+            other => Err(format!(
+                "invalid agent mode: {other} (expected planning, editing, or auto)"
+            )),
         }
     }
 }
@@ -80,7 +97,32 @@ impl AgentMode {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Planning => "planning",
-            Self::Build => "build",
+            Self::Editing => "editing",
+            Self::Auto => "auto",
+        }
+    }
+
+    /// Every mode, in increasing order of autonomy — the order `/mode` cycles
+    /// through and the order help text lists them in.
+    pub fn all() -> &'static [AgentMode] {
+        &[Self::Planning, Self::Editing, Self::Auto]
+    }
+
+    /// The next mode in the cycle, so a single keystroke can step through them.
+    pub fn next(self) -> Self {
+        match self {
+            Self::Planning => Self::Editing,
+            Self::Editing => Self::Auto,
+            Self::Auto => Self::Planning,
+        }
+    }
+
+    /// One-line description for the TUI status bar and `--help`.
+    pub fn summary(&self) -> &'static str {
+        match self {
+            Self::Planning => "read-only; proposes changes",
+            Self::Editing => "edits files; no shell",
+            Self::Auto => "edits files and runs shell",
         }
     }
 }

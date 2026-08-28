@@ -1,0 +1,48 @@
+$ cd ./examples/demo-rust && /Users/zainul/rust/zcode/target/release/zcode config
+
+Config sources (later overrides earlier)
+  user      /Users/zainul/.config/zcode/config.json
+  project   /Users/zainul/rust/zcode/examples/demo-rust/zcode.json
+
+Search paths
+  user      /Users/zainul/.config/zcode/config.json  [found]
+  user      /Users/zainul/.config/zcode/config.toml  [not found]
+  project   zcode.json, then zcode.toml — searched upward from the
+            current directory to the filesystem root
+
+Effective configuration
+  provider               openrouter
+  model                  poolside/laguna-s-2.1:free
+  api_key_env            ZCODE_OPENROUTER_API_KEY  [set]
+  endpoint               https://openrouter.ai/api/v1/chat/completions (provider default)
+  providers              6  (--provider NAME, or /provider NAME in the TUI)
+      fast         openrouter         anthropic/claude-sonnet-4.5
+                   https://openrouter.ai/api/v1/chat/completions
+      free-openrouter openrouter         poolside/laguna-s-2.1:free
+                   https://openrouter.ai/api/v1/chat/completions
+      paid-openrouter openrouter         z-ai/glm-5.3-flash
+                   https://openrouter.ai/api/v1/chat/completions
+      free-groq    openai-compatible  qwen/qwen3.6-27b
+                   https://api.groq.com/openai/v1/chat/completions
+      gateway      openai-compatible  internal-1
+                   https://gateway.internal/v1/chat/completions
+      mul.ai       lmstudio           qwen/qwen3.5-9b
+                   http://100.123.185.66:1234/v1
+  working_dir            /Users/zainul/rust/zcode/examples/demo-rust
+  mode                   auto
+  timeout_ms             120000
+  max_turns              500
+  max_tokens             40000
+  max_tool_output_chars  16000000
+  max_retries            3
+  rate_limit_backoff_ms  30000ms  (after a 429 with no Retry-After)
+  skills_dir             /Users/zainul/.config/zcode/skills
+  shell_allowed          9 pattern(s) — unrestricted: anything the denylist permits, pipes and `&&` included
+  shell_denied           23 built-in + 0 from config
+  rtk                    0.36.0 — shell output is token-optimised  [/opt/homebrew/bin/rtk]
+  mcp servers            0
+  lsp servers            1  (project looks like rust)
+    ▸ rust         /Users/zainul/.cargo/bin/rust-analyzer  [default]
+  pricing                free route — cost will show as $0.00
+
+[exit 0]

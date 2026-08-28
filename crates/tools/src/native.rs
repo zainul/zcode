@@ -809,8 +809,17 @@ mod tests {
 
         // Blocked commands come back as a tool error the model can read,
         // rather than aborting the whole run.
-        let blocked = tool.call(TOOL_SHELL, r#"{"command":"rm -rf /"}"#).unwrap();
-        assert!(blocked.error.unwrap().contains("blocked"));
+        let blocked = tool
+            .call(TOOL_SHELL, r#"{"command":"git status"}"#)
+            .unwrap();
+        let message = blocked.error.expect("not in this allowlist");
+        assert!(message.contains("blocked"), "{message}");
+
+        // The built-in denylist reports itself distinctly, so the model learns
+        // that widening `shell_allowed` would not help.
+        let denied = tool.call(TOOL_SHELL, r#"{"command":"rm -rf /"}"#).unwrap();
+        let message = denied.error.expect("denylisted");
+        assert!(message.contains("denylist"), "{message}");
     }
 
     #[test]

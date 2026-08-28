@@ -13,6 +13,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+pub mod opencode;
+pub use opencode::OpencodeTelemetry;
+
 use domain::{BoxError, ExtraField, TelemetryEvent, TelemetryPort, TelemetryTotals};
 use serde::{Deserialize, Serialize};
 
@@ -43,6 +46,7 @@ impl JsonTelemetry {
                 session_id: String::new(),
                 finish_reason: String::new(),
                 truncated: false,
+                cost_usd: None,
             },
             start: Instant::now(),
         }
@@ -154,6 +158,9 @@ impl TelemetryPort for JsonTelemetry {
                 total.finish_reason
             },
             truncated: total.truncated || self.totals.truncated,
+            // A priced run wins over an unpriced one, so a thin totals struct
+            // cannot erase a cost the emit stream already established.
+            cost_usd: total.cost_usd.or(self.totals.cost_usd),
         };
         self.totals = merged.clone();
         let report = ReportFile {
@@ -167,6 +174,7 @@ impl TelemetryPort for JsonTelemetry {
             execution_time_ms: merged.execution_time_ms,
             finish_reason: merged.finish_reason,
             truncated: merged.truncated,
+            cost_usd: merged.cost_usd,
         };
         let json = serde_json::to_string_pretty(&report)?;
         let path = self
@@ -197,6 +205,9 @@ struct ReportFile {
     execution_time_ms: u64,
     finish_reason: String,
     truncated: bool,
+    /// Estimated USD spend. Absent — not zero — when the model is unpriced.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    cost_usd: Option<f64>,
 }
 
 /// Atomic write: `<path>.tmp` then `fs::rename` (same-filesystem rename is
@@ -279,6 +290,7 @@ mod tests {
             session_id: String::new(),
             finish_reason: String::new(),
             truncated: false,
+            cost_usd: None,
         }
     }
 

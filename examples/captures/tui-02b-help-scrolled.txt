@@ -1,0 +1,38 @@
+### 02b-help-scrolled
+PageUp scrolls back to the start of /help
+
+┌────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│┌ conversation (scrolled ↑10, PageDown to follow) ─────────────────────────────────────────────────┐│
+││11:24:24  zcode                                                                                   ││
+││  Ready when you are. Type /help for commands.                                                    ││
+││                                                                                                  ││
+││11:24:24  zcode                                                                                   ││
+││  commands:                                                                                       ││
+││    /help                            show this list                                               ││
+││    /exit                            quit zcode (also /quit, or Ctrl-C)                           ││
+││    /mode [planning|editing|auto]    show or change what the agent is allowed to do               ││
+││    /cost                            token usage and estimated spend for this session             ││
+││    /model                           provider, model, and config source                           ││
+││    /provider [NAME]                 list the configured providers, or switch to one              ││
+││    /session                         current session id and where it is stored                    ││
+││    /tools                           tools available in the current mode                          ││
+││    /new                             start a fresh session (clears the model's context)           ││
+││    /clear                           clear the screen, keep the session                           ││
+││    /stop                            cancel the turn in flight (also Esc)                         ││
+││    /copy [all]                      copy the last answer, or all of the conversation             ││
+││                                                                                                  ││
+││  keys:                                                                                           ││
+││    Enter                            send                                                         ││
+││    Alt-Enter                        newline without sending                                      ││
+││    Esc                              dismiss a selection, cancel the turn, or clear the prompt    ││
+││    Ctrl-C                           cancel if busy, otherwise quit                               ││
+││    Ctrl-A / Ctrl-E                  start / end of line                                          ││
+││    Ctrl-W                           delete the previous word                                     ││
+││    Ctrl-U / Ctrl-K                  delete to start / end of line                                ││
+│└──────────────────────────────────────────────────────────────────────────────────────────────────┘│
+│┌ Enter sends · Alt-Enter newline · /help ─────────────────────────────────────────────────────────┐│
+││>                                                                                                 ││
+│└──────────────────────────────────────────────────────────────────────────────────────────────────┘│
+│ ● ready  │  mode auto  │  openrouter/laguna-s-2.1:free  │  0 in / 0 out  │  $0.00  │  scrolled ↑10 │
+└────────────────────────────────────────────────────────────────────────────────────────────────────┘
+cursor: row 29, col 3, visible=True

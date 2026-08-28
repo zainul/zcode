@@ -1,0 +1,45 @@
+$ cd . && /Users/zainul/rust/zcode/target/release/zcode run --help
+
+Run a single task and exit
+
+Usage: zcode run [OPTIONS] <PROMPT>
+
+Arguments:
+  <PROMPT>
+          The task, in natural language
+
+Options:
+      --image <FILE>
+          Attach an image for vision-capable models. Repeatable
+
+      --mode <MODE>
+          planning (read-only) | editing (edits files) | auto (edits and runs shell)
+
+      --provider <NAME>
+          Which provider to use: a name from the `providers` array, or a built-in kind (openai, anthropic, openrouter, ollama, …)
+
+      --session <SESSION>
+          Resume an existing session id
+
+      --json
+          Stream one JSON object per event to stdout (JSONL)
+
+      --json-format <FORMAT>
+          Event schema for `--json`: zcode's own flat log, or opencode's `session.next.*` envelopes for consumers written against opencode
+
+          Possible values:
+          - zcode:    zcode's own flat JSONL: one object per event, documented in the guide
+          - opencode: opencode's event envelopes (`session.next.*`), for tools written against opencode's bus
+          
+          [default: zcode]
+
+      --config <FILE>
+          Config file to use instead of ./zcode.json or ./zcode.toml
+
+      --timeout <SECS>
+          Give up after this many seconds and checkpoint the session
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+[exit 0]

@@ -115,14 +115,64 @@ pub struct LlmFinish {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_tokens: u64,
+    /// What the provider says the call cost, in USD, when it says so.
+    ///
+    /// Authoritative where present: it is the number that will appear on the
+    /// bill, for the model actually served, at the rate actually charged. The
+    /// local price table is an estimate for providers that report nothing, and
+    /// cannot know about a model it has never heard of.
+    pub cost_usd: Option<f64>,
+}
+
+/// A transient provider failure that was retried rather than surfaced as an
+/// error — most often a 429. Reported so a stalled agent is explicable
+/// instead of just slow.
+#[derive(Clone, Debug)]
+pub struct RetryNotice {
+    /// 1-based: the first retry is attempt 1.
+    pub attempt: u32,
+    pub max_attempts: u32,
+    /// How long the client waited before trying again.
+    pub delay_ms: u64,
+    /// HTTP status that triggered it, or `None` for a transport error.
+    pub status: Option<u16>,
+    /// Short human-readable cause ("rate limited", "connection timed out").
+    pub reason: String,
+}
+
+impl RetryNotice {
+    /// One-line rendering shared by every renderer, so the TUI, the pretty
+    /// printer and the logs all describe a retry the same way.
+    pub fn render(&self) -> String {
+        let status = match self.status {
+            Some(code) => format!(" ({code})"),
+            None => String::new(),
+        };
+        format!(
+            "{}{} — retrying in {:.1}s (attempt {}/{})",
+            self.reason,
+            status,
+            self.delay_ms as f64 / 1000.0,
+            self.attempt,
+            self.max_attempts
+        )
+    }
 }
 
 /// A streamed event from an LLM provider.
 #[derive(Clone, Debug)]
 pub enum LlmEvent {
     Delta(String),
-    ToolCallStart { id: String, name: String },
-    ToolCallArgs { id: String, arguments: String },
+    ToolCallStart {
+        id: String,
+        name: String,
+    },
+    ToolCallArgs {
+        id: String,
+        arguments: String,
+    },
+    /// Emitted before the events of a request that had to be retried.
+    Retry(RetryNotice),
     Finish(LlmFinish),
 }
 
@@ -305,6 +355,9 @@ pub struct TelemetryTotals {
     pub session_id: String,
     pub finish_reason: String,
     pub truncated: bool,
+    /// Estimated spend for the run, from `domain::pricing`. `None` when the
+    /// model is not in the price table — reported as absent rather than zero.
+    pub cost_usd: Option<f64>,
 }
 
 /// Telemetry port: stream JSONL events and flush a report file on completion.
@@ -335,8 +388,25 @@ pub enum UiEvent {
         name: String,
         content: String,
         error: Option<String>,
+        /// How long the call itself took, measured around the dispatch.
+        ///
+        /// The UI cannot time this for itself: events are drained in batches,
+        /// so the gap between *receiving* a start and a result is a fact about
+        /// the channel, not about the tool.
+        elapsed_ms: u64,
     },
     Finish(LlmFinish),
+    /// Usage so far in this turn, emitted after every provider call.
+    ///
+    /// Distinct from `Finish`, which arrives once and means the turn is over.
+    /// A turn that calls tools runs for many steps, each already billed, so
+    /// waiting for `Finish` to report anything leaves the display reading
+    /// `0 in / 0 out` through minutes of spending.
+    Usage(LlmFinish),
+    /// A provider call was retried (rate limit, transient 5xx, timeout).
+    Retry(RetryNotice),
+    /// Informational message from the engine itself, not the model.
+    Notice(String),
     LoopStart {
         step: u64,
         max_turns: u64,

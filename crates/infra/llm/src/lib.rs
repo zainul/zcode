@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use domain::{
     BoxError, LlmEvent, LlmFinish, LlmFinishReason, LlmMessage, LlmRequest, LlmResponse, LlmRole,
-    LlmToolCall,
+    LlmToolCall, RetryNotice,
 };
 use reqwest::blocking::{Client, RequestBuilder, Response};
 use reqwest::StatusCode;
@@ -31,7 +31,11 @@ use reqwest::StatusCode;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Transient failures are retried this many times before giving up.
-const DEFAULT_MAX_RETRIES: u32 = 2;
+///
+/// Three, not two: a 429 from a busy provider routinely needs more than one
+/// backoff, and giving up early turns a recoverable pause into a failed run.
+/// Override with `max_retries` in the config file.
+const DEFAULT_MAX_RETRIES: u32 = 3;
 const USER_AGENT: &str = concat!("zcode/", env!("CARGO_PKG_VERSION"));
 
 // ---------------------------------------------------------------------------
@@ -59,17 +63,169 @@ fn is_retryable(status: StatusCode) -> bool {
     )
 }
 
-/// Honour `Retry-After` when the provider sends one, else exponential backoff.
-fn retry_delay(attempt: u32, response: Option<&Response>) -> Duration {
-    if let Some(secs) = response
+/// Longest a single backoff may last, however the provider asks.
+const MAX_BACKOFF: Duration = Duration::from_secs(120);
+
+/// How long to wait after a 429 that carries no `Retry-After`.
+///
+/// Rate limits are not transient hiccups: a provider that just refused you is
+/// refusing everyone, and coming back in 600ms only spends another request to
+/// be told the same thing. Free and shared tiers meter by the minute, so the
+/// first retry has to sit out a meaningful part of one. Measured against
+/// OpenRouter's free routes, sub-second retries failed every time and a 30s
+/// wait succeeded.
+const DEFAULT_RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(30);
+
+/// First backoff for a non-rate-limit failure (a 500, a dropped connection).
+/// These usually *are* transient, so the old fast retry is right for them.
+const TRANSIENT_BACKOFF: Duration = Duration::from_millis(500);
+
+/// How long to wait before trying again, and how many times.
+#[derive(Clone, Copy, Debug)]
+pub struct RetryPolicy {
+    pub max_retries: u32,
+    /// Floor for a 429 with no `Retry-After`.
+    pub rate_limit_backoff: Duration,
+    /// Ceiling for any single wait, including one the provider asked for.
+    pub max_backoff: Duration,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_retries: DEFAULT_MAX_RETRIES,
+            rate_limit_backoff: DEFAULT_RATE_LIMIT_BACKOFF,
+            max_backoff: MAX_BACKOFF,
+        }
+    }
+}
+
+impl RetryPolicy {
+    pub fn with_max_retries(mut self, retries: u32) -> Self {
+        self.max_retries = retries;
+        self
+    }
+
+    pub fn with_rate_limit_backoff(mut self, backoff: Duration) -> Self {
+        self.rate_limit_backoff = backoff;
+        self
+    }
+}
+
+/// Parse a `Retry-After` value. The header is defined as either a delay in
+/// seconds or an HTTP date; providers also send fractional seconds, so all
+/// three spellings are accepted.
+fn parse_retry_after(raw: &str) -> Option<Duration> {
+    let raw = raw.trim();
+    if let Ok(secs) = raw.parse::<f64>() {
+        if secs.is_finite() && secs >= 0.0 {
+            return Some(Duration::from_millis((secs * 1000.0) as u64));
+        }
+    }
+    // An HTTP date: honour it only as a *relative* wait we can bound. Parsing
+    // the full date grammar is not worth a dependency; the RFC 1123 form
+    // providers actually send has the time at a fixed offset.
+    httpdate_delay(raw)
+}
+
+/// Seconds until an RFC 1123 timestamp (`Tue, 15 Nov 1994 08:12:31 GMT`),
+/// relative to the system clock. Returns `None` for anything unparseable.
+fn httpdate_delay(raw: &str) -> Option<Duration> {
+    let target = httpdate_to_unix(raw)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs() as i64;
+    let delta = target - now;
+    (delta > 0).then(|| Duration::from_secs(delta as u64))
+}
+
+/// Minimal RFC 1123 → unix-seconds conversion (days-from-civil algorithm).
+fn httpdate_to_unix(raw: &str) -> Option<i64> {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    // "Tue, 15 Nov 1994 08:12:31 GMT"
+    let rest = raw.split_once(", ").map(|(_, r)| r).unwrap_or(raw);
+    let mut parts = rest.split_whitespace();
+    let day: i64 = parts.next()?.parse().ok()?;
+    let month_name = parts.next()?;
+    let month = MONTHS.iter().position(|m| *m == month_name)? as i64 + 1;
+    let year: i64 = parts.next()?.parse().ok()?;
+    let mut hms = parts.next()?.split(':');
+    let (h, m, sec): (i64, i64, i64) = (
+        hms.next()?.parse().ok()?,
+        hms.next()?.parse().ok()?,
+        hms.next()?.parse().ok()?,
+    );
+    // Howard Hinnant's days_from_civil.
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(days * 86_400 + h * 3_600 + m * 60 + sec)
+}
+
+/// Deterministic sub-second jitter derived from the process id and attempt.
+///
+/// Two agents that hit the same rate limit at the same instant must not both
+/// come back at the same instant. This is not cryptographic and does not need
+/// to be — it only has to decorrelate.
+fn jitter_ms(attempt: u32) -> u64 {
+    let seed = std::process::id() as u64 ^ (attempt as u64).wrapping_mul(0x9E37_79B9);
+    // xorshift, then take the low bits: 0..=249ms.
+    let mut x = seed | 1;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    x % 250
+}
+
+/// How long to wait before attempt `attempt + 1`.
+///
+/// The provider's own `Retry-After` always wins — it is the only authoritative
+/// number in the exchange. Failing that, the wait depends on *why* we are
+/// retrying: a rate limit starts at [`RetryPolicy::rate_limit_backoff`], a
+/// transient error at [`TRANSIENT_BACKOFF`]. Both grow exponentially and both
+/// are capped, so a hostile or mistaken header cannot park the agent.
+fn retry_delay(
+    attempt: u32,
+    status: Option<StatusCode>,
+    response: Option<&Response>,
+    policy: RetryPolicy,
+) -> Duration {
+    if let Some(delay) = response
         .and_then(|r| r.headers().get(reqwest::header::RETRY_AFTER))
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.trim().parse::<u64>().ok())
+        .and_then(parse_retry_after)
     {
-        // Cap it so a hostile header cannot park the agent for an hour.
-        return Duration::from_secs(secs.min(30));
+        return delay.min(policy.max_backoff);
     }
-    Duration::from_millis(500 * 2_u64.pow(attempt.min(4)))
+    // Rate limits do not double. The window a provider meters over is fixed —
+    // usually a minute — so waiting 30s, then 60s, then 120s does not improve
+    // the odds, it just turns a recoverable pause into minutes of silence. A
+    // flat wait keeps the worst case predictable at `max_retries x backoff`.
+    // Transient errors *are* worth backing off from progressively.
+    let delay = if status == Some(StatusCode::TOO_MANY_REQUESTS) {
+        policy.rate_limit_backoff
+    } else {
+        TRANSIENT_BACKOFF.saturating_mul(1u32 << attempt.min(6))
+    };
+    (delay + Duration::from_millis(jitter_ms(attempt))).min(policy.max_backoff)
+}
+
+/// Short cause for a retried status, used in the notice the user sees.
+fn retry_reason(status: StatusCode) -> String {
+    match status.as_u16() {
+        429 => "rate limited by the provider".to_string(),
+        408 => "provider timed out".to_string(),
+        409 => "provider reported a conflict".to_string(),
+        500..=599 => format!("provider error {}", status.as_u16()),
+        other => format!("provider returned {other}"),
+    }
 }
 
 /// A failed HTTP exchange, rendered with the provider's own error text —
@@ -93,23 +249,42 @@ fn http_error(provider: &str, status: StatusCode, body: &str) -> BoxError {
     format!("{provider} request failed ({status}): {detail}{hint}").into()
 }
 
+/// A response plus the retries it took to get one.
+///
+/// The notices are carried out rather than logged here so the caller can
+/// replay them as `LlmEvent::Retry` at the head of the stream: a rate-limited
+/// agent should look *rate limited*, not hung.
+pub struct RetriedResponse {
+    pub response: Response,
+    pub retries: Vec<RetryNotice>,
+}
+
 /// Send with retries, returning a streaming-capable response.
 fn send_with_retry(
     provider: &str,
-    max_retries: u32,
+    policy: RetryPolicy,
     make_request: impl Fn() -> RequestBuilder,
-) -> Result<Response, BoxError> {
+) -> Result<RetriedResponse, BoxError> {
     let mut attempt = 0;
+    let mut retries: Vec<RetryNotice> = Vec::new();
     loop {
         let outcome = make_request().send();
         match outcome {
             Ok(response) => {
                 let status = response.status();
                 if status.is_success() {
-                    return Ok(response);
+                    return Ok(RetriedResponse { response, retries });
                 }
-                if is_retryable(status) && attempt < max_retries {
-                    std::thread::sleep(retry_delay(attempt, Some(&response)));
+                if is_retryable(status) && attempt < policy.max_retries {
+                    let delay = retry_delay(attempt, Some(status), Some(&response), policy);
+                    retries.push(RetryNotice {
+                        attempt: attempt + 1,
+                        max_attempts: policy.max_retries,
+                        delay_ms: delay.as_millis() as u64,
+                        status: Some(status.as_u16()),
+                        reason: retry_reason(status),
+                    });
+                    std::thread::sleep(delay);
                     attempt += 1;
                     continue;
                 }
@@ -118,8 +293,22 @@ fn send_with_retry(
             }
             Err(e) => {
                 // Connection reset / timeout: worth one more go.
-                if attempt < max_retries && (e.is_timeout() || e.is_request() || e.is_connect()) {
-                    std::thread::sleep(retry_delay(attempt, None));
+                if attempt < policy.max_retries
+                    && (e.is_timeout() || e.is_request() || e.is_connect())
+                {
+                    let delay = retry_delay(attempt, None, None, policy);
+                    retries.push(RetryNotice {
+                        attempt: attempt + 1,
+                        max_attempts: policy.max_retries,
+                        delay_ms: delay.as_millis() as u64,
+                        status: None,
+                        reason: if e.is_timeout() {
+                            "connection timed out".into()
+                        } else {
+                            "connection failed".into()
+                        },
+                    });
+                    std::thread::sleep(delay);
                     attempt += 1;
                     continue;
                 }
@@ -127,6 +316,14 @@ fn send_with_retry(
             }
         }
     }
+}
+
+/// Turn the retries that preceded a stream into leading events, so every
+/// renderer sees them in order before the model's first token.
+fn retry_events(
+    retries: Vec<RetryNotice>,
+) -> impl Iterator<Item = Result<LlmEvent, BoxError>> + Send {
+    retries.into_iter().map(|n| Ok(LlmEvent::Retry(n)))
 }
 
 // ---------------------------------------------------------------------------
@@ -227,11 +424,13 @@ fn aggregate(
         input_tokens: 0,
         output_tokens: 0,
         cache_tokens: 0,
+        cost_usd: None,
     };
     for ev in events.into_iter().flatten() {
         match ev {
             LlmEvent::Delta(t) => text.push_str(&t),
-            LlmEvent::ToolCallStart { .. } | LlmEvent::ToolCallArgs { .. } => {}
+            LlmEvent::ToolCallStart { .. } | LlmEvent::ToolCallArgs { .. } | LlmEvent::Retry(_) => {
+            }
             LlmEvent::Finish(f) => finish = f,
         }
     }
@@ -251,9 +450,16 @@ pub struct OpenAiShapeLlm {
     api_key: String,
     model: String,
     provider: &'static str,
-    max_retries: u32,
+    retry: RetryPolicy,
     /// Extra headers a specific provider requires (e.g. OpenRouter attribution).
     extra_headers: Vec<(&'static str, String)>,
+    /// When set, the stable prefix (system prompt + tools + history) is marked
+    /// with `cache_control` breakpoints so repeated calls hit the provider's
+    /// prompt cache instead of re-billing the full prompt every turn. Required
+    /// for Anthropic models routed through the OpenAI shape (OpenRouter), and
+    /// ignored by providers that do not understand it — which is why it is a
+    /// per-adapter flag rather than always-on.
+    cache_control: bool,
 }
 
 impl OpenAiShapeLlm {
@@ -268,9 +474,22 @@ impl OpenAiShapeLlm {
             api_key: api_key.to_string(),
             model: model.to_string(),
             provider: "openai",
-            max_retries: DEFAULT_MAX_RETRIES,
+            retry: RetryPolicy::default(),
             extra_headers: Vec::new(),
+            cache_control: false,
         }
+    }
+
+    /// Replace the retry policy (`max_retries` / `rate_limit_backoff_ms`).
+    pub fn set_retry_policy(&mut self, retry: RetryPolicy) {
+        self.retry = retry;
+    }
+
+    /// Enable provider prompt caching by marking the request prefix with
+    /// `cache_control` breakpoints (FR-COST-01).
+    pub fn with_cache_control(mut self, on: bool) -> Self {
+        self.cache_control = on;
+        self
     }
 
     fn labelled(mut self, provider: &'static str) -> Self {
@@ -304,15 +523,15 @@ impl OpenAiShapeLlm {
         builder.json(payload)
     }
 
-    fn open_stream(&self, req: &LlmRequest) -> Result<Response, BoxError> {
-        let payload = build_openai_request(req, &self.model);
-        send_with_retry(self.provider, self.max_retries, || self.request(&payload))
+    fn open_stream(&self, req: &LlmRequest) -> Result<RetriedResponse, BoxError> {
+        let payload = build_openai_request(req, &self.model, self.cache_control);
+        send_with_retry(self.provider, self.retry, || self.request(&payload))
     }
 
     /// Non-streaming read of the whole body (used by `send()`).
     fn http_body(&self, req: &LlmRequest) -> Result<String, BoxError> {
-        let response = self.open_stream(req)?;
-        response
+        self.open_stream(req)?
+            .response
             .text()
             .map_err(|e| format!("{} response read failed: {e}", self.provider).into())
     }
@@ -322,9 +541,8 @@ impl OpenAiShapeLlm {
         req: &LlmRequest,
     ) -> Box<dyn Iterator<Item = Result<LlmEvent, BoxError>> + Send> {
         match self.open_stream(req) {
-            Ok(response) => Box::new(EventStream::from_response(
-                response,
-                OpenAiDecoder::default(),
+            Ok(RetriedResponse { response, retries }) => Box::new(retry_events(retries).chain(
+                EventStream::from_response(response, OpenAiDecoder::default()),
             )),
             Err(e) => Box::new(std::iter::once(Err(e))),
         }
@@ -333,6 +551,12 @@ impl OpenAiShapeLlm {
 
 macro_rules! openai_shaped_port {
     ($ty:ty) => {
+        impl $ty {
+            /// Replace the retry policy (`max_retries` / `rate_limit_backoff_ms`).
+            pub fn set_retry_policy(&mut self, retry: RetryPolicy) {
+                self.0.set_retry_policy(retry);
+            }
+        }
         impl domain::LlmPort for $ty {
             fn send(&mut self, req: &LlmRequest) -> Result<LlmResponse, BoxError> {
                 let body = self.0.http_body(req)?;
@@ -372,14 +596,22 @@ impl OpenRouterLlm {
         Self::with_timeout(api_key, model, DEFAULT_TIMEOUT)
     }
     pub fn with_timeout(api_key: &str, model: &str, timeout: Duration) -> Self {
+        Self::at(Self::endpoint(), api_key, model, timeout)
+    }
+    /// As `with_timeout`, against a specific endpoint — a gateway, a proxy, or
+    /// a stub. `base_url` is documented as an endpoint override, so it has to
+    /// override this one too; hardcoding it meant `zcode config` printed the
+    /// configured URL and the client quietly used another.
+    pub fn at(endpoint: &str, api_key: &str, model: &str, timeout: Duration) -> Self {
         Self(
-            OpenAiShapeLlm::with_timeout(Self::endpoint(), api_key, model, timeout)
+            OpenAiShapeLlm::with_timeout(&chat_completions_url(endpoint), api_key, model, timeout)
                 .labelled("openrouter")
                 .with_header(
                     "HTTP-Referer",
                     "https://github.com/zainul/zcode".to_string(),
                 )
-                .with_header("X-Title", "zcode".to_string()),
+                .with_header("X-Title", "zcode".to_string())
+                .with_cache_control(true),
         )
     }
     pub fn endpoint() -> &'static str {
@@ -396,8 +628,12 @@ impl DeepSeekLlm {
         Self::with_timeout(api_key, model, DEFAULT_TIMEOUT)
     }
     pub fn with_timeout(api_key: &str, model: &str, timeout: Duration) -> Self {
+        Self::at(Self::endpoint(), api_key, model, timeout)
+    }
+    /// As `with_timeout`, against a specific endpoint. See `OpenRouterLlm::at`.
+    pub fn at(endpoint: &str, api_key: &str, model: &str, timeout: Duration) -> Self {
         Self(
-            OpenAiShapeLlm::with_timeout(Self::endpoint(), api_key, model, timeout)
+            OpenAiShapeLlm::with_timeout(&chat_completions_url(endpoint), api_key, model, timeout)
                 .labelled("deepseek"),
         )
     }
@@ -415,16 +651,30 @@ impl VllmLlm {
         Self::with_timeout(base_url, api_key, model, DEFAULT_TIMEOUT)
     }
     pub fn with_timeout(base_url: &str, api_key: &str, model: &str, timeout: Duration) -> Self {
-        let endpoint = format!("{}/chat/completions", base_url.trim_end_matches('/'));
         Self(
-            OpenAiShapeLlm::with_timeout(&endpoint, api_key, model, timeout)
+            OpenAiShapeLlm::with_timeout(&chat_completions_url(base_url), api_key, model, timeout)
                 .labelled("openai-compatible"),
         )
     }
 }
+
+/// Resolve `base_url` to a chat-completions endpoint, whichever the user gave.
+///
+/// "base URL" is genuinely ambiguous — vLLM's docs print
+/// `http://host:8000/v1`, while most people copy the full
+/// `.../v1/chat/completions` out of a curl example. Appending unconditionally
+/// turned the second, reasonable spelling into a 404 at a doubled path, and
+/// the error named a URL the user never typed.
+fn chat_completions_url(base_url: &str) -> String {
+    let trimmed = base_url.trim_end_matches('/');
+    if trimmed.ends_with("/chat/completions") {
+        return trimmed.to_string();
+    }
+    format!("{trimmed}/chat/completions")
+}
 openai_shaped_port!(VllmLlm);
 
-fn build_openai_request(req: &LlmRequest, model: &str) -> serde_json::Value {
+fn build_openai_request(req: &LlmRequest, model: &str, cache_control: bool) -> serde_json::Value {
     let messages: Vec<serde_json::Value> = req
         .messages
         .iter()
@@ -444,6 +694,20 @@ fn build_openai_request(req: &LlmRequest, model: &str) -> serde_json::Value {
     if !tools.is_empty() {
         payload["tools"] = serde_json::Value::Array(tools);
         payload["tool_choice"] = serde_json::json!("auto");
+    }
+    // Mark the whole stable prefix — system prompt, tools and the conversation
+    // so far — as a cache breakpoint. On a provider that honours
+    // `cache_control` (e.g. OpenRouter routing Anthropic models, or any
+    // OpenAI-compatible server that implements prompt caching) the next turn's
+    // identical prefix is served from cache instead of being re-billed. The
+    // breakpoint sits on the last message so it folds in everything before it.
+    if cache_control {
+        if let Some(last) = payload["messages"]
+            .as_array_mut()
+            .and_then(|m| m.last_mut())
+        {
+            last["cache_control"] = serde_json::json!({ "type": "ephemeral" });
+        }
     }
     payload
 }
@@ -517,6 +781,9 @@ pub struct OpenAiDecoder {
     /// folded in (FR-OUTPUT-03/04/05).
     pending_finish: Option<LlmFinish>,
     usage: Option<(u64, u64, u64)>,
+    /// Provider-reported cost, held alongside `usage` because it can arrive in
+    /// the same trailing chunk as the token counts — or in a later one.
+    cost_usd: Option<f64>,
 }
 
 impl SseDecode for OpenAiDecoder {
@@ -546,11 +813,18 @@ impl SseDecode for OpenAiDecoder {
                 .and_then(|d| d.get("cached_tokens"))
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
+            // What the provider says it charged. OpenRouter reports this on
+            // every response; it is exact, per-model, and does not depend on a
+            // local table having heard of the model. `0.0` is a real answer —
+            // a free route — so only an absent field means "not reported".
+            let cost = u.get("cost").and_then(|v| v.as_f64()).filter(|c| *c >= 0.0);
             self.usage = Some((in_tok, out_tok, cache));
+            self.cost_usd = cost.or(self.cost_usd);
             if let Some(finish) = self.pending_finish.as_mut() {
                 finish.input_tokens = in_tok;
                 finish.output_tokens = out_tok;
                 finish.cache_tokens = cache;
+                finish.cost_usd = cost.or(finish.cost_usd);
             }
         }
 
@@ -603,6 +877,7 @@ impl SseDecode for OpenAiDecoder {
                 input_tokens: i,
                 output_tokens: o,
                 cache_tokens: c,
+                cost_usd: self.cost_usd,
             });
             self.pending.clear();
             self.started.clear();
@@ -685,7 +960,8 @@ pub struct AnthropicLlm {
     client: Client,
     api_key: String,
     model: String,
-    max_retries: u32,
+    retry: RetryPolicy,
+    endpoint: String,
 }
 
 impl AnthropicLlm {
@@ -694,11 +970,19 @@ impl AnthropicLlm {
     }
 
     pub fn with_timeout(api_key: &str, model: &str, timeout: Duration) -> Self {
+        Self::at(Self::endpoint(), api_key, model, timeout)
+    }
+
+    /// As `with_timeout`, against a specific endpoint — a gateway or a proxy.
+    /// `base_url` is documented as an endpoint override, so it has to override
+    /// this one too.
+    pub fn at(endpoint: &str, api_key: &str, model: &str, timeout: Duration) -> Self {
         Self {
             client: build_client(timeout),
             api_key: api_key.to_string(),
             model: model.to_string(),
-            max_retries: DEFAULT_MAX_RETRIES,
+            retry: RetryPolicy::default(),
+            endpoint: endpoint.to_string(),
         }
     }
 
@@ -706,15 +990,20 @@ impl AnthropicLlm {
         &self.model
     }
 
+    /// Replace the retry policy (`max_retries` / `rate_limit_backoff_ms`).
+    pub fn set_retry_policy(&mut self, retry: RetryPolicy) {
+        self.retry = retry;
+    }
+
     pub fn endpoint() -> &'static str {
         "https://api.anthropic.com/v1/messages"
     }
 
-    fn open_stream(&self, req: &LlmRequest) -> Result<Response, BoxError> {
+    fn open_stream(&self, req: &LlmRequest) -> Result<RetriedResponse, BoxError> {
         let payload = build_anthropic_request(req, &self.model);
-        send_with_retry("anthropic", self.max_retries, || {
+        send_with_retry("anthropic", self.retry, || {
             self.client
-                .post(Self::endpoint())
+                .post(&self.endpoint)
                 .header("x-api-key", &self.api_key)
                 .header("anthropic-version", "2023-06-01")
                 .header("content-type", "application/json")
@@ -725,6 +1014,7 @@ impl AnthropicLlm {
 
     fn http_body(&self, req: &LlmRequest) -> Result<String, BoxError> {
         self.open_stream(req)?
+            .response
             .text()
             .map_err(|e| format!("anthropic response read failed: {e}").into())
     }
@@ -740,9 +1030,8 @@ impl domain::LlmPort for AnthropicLlm {
         req: &LlmRequest,
     ) -> Box<dyn Iterator<Item = Result<LlmEvent, BoxError>> + Send> {
         match self.open_stream(req) {
-            Ok(response) => Box::new(EventStream::from_response(
-                response,
-                AnthropicDecoder::default(),
+            Ok(RetriedResponse { response, retries }) => Box::new(retry_events(retries).chain(
+                EventStream::from_response(response, AnthropicDecoder::default()),
             )),
             Err(e) => Box::new(std::iter::once(Err(e))),
         }
@@ -837,9 +1126,21 @@ fn build_anthropic_request(req: &LlmRequest, model: &str) -> serde_json::Value {
         "temperature": req.temperature,
     });
     if !system.is_empty() {
-        payload["system"] = serde_json::Value::String(system);
+        // Anthropic accepts the system prompt as an array of text blocks, and
+        // only blocks carry `cache_control`. Marking it caches the (large,
+        // turn-stable) system instructions so every turn after the first reads
+        // them from the prompt cache (FR-COST-01).
+        payload["system"] = serde_json::json!([
+            { "type": "text", "text": system, "cache_control": { "type": "ephemeral" } }
+        ]);
     }
     if !tools.is_empty() {
+        let mut tools = tools;
+        // The tool schemas are equally stable; a cache breakpoint on the last
+        // tool folds the whole tool list into the cached prefix.
+        if let Some(last) = tools.last_mut() {
+            last["cache_control"] = serde_json::json!({ "type": "ephemeral" });
+        }
         payload["tools"] = serde_json::Value::Array(tools);
     }
     payload
@@ -887,6 +1188,7 @@ impl Default for AnthropicDecoder {
                 input_tokens: 0,
                 output_tokens: 0,
                 cache_tokens: 0,
+                cost_usd: None,
             },
             last_event: String::new(),
             emitted_finish: false,
@@ -1009,7 +1311,7 @@ pub struct OllamaLlm {
     client: Client,
     endpoint: String,
     model: String,
-    max_retries: u32,
+    retry: RetryPolicy,
 }
 
 impl OllamaLlm {
@@ -1022,7 +1324,7 @@ impl OllamaLlm {
             client: build_client(timeout),
             endpoint: endpoint.to_string(),
             model: model.to_string(),
-            max_retries: DEFAULT_MAX_RETRIES,
+            retry: RetryPolicy::default(),
         }
     }
 
@@ -1030,9 +1332,14 @@ impl OllamaLlm {
         &self.model
     }
 
-    fn open_stream(&self, req: &LlmRequest) -> Result<Response, BoxError> {
+    /// Replace the retry policy (`max_retries` / `rate_limit_backoff_ms`).
+    pub fn set_retry_policy(&mut self, retry: RetryPolicy) {
+        self.retry = retry;
+    }
+
+    fn open_stream(&self, req: &LlmRequest) -> Result<RetriedResponse, BoxError> {
         let payload = build_ollama_request(req, &self.model);
-        send_with_retry("ollama", self.max_retries, || {
+        send_with_retry("ollama", self.retry, || {
             self.client
                 .post(&self.endpoint)
                 .header("content-type", "application/json")
@@ -1047,6 +1354,7 @@ impl OllamaLlm {
         let has_images = !req.images.is_empty();
         let body = self
             .open_stream(req)?
+            .response
             .text()
             .map_err(|e| -> BoxError { format!("ollama response read failed: {e}").into() })?;
         let mut events = parse_ollama_events(&body);
@@ -1070,8 +1378,11 @@ impl domain::LlmPort for OllamaLlm {
     ) -> Box<dyn Iterator<Item = Result<LlmEvent, BoxError>> + Send> {
         let warn = !req.images.is_empty();
         match self.open_stream(req) {
-            Ok(response) => {
-                let stream = EventStream::from_response(response, OllamaDecoder::default());
+            Ok(RetriedResponse { response, retries }) => {
+                let stream = retry_events(retries).chain(EventStream::from_response(
+                    response,
+                    OllamaDecoder::default(),
+                ));
                 if warn {
                     Box::new(
                         std::iter::once(Ok(LlmEvent::Delta(OLLAMA_VISION_WARNING.to_string())))
@@ -1156,6 +1467,7 @@ impl SseDecode for OllamaDecoder {
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0),
                 cache_tokens: 0,
+                cost_usd: None,
             };
             if !self.seen_ids.is_empty() {
                 finish.reason = LlmFinishReason::ToolUse;
@@ -1212,6 +1524,7 @@ impl SseDecode for OllamaDecoder {
                 input_tokens: 0,
                 output_tokens: 0,
                 cache_tokens: 0,
+                cost_usd: None,
             })));
             self.done = true;
         }
@@ -1312,6 +1625,69 @@ mod tests {
     }
 
     #[test]
+    fn a_provider_reported_cost_is_carried_through() {
+        // OpenRouter reports what it actually charged on every response. That
+        // is exact for any model, including one the local price table has
+        // never heard of — which is the case this fixes.
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":9393,\"completion_tokens\":167,\"cost\":0.000508}}\n",
+            "data: [DONE]\n",
+        );
+        let events = parse_openai_events(body);
+        let finish = events
+            .iter()
+            .find_map(|e| match e {
+                Ok(LlmEvent::Finish(f)) => Some(f),
+                _ => None,
+            })
+            .expect("a finish event");
+        assert_eq!(finish.input_tokens, 9393);
+        assert_eq!(finish.output_tokens, 167);
+        assert_eq!(finish.cost_usd, Some(0.000508));
+    }
+
+    #[test]
+    fn a_free_route_reports_zero_rather_than_nothing() {
+        // `0.0` is an answer — it means free — and must not be mistaken for
+        // "the provider did not say".
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2,\"cost\":0}}\n",
+            "data: [DONE]\n",
+        );
+        let events = parse_openai_events(body);
+        let finish = events
+            .iter()
+            .find_map(|e| match e {
+                Ok(LlmEvent::Finish(f)) => Some(f),
+                _ => None,
+            })
+            .expect("a finish event");
+        assert_eq!(finish.cost_usd, Some(0.0));
+    }
+
+    #[test]
+    fn a_provider_that_reports_no_cost_leaves_it_unknown() {
+        // Everything that is not OpenRouter: the local table has to answer.
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2}}\n",
+            "data: [DONE]\n",
+        );
+        let events = parse_openai_events(body);
+        let finish = events
+            .iter()
+            .find_map(|e| match e {
+                Ok(LlmEvent::Finish(f)) => Some(f),
+                _ => None,
+            })
+            .expect("a finish event");
+        assert_eq!(finish.cost_usd, None);
+    }
+
+    #[test]
     fn tool_calls_without_ids_still_dispatch() {
         // Some OpenAI-compatible servers omit `id` on tool-call deltas.
         let body = concat!(
@@ -1345,11 +1721,170 @@ mod tests {
     }
 
     #[test]
+    fn retry_after_accepts_seconds_and_fractions() {
+        assert_eq!(parse_retry_after("2"), Some(Duration::from_secs(2)));
+        assert_eq!(parse_retry_after(" 30 "), Some(Duration::from_secs(30)));
+        assert_eq!(parse_retry_after("1.5"), Some(Duration::from_millis(1500)));
+        assert_eq!(parse_retry_after("nonsense"), None);
+        // A negative value is not a wait; fall back to backoff.
+        assert_eq!(parse_retry_after("-5"), None);
+    }
+
+    #[test]
+    fn retry_after_accepts_an_http_date() {
+        // The RFC 1123 form providers actually send. Fixed epoch check first,
+        // so the conversion itself is pinned rather than only its sign.
+        assert_eq!(
+            httpdate_to_unix("Tue, 15 Nov 1994 08:12:31 GMT"),
+            Some(784_887_151)
+        );
+        assert_eq!(httpdate_to_unix("Thu, 01 Jan 1970 00:00:00 GMT"), Some(0));
+        // A date in the past is not a wait.
+        assert_eq!(httpdate_delay("Tue, 15 Nov 1994 08:12:31 GMT"), None);
+        assert_eq!(httpdate_to_unix("not a date"), None);
+    }
+
+    #[test]
+    fn a_hostile_retry_after_cannot_park_the_agent() {
+        // 24h in the header must not become a 24h sleep.
+        assert!(parse_retry_after("86400").unwrap() > MAX_BACKOFF);
+        // …because `retry_delay` clamps it to the policy ceiling.
+        assert_eq!(MAX_BACKOFF, Duration::from_secs(120));
+        assert_eq!(RetryPolicy::default().max_backoff, MAX_BACKOFF);
+    }
+
+    #[test]
+    fn jitter_decorrelates_but_stays_small() {
+        for attempt in 0..8 {
+            assert!(jitter_ms(attempt) < 250, "attempt {attempt}");
+        }
+        // Different attempts must not all land on the same offset.
+        let distinct: HashSet<u64> = (0..8).map(jitter_ms).collect();
+        assert!(distinct.len() > 1, "jitter is constant");
+    }
+
+    #[test]
+    fn a_rate_limit_notice_reads_like_a_sentence() {
+        let notice = RetryNotice {
+            attempt: 1,
+            max_attempts: 3,
+            delay_ms: 2_000,
+            status: Some(429),
+            reason: retry_reason(StatusCode::TOO_MANY_REQUESTS),
+        };
+        assert_eq!(
+            notice.render(),
+            "rate limited by the provider (429) — retrying in 2.0s (attempt 1/3)"
+        );
+    }
+
+    #[test]
+    fn retries_become_leading_stream_events() {
+        // A rate-limited turn must look rate-limited to the UI, not hung.
+        let notices = vec![RetryNotice {
+            attempt: 1,
+            max_attempts: 3,
+            delay_ms: 500,
+            status: Some(429),
+            reason: "rate limited by the provider".into(),
+        }];
+        let events: Vec<_> = retry_events(notices).collect();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], Ok(LlmEvent::Retry(_))));
+    }
+
+    #[test]
+    fn retry_events_do_not_pollute_the_aggregated_answer() {
+        let events = vec![
+            Ok(LlmEvent::Retry(RetryNotice {
+                attempt: 1,
+                max_attempts: 3,
+                delay_ms: 500,
+                status: Some(429),
+                reason: "rate limited by the provider".into(),
+            })),
+            Ok(LlmEvent::Delta("hi".into())),
+        ];
+        let response = aggregate(events, String::new());
+        assert_eq!(response.text, "hi");
+    }
+
+    #[test]
+    fn a_rate_limit_waits_far_longer_than_a_transient_error() {
+        // The reported problem: three sub-second retries after a 429 all
+        // failed, because a provider that just refused you is still refusing
+        // you 600ms later.
+        let policy = RetryPolicy::default();
+        let limited = retry_delay(0, Some(StatusCode::TOO_MANY_REQUESTS), None, policy);
+        let transient = retry_delay(0, Some(StatusCode::BAD_GATEWAY), None, policy);
+        assert!(
+            limited >= Duration::from_secs(30),
+            "a 429 must sit out a meaningful part of a rate-limit window: {limited:?}"
+        );
+        assert!(transient < Duration::from_secs(1), "{transient:?}");
+    }
+
+    #[test]
+    fn the_rate_limit_backoff_is_configurable() {
+        let policy = RetryPolicy::default().with_rate_limit_backoff(Duration::from_secs(5));
+        let delay = retry_delay(0, Some(StatusCode::TOO_MANY_REQUESTS), None, policy);
+        assert!(delay >= Duration::from_secs(5) && delay < Duration::from_secs(6));
+    }
+
+    #[test]
+    fn a_provider_supplied_retry_after_beats_the_default() {
+        // `Retry-After` is the only authoritative number in the exchange, so
+        // it wins in both directions — including when it is *shorter*.
+        let policy = RetryPolicy::default();
+        assert_eq!(parse_retry_after("2"), Some(Duration::from_secs(2)));
+        // With no header, the 429 default applies instead.
+        assert!(
+            retry_delay(0, Some(StatusCode::TOO_MANY_REQUESTS), None, policy)
+                >= policy.rate_limit_backoff
+        );
+    }
+
+    #[test]
+    fn the_rate_limit_wait_is_flat_so_the_worst_case_is_predictable() {
+        // Doubling from a 30s base turned a throttled run into nine minutes of
+        // silence. The metering window is fixed, so the wait should be too:
+        // the worst case is `max_retries x rate_limit_backoff`, no more.
+        let policy = RetryPolicy::default();
+        let waits: Vec<Duration> = (0..policy.max_retries)
+            .map(|a| retry_delay(a, Some(StatusCode::TOO_MANY_REQUESTS), None, policy))
+            .collect();
+        for w in &waits {
+            assert!(*w >= policy.rate_limit_backoff, "{w:?}");
+            // Only jitter separates them from the base.
+            assert!(
+                *w < policy.rate_limit_backoff + Duration::from_secs(1),
+                "{w:?}"
+            );
+        }
+        let total: Duration = waits.iter().sum();
+        assert!(
+            total < policy.rate_limit_backoff * policy.max_retries + Duration::from_secs(1),
+            "worst case {total:?}"
+        );
+        assert!(retry_delay(20, Some(StatusCode::TOO_MANY_REQUESTS), None, policy) <= MAX_BACKOFF);
+    }
+
+    #[test]
+    fn a_transient_error_still_backs_off_progressively() {
+        let policy = RetryPolicy::default();
+        let first = retry_delay(0, Some(StatusCode::BAD_GATEWAY), None, policy);
+        let second = retry_delay(1, Some(StatusCode::BAD_GATEWAY), None, policy);
+        assert!(second > first, "{first:?} then {second:?}");
+        assert!(retry_delay(20, Some(StatusCode::BAD_GATEWAY), None, policy) <= MAX_BACKOFF);
+    }
+
+    #[test]
     fn backoff_grows_and_stays_bounded() {
-        let first = retry_delay(0, None);
-        let second = retry_delay(1, None);
+        let policy = RetryPolicy::default();
+        let first = retry_delay(0, None, None, policy);
+        let second = retry_delay(1, None, None, policy);
         assert!(second > first);
-        assert!(retry_delay(20, None) <= Duration::from_secs(10));
+        assert!(retry_delay(20, None, None, policy) <= MAX_BACKOFF);
     }
 
     #[test]
@@ -1375,7 +1910,7 @@ mod tests {
     #[test]
     fn openai_omits_empty_tool_arrays() {
         // An empty `tools: []` is rejected by several OpenAI-compatible servers.
-        let payload = build_openai_request(&req(), "gpt-4o-mini");
+        let payload = build_openai_request(&req(), "gpt-4o-mini", false);
         assert!(payload.get("tools").is_none());
         assert!(payload["stream"].as_bool().unwrap());
         assert!(payload["stream_options"]["include_usage"]
@@ -1391,7 +1926,7 @@ mod tests {
             description: "read a file".into(),
             params_json: r#"{"type":"object"}"#.into(),
         }]);
-        let payload = build_openai_request(&r, "gpt-4o-mini");
+        let payload = build_openai_request(&r, "gpt-4o-mini", false);
         assert_eq!(payload["tools"][0]["function"]["name"], "read");
         assert_eq!(payload["tool_choice"], "auto");
     }
@@ -1399,7 +1934,7 @@ mod tests {
     #[test]
     fn anthropic_lifts_the_system_prompt_out_of_messages() {
         let payload = build_anthropic_request(&req(), "claude-sonnet-4");
-        assert_eq!(payload["system"], "you are helpful");
+        assert_eq!(payload["system"][0]["text"], "you are helpful");
         let messages = payload["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 1, "system must not remain a message");
         assert_eq!(messages[0]["role"], "user");
@@ -1569,6 +2104,54 @@ mod tests {
     }
     use super::*;
 
+    /// OpenRouter (and any cache-aware OpenAI-shaped server) must get a
+    /// `cache_control` breakpoint on the request prefix, or every turn re-pays
+    /// for the full system prompt + tools.
+    #[test]
+    fn openai_cache_control_marks_the_last_message() {
+        let payload = build_openai_request(&req(), "gpt-4o-mini", true);
+        let messages = payload["messages"].as_array().unwrap();
+        assert!(
+            messages
+                .last()
+                .unwrap()
+                .get("cache_control")
+                .is_some_and(|c| c["type"] == "ephemeral"),
+            "last message must carry the cache breakpoint: {messages:?}"
+        );
+        // A provider that ignores it must not receive the field at all.
+        let off = build_openai_request(&req(), "gpt-4o-mini", false);
+        assert!(off["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m.get("cache_control").is_none()));
+    }
+
+    /// Anthropic caches only what is explicitly marked; without the breakpoint
+    /// the large system prompt and tool schemas are re-billed every turn.
+    #[test]
+    fn anthropic_cache_control_marks_system_and_tools() {
+        let mut r = req();
+        r.tools = Box::new([domain::ToolSpec {
+            name: "read".into(),
+            description: "read a file".into(),
+            params_json: r#"{"type":"object"}"#.into(),
+        }]);
+        let payload = build_anthropic_request(&r, "claude-sonnet-4");
+        let sys = payload["system"]
+            .as_array()
+            .expect("system must be an array of blocks");
+        assert_eq!(sys[0]["type"], "text");
+        assert_eq!(sys[0]["cache_control"]["type"], "ephemeral");
+        let tools = payload["tools"].as_array().unwrap();
+        assert_eq!(
+            tools.last().unwrap()["cache_control"]["type"],
+            "ephemeral",
+            "last tool must carry the cache breakpoint"
+        );
+    }
+
     fn req() -> LlmRequest {
         LlmRequest {
             messages: Box::new([
@@ -1714,6 +2297,24 @@ data: {\"type\":\"message_stop\"}
     fn vllm_uses_base_url() {
         let v = VllmLlm::new("http://localhost:8000/v1", "key", "qwen");
         assert_eq!(v.0.endpoint(), "http://localhost:8000/v1/chat/completions");
+    }
+
+    #[test]
+    fn a_base_url_that_is_already_an_endpoint_is_not_doubled() {
+        // Regression: `base_url` copied from a curl example produced
+        // `…/v1/chat/completions/chat/completions`.
+        for given in [
+            "http://127.0.0.1:8099/v1",
+            "http://127.0.0.1:8099/v1/",
+            "http://127.0.0.1:8099/v1/chat/completions",
+            "http://127.0.0.1:8099/v1/chat/completions/",
+        ] {
+            assert_eq!(
+                chat_completions_url(given),
+                "http://127.0.0.1:8099/v1/chat/completions",
+                "{given}"
+            );
+        }
     }
 
     #[test]

@@ -1,0 +1,7 @@
+{
+  "provider": "openai-compatible",
+  "base_url": "http://127.0.0.1:8093/v1/chat/completions",
+  "model": "gpt-4o-mini",
+  "api_key_env": "ZCODE_API_KEY",
+  "max_retries": 1
+}

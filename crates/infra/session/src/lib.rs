@@ -125,10 +125,18 @@ struct SessionFile {
     messages: Vec<SerializableMessage>,
 }
 
+/// On-disk spelling of `domain::AgentMode`.
+///
+/// `Build` is the v0.1 name for what is now `Auto`; it stays in the enum so
+/// sessions written by an older binary still load, and `#[serde(alias)]`
+/// accepts either spelling on the way in.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum SerializableMode {
     Planning,
+    Editing,
+    Auto,
+    /// v0.1 spelling of `Auto`, read-only: never written by this version.
     Build,
 }
 
@@ -209,14 +217,18 @@ impl SessionFile {
 fn mode_to_serializable(mode: AgentMode) -> SerializableMode {
     match mode {
         AgentMode::Planning => SerializableMode::Planning,
-        AgentMode::Build => SerializableMode::Build,
+        AgentMode::Editing => SerializableMode::Editing,
+        AgentMode::Auto => SerializableMode::Auto,
     }
 }
 
 fn mode_from_serializable(mode: SerializableMode) -> AgentMode {
     match mode {
         SerializableMode::Planning => AgentMode::Planning,
-        SerializableMode::Build => AgentMode::Build,
+        SerializableMode::Editing => AgentMode::Editing,
+        // A session recorded before `editing` existed used `build` for the
+        // fully autonomous mode.
+        SerializableMode::Auto | SerializableMode::Build => AgentMode::Auto,
     }
 }
 
@@ -542,7 +554,7 @@ mod tests {
             id: id.to_string(),
             created_at: now.clone(),
             model: "gpt-4o-mini".to_string(),
-            mode: AgentMode::Build,
+            mode: AgentMode::Auto,
             last_message_at: now,
             step_count: steps,
             messages: Box::new([

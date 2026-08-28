@@ -1,0 +1,7 @@
+{
+  "provider": "openai-compatible",
+  "base_url": "http://127.0.0.1:8099/v1/chat/completions",
+  "model": "gpt-4o-mini",
+  "max_retries": 3,
+  "shell_allowed": []
+}

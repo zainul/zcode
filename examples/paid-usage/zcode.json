@@ -1,0 +1,10 @@
+{
+  "provider": "openrouter",
+  "model": "z-ai/glm-5.3-flash",
+  "base_url": "http://127.0.0.1:8162/v1/chat/completions",
+  "api_key_env": "ZCODE_API_KEY",
+  "max_retries": 1,
+  "shell_allowed": [".*"],
+  "lsp": { "defaults": false },
+  "rtk": { "enabled": false }
+}

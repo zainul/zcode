@@ -67,10 +67,18 @@ it for slow or long-form models:
 
 Working as intended. Add a pattern to `shell_allowed` if the command is one you
 want to permit — remembering that patterns are anchored, every `;`/`|` segment
-is checked, and `` ` ``, `$(`, `>`, `<`, `&` are refused outright.
+is checked, and `` ` ``, `$(`, `>`, `<`, `&` are refused outright *under a
+narrow allowlist*.
 
 ```json
 { "shell_allowed": ["cargo (test|build).*", "git status"] }
+```
+
+To permit everything the built-in denylist does not refuse — chaining, pipes
+and redirection included — set the allowlist open:
+
+```json
+{ "shell_allowed": [".*"] }
 ```
 
 **`hunk 2 does not match src/lib.rs — re-read the file and rebuild the diff`**
@@ -169,6 +177,226 @@ $ jq . .zcode/reports/<file>.json
 Include the `zcode version` line, the config with secrets removed, the exact
 command, the one-line error, and — if you can share it — the session file from
 `.zcode/sessions/`.
+
+## `command refused: it matches zcode's built-in denylist`
+
+Not the allowlist — a separate, always-on list of irreversible commands
+(`sudo`, `dd … of=`, `git push --force`, `npm publish`, `curl … | sh`, …).
+Widening `shell_allowed` will not help, and the message says so. If you
+genuinely need the command, run it yourself.
+
+See [chapter 7](07-tools-and-safety.md#2-the-denylist--which-shell_allowed-cannot-override)
+for the full list.
+
+## ``command refused: `rm -r` must name a specific path``
+
+Recursive deletes are **not** banned — `rm -rf node_modules` and
+`rm -rf ./target` run fine. What is refused is a target whose extent cannot be
+read from the command:
+
+```
+command refused: `rm -r` must name a specific path, and "$BUILD_DIR" does not —
+globs, `~`, `..`, `$VAR` and absolute paths outside /tmp are refused because
+what they delete cannot be read from the command: rm -rf $BUILD_DIR
+  hint: name the directory itself, e.g. `rm -rf node_modules` or `rm -rf ./target`
+```
+
+The message names the offending word. Replace it with the literal path:
+`rm -rf build` rather than `rm -rf $BUILD_DIR`, `rm -rf build/out` rather than
+`rm -rf build/*`.
+
+The full table of what passes and what does not is in
+[chapter 7](07-tools-and-safety.md#recursive-deletes-are-judged-by-their-target).
+
+## `command blocked by the shell allowlist`
+
+The command did not match any `shell_allowed` pattern. The error names the
+program and suggests a pattern:
+
+```
+  hint: no pattern in `shell_allowed` matches `go`; add one, e.g. "go( .*)?"
+```
+
+If the hint instead mentions metacharacters, the command contains `$(`, a
+backtick, `>`, `<`, or `&&`. Under a narrow allowlist only `2>&1` and
+`>/dev/null` are permitted, so either rewrite the command without the rest or
+open the allowlist with `"shell_allowed": [".*"]`, which switches the structure
+check off as well. The denylist still applies either way.
+
+If `"shell_allowed": [".*"]` is already set and a command with `&&` or a pipe is
+*still* refused, you are on a build from before zcode 0.2 — that was a bug: the
+structure check ran ahead of the allowlist and so refused commands an open
+allowlist had already permitted.
+
+Note that the shipped default already covers Go, Rust, Node, Python, and the
+common build tools — if `go build` is blocked, something in your config
+*replaced* the default list.
+
+## The agent pauses for many seconds, then continues
+
+It was rate limited. You will see:
+
+```
+↻ rate limited by the provider (429) — retrying in 2.0s (attempt 1/3)
+```
+
+zcode honours the provider's `Retry-After` header when it sends one. Without
+one, a 429 waits a flat `rate_limit_backoff_ms` (30s) — the metering window is
+fixed, so doubling would only lengthen the silence — while a transient 5xx
+starts at 500ms and doubles. Both carry jitter and are capped at 120s.
+`max_retries` (default 3) sets how many times, so the worst case for a rate
+limit is 90 seconds. Raising it trades latency for a better chance of
+completing; lowering it fails faster.
+
+## The cost shows `n/a`
+
+There is no rate in the price table for your model. Add one under `pricing` —
+see [chapter 12](12-configuration-reference.md#cost-estimates). `n/a` means
+"unknown", never "free"; a model known to be free shows `$0.00`.
+
+## No language server started
+
+`zcode config` tells you what it looked for:
+
+```
+  lsp servers            0  (project looks like go)
+    (none — no language server for this project is installed)
+```
+
+Install the server for the language it detected. If it detected nothing, there
+is no `go.mod`, `Cargo.toml`, `tsconfig.json`, or `package.json` at
+`working_dir` — check that `working_dir` points where you expect.
+
+## `openai-compatible request failed … /chat/completions/chat/completions`
+
+Older versions appended `/chat/completions` to `base_url` unconditionally, so a
+full endpoint became a doubled path. Current versions accept either spelling.
+Run `zcode version` — if it predates this fix, update with
+`./scripts/update.sh`.
+
+## `unknown provider` on startup
+
+The `provider` key names neither a `providers` entry nor a built-in kind. The
+error lists both:
+
+```
+zcode: unknown provider `nope` — configured: free, fast, local, gateway;
+built in: openai, anthropic, openrouter, deepseek, ollama, vllm, openai-compatible
+```
+
+If you meant a profile, check the spelling of its `name` in the `providers`
+array. `zcode config` prints the whole list with the active one marked. See
+[chapter 12](12-configuration-reference.md#multiple-providers).
+
+## The wrong model answered after switching provider
+
+A declared `providers` entry is **complete in itself**: what it does not state
+comes from the defaults for its `kind`, not from a top-level `model`. So a
+profile with no `model` uses its kind's default, even if the file has a
+top-level `model` line — deliberately, because a top-level key was written for
+whichever provider the config had at the time.
+
+Put the model in the profile:
+
+```json
+{ "name": "gateway", "kind": "openai-compatible", "model": "internal-1",
+  "base_url": "https://gateway.internal/v1/chat/completions" }
+```
+
+## Dragging does not select text
+
+zcode captures the mouse so the wheel can scroll, which means the terminal
+stops doing its own selection — zcode does it instead. Drag inside the
+**conversation** pane and it highlights; release copies.
+
+If you want the terminal's own selection back (to select across the border, or
+into the prompt), hold **Shift** while dragging — **Option** on macOS Terminal.
+
+## `could not copy` after selecting
+
+zcode says which mechanism it used, so this names the failure. It tries
+`pbcopy`, `wl-copy`, `xclip`, `xsel` and `clip.exe` first, then falls back to
+OSC 52, which asks the terminal to set the clipboard.
+
+| Message | Meaning |
+|---------|---------|
+| `copied (pbcopy)` and similar | a real clipboard tool took it — this is exact |
+| `copied (terminal clipboard)` | OSC 52 was written; whether it worked is up to your terminal |
+| `selection is too large for the terminal clipboard` | over ~75 KB with no local tool available; select less |
+
+On Linux without `wl-copy`/`xclip`/`xsel` installed, and in a terminal that
+ignores OSC 52, nothing can reach the clipboard. Install one of those tools.
+
+Over SSH, only OSC 52 can work, and tmux and screen need it enabled explicitly.
+
+## Shell output looks different from my own terminal
+
+That is [rtk](07-tools-and-safety.md#token-optimised-shell-output-rtk),
+filtering command output before it reaches the model — `ls -la` comes back as
+61 bytes instead of 438. It is on by default whenever rtk is installed.
+
+`zcode config` says whether it is active:
+
+```
+rtk                    0.36.0 — shell output is token-optimised  [/opt/homebrew/bin/rtk]
+```
+
+To turn it off for one run, `ZCODE_RTK=0 zcode run "…"`; permanently,
+`{ "rtk": { "enabled": false } }`.
+
+## zcode installed rtk and I did not ask it to
+
+It did, and it says so before it starts. `rtk.auto_install` is on by default,
+because the point of rtk is a smaller bill and an optimisation nobody turns on
+is not an optimisation.
+
+It only ever runs **Homebrew**, and only when Homebrew is already installed —
+it installs a package, never a package manager, and never downloads a script to
+run. To stop it:
+
+```json
+{ "rtk": { "auto_install": false } }
+```
+
+or `ZCODE_RTK_AUTO_INSTALL=0`. rtk is still used if it is already present;
+`"enabled": false` is what stops that too.
+
+## `could not install rtk automatically`
+
+zcode carries on without it — rtk makes output smaller, its absence is not an
+error. The common causes:
+
+| Message | Fix |
+|---------|-----|
+| `no supported package manager` | `brew install rtk`, or install from [the repo](https://github.com/rtk-ai/rtk) |
+| `brew failed: …` | run `brew install rtk` yourself to see the full output |
+| `a previous install failed within the last day` | fix the cause, then `brew install rtk` — or delete `~/.config/zcode/rtk-install-failed` to retry sooner |
+
+A failed install is recorded machine-wide and not retried for 24 hours, so a
+machine with no network does not pay the package manager's failure cost on
+every single run.
+
+## `failed printing to stdout: Broken pipe`
+
+Fixed. `zcode … | head` used to panic: Rust ignores `SIGPIPE`, so writing to a
+closed pipe returned an error and `println!` turned it into a panic. If the
+agent ran such a pipeline through the shell tool, the panic text landed in the
+tool result on top of the real output.
+
+zcode now exits quietly with status 0 when its reader goes away, as every other
+Unix tool does. If you still see this, you are on a build from before zcode
+0.2.
+
+## A `/command` was sent to the model instead of running
+
+Only the commands in `/help` are recognised. Anything else — including a path
+like `/usr/local/bin` — is treated as a prompt, deliberately. A near-miss is
+caught:
+
+```
+unknown command `/exitt` — /help lists them all
+```
+
 
 ---
 

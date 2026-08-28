@@ -16,6 +16,7 @@
 pub mod guard;
 pub mod native;
 pub mod patch;
+pub mod rtk;
 pub mod skills;
 
 use std::path::{Path, PathBuf};
@@ -25,14 +26,68 @@ use domain::{
     ToolRegistryPort, ToolResult, ToolSpec,
 };
 
-pub use guard::{GuardedShell, ShellToolError};
+pub use guard::{allowlist_is_unrestricted, builtin_deny_rule_count, GuardedShell, ShellToolError};
 pub use native::{
     ApplyPatchTool, ListDirTool, ReadTool, ShellTool, SkillTool, StrReplaceTool, WriteTool,
     TOOL_APPLY_PATCH, TOOL_LIST_DIR, TOOL_READ, TOOL_SHELL, TOOL_SKILL, TOOL_STR_REPLACE,
     TOOL_WRITE,
 };
 pub use patch::{apply_patch, parse_unified_diff, PatchError};
+pub use rtk::Rtk;
 pub use skills::{SkillEntry, SkillIndex};
+
+/// Find rtk, installing it first if that is allowed and it is missing.
+///
+/// Every failure here is a `None` and a log line: rtk makes output smaller,
+/// and a machine that cannot have it must run exactly as it did before.
+fn resolve_rtk(cfg: &infra_config::RtkConfig, notes: &mut Vec<String>) -> Option<rtk::Rtk> {
+    if !cfg.enabled {
+        return None;
+    }
+    if let Some(found) = rtk::Rtk::detect(cfg.path.as_deref()) {
+        // Nothing is said on the happy path. A line on every launch about an
+        // optimisation that always works is noise; `zcode config` is where you
+        // look to confirm it.
+        log::info!(
+            "rtk {} active — shell output is token-optimised ({})",
+            found.version(),
+            found.path().display()
+        );
+        return Some(found);
+    }
+    if cfg.path.is_some() {
+        notes.push("rtk.path does not point at a working rtk; continuing without it".to_string());
+        return None;
+    }
+    if !cfg.auto_install {
+        log::debug!(
+            "rtk not found and rtk.auto_install is off; {}",
+            rtk::MANUAL_INSTALL_HINT
+        );
+        return None;
+    }
+    // Said *before* the package manager runs, not after. `brew install` can
+    // take a minute, and a first run that stalls with no explanation reads as
+    // a hang rather than as work.
+    if rtk::install_will_be_attempted() {
+        log::warn!("rtk is not installed — installing it now to cut shell output; this runs once");
+    }
+    match rtk::install() {
+        Ok(installed) => {
+            notes.push(format!(
+                "installed rtk {} — shell output is now token-optimised",
+                installed.version()
+            ));
+            Some(installed)
+        }
+        Err(e) => {
+            notes.push(format!(
+                "could not install rtk automatically ({e}); continuing without it"
+            ));
+            None
+        }
+    }
+}
 
 pub const LSP_GOTO_DEFINITION: &str = "lsp__goto_definition";
 pub const LSP_FIND_REFERENCES: &str = "lsp__find_references";
@@ -150,7 +205,15 @@ impl ToolRegistry {
     /// a warning (FR-MCP-05); the agent still runs.
     pub fn from_config(cfg: &infra_config::Config) -> Result<Self, ShellToolError> {
         let root = cfg.working_dir.clone();
-        let shell = GuardedShell::new(infra_shell::StdShell::new(), &cfg.shell_allowed)?;
+        // Collected rather than logged directly so they reach the TUI through
+        // the same channel as an MCP server that would not start.
+        let mut rtk_notes: Vec<String> = Vec::new();
+        let shell = GuardedShell::with_denylist(
+            infra_shell::StdShell::new(),
+            &cfg.shell_allowed,
+            &cfg.shell_denied,
+        )?
+        .with_rtk(resolve_rtk(&cfg.rtk, &mut rtk_notes));
 
         // `mut` is only used by the feature-gated MCP/LSP blocks below.
         #[allow(unused_mut)]
@@ -165,6 +228,10 @@ impl ToolRegistry {
                 shell,
                 cfg.timeout_ms,
             )));
+
+        for note in rtk_notes {
+            registry.warn(note);
+        }
 
         // Advertising a skill tool with nothing to load wastes prompt budget
         // and invites the model to guess names.
@@ -188,10 +255,12 @@ impl ToolRegistry {
             }
         }
 
-        // One language server per run: the first configured server that starts
-        // wins. Multi-server routing by file extension is a v0.3 concern.
+        // One language server per run: the first server that starts wins, and
+        // `effective_lsp_servers` has already sorted the project's own
+        // language to the front. Multi-server routing by file extension is a
+        // v0.3 concern.
         #[cfg(feature = "lsp")]
-        for server in cfg.lsp_servers.iter() {
+        for server in cfg.effective_lsp_servers().iter() {
             match infra_lsp::LspClient::start_with_timeout(
                 &server.command,
                 &server.args,

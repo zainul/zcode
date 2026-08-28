@@ -12,12 +12,14 @@ Arguments:
   <PROMPT>  The task, in natural language
 
 Options:
-      --image <FILE>       Attach an image for vision-capable models. Repeatable
-      --mode <MODE>        planning = read-only, proposes changes; build = edits directly
-      --session <SESSION>  Resume an existing session id
-      --json               Stream one JSON object per event to stdout (JSONL)
-      --config <FILE>      Config file to use instead of ./zcode.json or ./zcode.toml
-      --timeout <SECS>     Give up after this many seconds and checkpoint the session
+      --image <FILE>          Attach an image for vision-capable models. Repeatable
+      --mode <MODE>           planning (read-only) | editing (edits files) | auto (edits and runs shell)
+      --provider <NAME>       Which provider to use: a name from the `providers` array, or a built-in kind
+      --session <SESSION>     Resume an existing session id
+      --json                  Stream one JSON object per event to stdout (JSONL)
+      --json-format <FORMAT>  Event schema for `--json`: `zcode` (default) or `opencode`
+      --config <FILE>         Config file to use instead of ./zcode.json or ./zcode.toml
+      --timeout <SECS>        Give up after this many seconds and checkpoint the session
 ```
 
 ## Streaming
@@ -49,6 +51,12 @@ $ zcode run --session 01a03bd4-8313-7b32-9809-7d9984359dda "now update the docs"
 
 # A different config, e.g. a cheaper model for a bulk job
 $ zcode run --config ci/zcode.cheap.json "regenerate the fixture files"
+
+# A different provider for one run — model, key variable and URL move together
+$ zcode run --provider local "summarise this diff"
+
+# Machine-readable in opencode's schema, for a consumer written against it
+$ zcode run --json --json-format opencode "list the crates"
 
 # Bound the wall clock
 $ zcode run --timeout 120 "refactor the parser module"

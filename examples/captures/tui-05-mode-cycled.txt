@@ -1,0 +1,38 @@
+### 05-mode-cycled
+Shift-Tab cycles planning → editing
+
+┌────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│┌ conversation ────────────────────────────────────────────────────────────────────────────────────┐│
+││    Enter                            send                                                         ││
+││    Alt-Enter                        newline without sending                                      ││
+││    Esc                              dismiss a selection, cancel the turn, or clear the prompt    ││
+││    Ctrl-C                           cancel if busy, otherwise quit                               ││
+││    Ctrl-A / Ctrl-E                  start / end of line                                          ││
+││    Ctrl-W                           delete the previous word                                     ││
+││    Ctrl-U / Ctrl-K                  delete to start / end of line                                ││
+││    PageUp / PageDown                scroll the conversation (also the mouse wheel)               ││
+││    Ctrl-Up / Ctrl-Down              scroll one line                                              ││
+││    Drag                             select; releasing copies to the clipboard                    ││
+││    Click a `tools used` header      fold or unfold that run                                      ││
+││    Ctrl-T                           fold or unfold every run of tool calls                       ││
+││    Shift-Tab                        cycle mode                                                   ││
+││    Ctrl-Y                           copy the last answer to the clipboard                        ││
+││    Up / Down                        recall the previous / next sent prompt                       ││
+││                                                                                                  ││
+││    drag to select and copy · wheel scrolls · Shift-drag for the terminal's own selection         ││
+││                                                                                                  ││
+││11:24:27  zcode                                                                                   ││
+││  mode: auto — edits files and runs shell                                                         ││
+││      planning  read-only; proposes changes                                                       ││
+││      editing   edits files; no shell                                                             ││
+││    ▸ auto      edits files and runs shell                                                        ││
+││    (/mode <name>, or Shift-Tab to cycle)                                                         ││
+││  · mode: planning — read-only; proposes changes                                                  ││
+││  · mode: editing — edits files; no shell                                                         ││
+│└──────────────────────────────────────────────────────────────────────────────────────────────────┘│
+│┌ Enter sends · Alt-Enter newline · /help ─────────────────────────────────────────────────────────┐│
+││>                                                                                                 ││
+│└──────────────────────────────────────────────────────────────────────────────────────────────────┘│
+│ ● ready  │  mode editing  │  openrouter/poolside/laguna-s-2.1:free  │  0 in / 0 out  │  $0.00      │
+└────────────────────────────────────────────────────────────────────────────────────────────────────┘
+cursor: row 29, col 3, visible=True

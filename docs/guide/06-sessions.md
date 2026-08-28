@@ -88,13 +88,18 @@ with `zcode run --session <id>`.
 
 ## The file format
 
+Sessions written before `editing` existed record `"mode": "build"`. They still
+load — `build` reads as `auto` — and the next checkpoint writes the current
+spelling. (`session export` copies the file verbatim, so an old export keeps
+the old spelling; that is what makes it a faithful copy.)
+
 ```json
 {
   "version": 1,
   "id": "01a03bd4-8313-7b32-9809-7d9984359dda",
   "created_at": "2026-08-26T02:09:38Z",
   "model": "demo-model",
-  "mode": "build",
+  "mode": "auto",
   "last_message_at": "2026-08-26T02:09:38Z",
   "step_count": 2,
   "messages": [

@@ -8,3 +8,12 @@ zcode.json.local
 *.profraw
 /logs/
 node.json
+
+# Runtime state: sessions, reports, and skills zcode writes as it runs. This
+# repo is also a working directory for zcode itself, so the root has one too.
+/.zcode/
+
+# Acceptance-harness scratch
+examples/**/.zcode/
+examples/__pycache__/
+examples/demo-go/demo

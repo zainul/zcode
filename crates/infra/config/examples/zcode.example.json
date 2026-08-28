@@ -3,29 +3,50 @@
     "Example zcode configuration in JSON. Copy to ./zcode.json and edit.",
     "`zcode.json` is preferred over `zcode.toml` when both exist.",
     "Secrets are NEVER stored here: `api_key_env` names the environment",
-    "variable the key is read from at startup."
+    "variable the key is read from at startup.",
+    "Nothing below is required — every key falls back to a working default.",
+    "See docs/guide/12-configuration-reference.md for all of them."
   ],
 
-  "provider": "openrouter",
-  "model": "anthropic/claude-sonnet-4.5",
-  "api_key_env": "ZCODE_OPENROUTER_API_KEY",
+  "provider": "fast",
+  "providers": [
+    {
+      "name": "fast",
+      "kind": "openrouter",
+      "model": "anthropic/claude-sonnet-4.5",
+      "api_key_env": "ZCODE_OPENROUTER_API_KEY"
+    },
+    {
+      "name": "local",
+      "kind": "ollama",
+      "model": "qwen2.5-coder"
+    }
+  ],
 
+  "mode": "auto",
   "timeout_ms": 120000,
   "max_turns": 20,
   "max_tokens": 16384,
   "max_tool_output_chars": 16000,
-  "mode": "build",
+
+  "max_retries": 3,
+  "rate_limit_backoff_ms": 30000,
 
   "shell_allowed": [
-    "echo .*",
-    "ls .*",
+    "echo( .*)?",
+    "ls( .*)?",
     "cat .*",
-    "git status",
-    "git diff.*",
-    "cargo (build|test|check|fmt|clippy).*"
+    "git (status|diff|log)( .*)?",
+    "cargo (build|test|check|fmt|clippy)( .*)?"
   ],
+  "shell_denied": [],
 
   "skills_dir": ".zcode/skills",
+
+  "rtk": {
+    "enabled": true,
+    "auto_install": true
+  },
 
   "mcp": {
     "servers": [
@@ -38,6 +59,7 @@
   },
 
   "lsp": {
+    "defaults": true,
     "servers": [
       { "language": "rust", "command": "rust-analyzer", "args": [] }
     ]
