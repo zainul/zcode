@@ -75,6 +75,10 @@ pub enum Provider {
     Ollama,
     Vllm,
     OpenaiCompatible,
+    /// LM Studio's local server. OpenAI-compatible on the wire; it is a
+    /// separate kind only so its default endpoint and keyless-ness come for
+    /// free, the way `ollama` does.
+    LmStudio,
 }
 
 impl Provider {
@@ -87,6 +91,7 @@ impl Provider {
             Self::Ollama => "ollama",
             Self::Vllm => "vllm",
             Self::OpenaiCompatible => "openai-compatible",
+            Self::LmStudio => "lmstudio",
         }
     }
 
@@ -100,7 +105,7 @@ impl Provider {
             Self::Openrouter => "ZCODE_OPENROUTER_API_KEY",
             Self::Deepseek => "ZCODE_DEEPSEEK_API_KEY",
             Self::Ollama => "ZCODE_OLLAMA_API_KEY",
-            Self::Vllm | Self::OpenaiCompatible => "ZCODE_API_KEY",
+            Self::Vllm | Self::OpenaiCompatible | Self::LmStudio => "ZCODE_API_KEY",
         }
     }
 
@@ -117,13 +122,18 @@ impl Provider {
             Self::Ollama => "llama3.2",
             // Self-hosted servers usually expose a single model under a name
             // only the operator knows, so there is nothing sensible to guess.
-            Self::Vllm | Self::OpenaiCompatible => "",
+            // Self-hosted servers usually expose whatever the operator
+            // loaded, under a name only they know.
+            Self::Vllm | Self::OpenaiCompatible | Self::LmStudio => "",
         }
     }
 
     /// Local providers need no credential.
     pub fn requires_api_key(&self) -> bool {
-        !matches!(self, Self::Ollama | Self::Vllm | Self::OpenaiCompatible)
+        !matches!(
+            self,
+            Self::Ollama | Self::Vllm | Self::OpenaiCompatible | Self::LmStudio
+        )
     }
 
     pub fn default_endpoint(&self) -> Option<&'static str> {
@@ -133,6 +143,8 @@ impl Provider {
             Self::Openrouter => Some("https://openrouter.ai/api/v1/chat/completions"),
             Self::Deepseek => Some("https://api.deepseek.com/chat/completions"),
             Self::Ollama => Some("http://localhost:11434/api/chat"),
+            // LM Studio's server listens here out of the box.
+            Self::LmStudio => Some("http://localhost:1234/v1/chat/completions"),
             Self::Vllm | Self::OpenaiCompatible => None,
         }
     }
@@ -148,6 +160,7 @@ pub const BUILTIN_PROVIDERS: &[&str] = &[
     "ollama",
     "vllm",
     "openai-compatible",
+    "lmstudio",
 ];
 
 impl std::str::FromStr for Provider {
@@ -162,6 +175,7 @@ impl std::str::FromStr for Provider {
             "ollama" => Ok(Self::Ollama),
             "vllm" => Ok(Self::Vllm),
             "openai-compatible" => Ok(Self::OpenaiCompatible),
+            "lmstudio" | "lm-studio" | "lm_studio" => Ok(Self::LmStudio),
             other => Err(format!("unknown provider: {other}")),
         }
     }
@@ -342,6 +356,13 @@ pub struct Config {
     /// Every configured endpoint, in declaration order, merged across layers
     /// by name. Empty when the config never mentions `providers`.
     pub providers: Box<[ProviderProfile]>,
+    /// Entries that could not be understood, as `(name, reason)`.
+    ///
+    /// Kept rather than made fatal: one mistyped `kind` used to stop the whole
+    /// config loading, so `zcode config` — the command you reach for to *find*
+    /// the mistake — failed too, and every other provider went with it. A bad
+    /// entry is now an error only when it is the one selected.
+    pub invalid_providers: Vec<(String, String)>,
     /// What the *top level* of the config asked for, kept apart from the
     /// resolved values so [`Config::select_provider`] can switch endpoints
     /// without losing it — it is the fallback for a profile that is silent.
@@ -408,6 +429,7 @@ impl Default for Config {
             provider: Provider::Openai,
             provider_name: Provider::Openai.as_str().to_string(),
             providers: Box::new([]),
+            invalid_providers: Vec::new(),
             top_level: ProviderSettings::default(),
             model: DEFAULT_MODEL.to_string(),
             api_key_env: String::from("ZCODE_OPENAI_API_KEY"),
@@ -458,6 +480,14 @@ impl Config {
         let (profile, declared) = match self.providers.iter().find(|p| p.name == name) {
             Some(found) => (found.clone(), true),
             None => {
+                // Selected an entry that failed to parse: say what is wrong
+                // with it rather than claiming it does not exist.
+                if let Some((_, reason)) = self.invalid_providers.iter().find(|(n, _)| n == name) {
+                    return Err(ConfigError::InvalidProviderEntry {
+                        name: name.to_string(),
+                        reason: reason.clone(),
+                    });
+                }
                 let kind = name.parse::<Provider>().map_err(|_| {
                     if self.providers.is_empty() {
                         ConfigError::UnknownProvider(name.to_string())
@@ -662,6 +692,8 @@ pub enum ConfigError {
          say which provider it is"
     )]
     ProviderEntryUnnamed,
+    #[error("provider `{name}` is configured but unusable: {reason}")]
+    InvalidProviderEntry { name: String, reason: String },
 }
 
 /// Intermediate deserialization target so unknown/extra keys in the file are
@@ -731,7 +763,15 @@ struct RtkSection {
 /// `{ "name": "cheap", "kind": "openrouter", … }` both work. `provider` is
 /// accepted as a spelling of `kind` because that is the word the top level
 /// uses and people reach for it here too.
+/// Unknown keys are an error here, unlike everywhere else in the file.
+///
+/// TOML puts every bare key after `[[providers]]` *inside* that entry, so a
+/// `timeout_ms = 120000` written below the table array silently becomes a
+/// field of the last provider and is then dropped. Refusing what a profile
+/// cannot use turns a setting that quietly did nothing into a message naming
+/// the line.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ProviderFile {
     #[serde(default)]
     name: Option<String>,
@@ -746,6 +786,14 @@ struct ProviderFile {
 }
 
 impl ProviderFile {
+    /// What to call this entry in a diagnostic, before it is known to be valid.
+    fn label(&self) -> String {
+        self.name
+            .clone()
+            .or_else(|| self.kind.clone())
+            .unwrap_or_else(|| "(unnamed)".to_string())
+    }
+
     fn into_profile(self) -> Result<ProviderProfile, ConfigError> {
         // Either field names the other when only one is given; a profile with
         // neither cannot say what it talks to, so it is an error rather than
@@ -946,6 +994,7 @@ impl Loader {
         // They are collected here and resolved once, at the end.
         let mut top_level = ProviderSettings::default();
         let mut profiles: Vec<ProviderProfile> = Vec::new();
+        let mut invalid: Vec<(String, String)> = Vec::new();
         let mut selected: Option<String> = None;
         let mut working_dir_set = false;
 
@@ -968,10 +1017,21 @@ impl Loader {
                 // project only has to say which of them it wants — while still
                 // being able to redefine one it disagrees with.
                 for entry in entries {
-                    let profile = entry.into_profile()?;
-                    match profiles.iter_mut().find(|p| p.name == profile.name) {
-                        Some(existing) => *existing = profile,
-                        None => profiles.push(profile),
+                    let label = entry.label();
+                    match entry.into_profile() {
+                        Ok(profile) => {
+                            invalid.retain(|(name, _)| *name != profile.name);
+                            match profiles.iter_mut().find(|p| p.name == profile.name) {
+                                Some(existing) => *existing = profile,
+                                None => profiles.push(profile),
+                            }
+                        }
+                        // Recorded, not fatal — see `Config::invalid_providers`.
+                        Err(reason) => {
+                            profiles.retain(|p| p.name != label);
+                            invalid.retain(|(name, _)| *name != label);
+                            invalid.push((label, reason.to_string()));
+                        }
                     }
                 }
             }
@@ -1152,6 +1212,7 @@ impl Loader {
         config.skills_dir = expand_tilde(config.skills_dir);
 
         config.providers = profiles.into_boxed_slice();
+        config.invalid_providers = invalid;
         config.top_level = top_level;
         // Nothing named a provider, so keep the default kind but still run it
         // through the same resolution — a profile may be declared for it.
@@ -1282,6 +1343,19 @@ mod tests {
 
     fn env_guard() -> std::sync::MutexGuard<'static, ()> {
         ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Point the user-config layer at an empty directory.
+    ///
+    /// `discover_from` reads `~/.config/zcode/`, so without this a unit test
+    /// depends on whatever the developer happens to have configured — and
+    /// fails for reasons that have nothing to do with the code. Callers must
+    /// already hold `env_guard`, since this moves process-global state.
+    #[must_use]
+    fn isolated_user_config() -> tempfile::TempDir {
+        let empty = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", empty.path());
+        empty
     }
 
     fn write_config(dir: &tempfile::TempDir, toml_content: &str) -> PathBuf {
@@ -1523,13 +1597,136 @@ kind = "ollama"
     }
 
     #[test]
+    fn a_top_level_key_written_under_a_provider_table_is_reported() {
+        // The TOML footgun: everything after `[[providers]]` belongs to that
+        // entry. Silently ignoring it means the setting appears to be there
+        // and does nothing, which is the worst of both.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(
+            &dir,
+            "provider = 'x'\n[[providers]]\nname = 'x'\nkind = 'ollama'\ntimeout_ms = 120000\n",
+        );
+        let err = Loader::new(&path).load().unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("timeout_ms"), "{message}");
+    }
+
+    #[test]
+    fn lm_studio_is_a_built_in_kind() {
+        // OpenAI-compatible on the wire, but with its own default endpoint and
+        // no key, so `{ "kind": "lmstudio" }` is enough to point at a local one.
+        let kind: Provider = "lmstudio".parse().unwrap();
+        assert_eq!(kind, Provider::LmStudio);
+        assert!(!kind.requires_api_key());
+        assert_eq!(
+            kind.default_endpoint(),
+            Some("http://localhost:1234/v1/chat/completions")
+        );
+        // The spellings people reach for.
+        assert_eq!("lm-studio".parse::<Provider>().unwrap(), Provider::LmStudio);
+        assert_eq!("lm_studio".parse::<Provider>().unwrap(), Provider::LmStudio);
+    }
+
+    #[test]
+    fn one_unusable_entry_does_not_take_the_whole_config_with_it() {
+        // The reported breakage: a single mistyped `kind` stopped the config
+        // loading at all, so `zcode config` — the command you use to find the
+        // mistake — failed too, and every other provider went with it.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Loader::new(&write_config(
+            &dir,
+            r#"
+provider = "good"
+
+[[providers]]
+name = "good"
+kind = "openrouter"
+
+[[providers]]
+name = "typo"
+kind = "not-a-provider"
+"#,
+        ))
+        .load()
+        .expect("the config still loads");
+
+        assert_eq!(
+            cfg.provider,
+            Provider::Openrouter,
+            "the good one still works"
+        );
+        assert_eq!(cfg.provider_names(), ["good"], "the bad one is not offered");
+        assert_eq!(cfg.invalid_providers.len(), 1);
+        assert_eq!(cfg.invalid_providers[0].0, "typo");
+        assert!(
+            cfg.invalid_providers[0].1.contains("not-a-provider"),
+            "{:?}",
+            cfg.invalid_providers[0].1
+        );
+    }
+
+    #[test]
+    fn selecting_an_unusable_entry_says_what_is_wrong_with_it() {
+        // "unknown provider `typo`" would be a lie: it is known, and broken.
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Loader::new(&write_config(
+            &dir,
+            "provider = 'good'\n[[providers]]\nname = 'good'\nkind = 'ollama'\n\
+             [[providers]]\nname = 'typo'\nkind = 'nope'\n",
+        ))
+        .load()
+        .unwrap();
+
+        let err = cfg.select_provider("typo").unwrap_err();
+        assert!(
+            matches!(err, ConfigError::InvalidProviderEntry { .. }),
+            "{err:?}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("typo") && message.contains("nope"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_later_layer_can_repair_a_broken_entry() {
+        // A machine-wide typo must be fixable from the project file, not just
+        // reported at it.
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Loader::new(&write_config(
+            &dir,
+            "provider = 'x'\n[[providers]]\nname = 'x'\nkind = 'nope'\n",
+        ))
+        .load()
+        .unwrap_err();
+        let _ = &mut cfg; // the selected entry is broken, so this one *is* fatal
+
+        let dir2 = tempfile::tempdir().unwrap();
+        let good = Loader::new(&write_config(
+            &dir2,
+            "provider = 'x'\n[[providers]]\nname = 'x'\nkind = 'lmstudio'\n",
+        ))
+        .load()
+        .unwrap();
+        assert_eq!(good.provider, Provider::LmStudio);
+    }
+
+    #[test]
     fn a_provider_entry_must_say_what_it_is() {
+        // Neither `name` nor `kind`, so it cannot say what it talks to. Like
+        // any other unusable entry it is recorded and skipped rather than
+        // taking the config down — it is not the one selected.
         let dir = tempfile::tempdir().unwrap();
         let path = write_config(&dir, "[[providers]]\nmodel = 'x'\n");
-        assert!(matches!(
-            Loader::new(&path).load(),
-            Err(ConfigError::ProviderEntryUnnamed)
-        ));
+        let cfg = Loader::new(&path).load().unwrap();
+        assert_eq!(cfg.invalid_providers.len(), 1);
+        assert_eq!(cfg.invalid_providers[0].0, "(unnamed)");
+        assert!(
+            cfg.invalid_providers[0].1.contains("name"),
+            "{:?}",
+            cfg.invalid_providers[0].1
+        );
     }
 
     #[test]
@@ -1803,6 +2000,7 @@ model = "gpt-3.5-turbo"
     #[test]
     fn project_config_is_found_from_a_subdirectory() {
         let _guard = env_guard();
+        let _home = isolated_user_config();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         fs::write(
@@ -1824,6 +2022,7 @@ model = "gpt-3.5-turbo"
     #[test]
     fn working_dir_anchors_to_the_project_root() {
         let _guard = env_guard();
+        let _home = isolated_user_config();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         fs::write(root.join("zcode.json"), r#"{"provider":"ollama"}"#).unwrap();
@@ -1841,6 +2040,7 @@ model = "gpt-3.5-turbo"
     #[test]
     fn explicit_working_dir_beats_the_project_root() {
         let _guard = env_guard();
+        let _home = isolated_user_config();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         fs::write(
@@ -1855,6 +2055,7 @@ model = "gpt-3.5-turbo"
     #[test]
     fn nearest_config_wins_over_a_higher_one() {
         let _guard = env_guard();
+        let _home = isolated_user_config();
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("zcode.json"), r#"{"max_turns":1}"#).unwrap();
         let inner = dir.path().join("inner");
@@ -1867,6 +2068,7 @@ model = "gpt-3.5-turbo"
     #[test]
     fn json_is_preferred_over_toml_in_the_same_directory() {
         let _guard = env_guard();
+        let _home = isolated_user_config();
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("zcode.json"), r#"{"max_turns":7}"#).unwrap();
         fs::write(dir.path().join("zcode.toml"), "max_turns = 8\n").unwrap();
@@ -1916,6 +2118,7 @@ model = "gpt-3.5-turbo"
     #[test]
     fn discovery_reports_the_files_it_will_read() {
         let _guard = env_guard();
+        let _home = isolated_user_config();
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("zcode.toml"), "max_turns = 3\n").unwrap();
         let loader = Loader::discover_from(dir.path());
@@ -1931,6 +2134,7 @@ model = "gpt-3.5-turbo"
     #[test]
     fn no_config_anywhere_falls_back_to_defaults() {
         let _guard = env_guard();
+        let _home = isolated_user_config();
         let dir = tempfile::tempdir().unwrap();
         let loader = Loader::discover_from(dir.path());
         // The user layer may or may not exist on the machine running the

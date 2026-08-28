@@ -60,6 +60,29 @@ Then a project only needs what is specific to it:
 { "model": "anthropic/claude-sonnet-4.5", "shell_allowed": ["cargo (test|build).*"] }
 ```
 
+### Several providers
+
+The user config is also where a `providers` array belongs — declare every
+endpoint once, machine-wide, and let each project pick one:
+
+```json
+{
+  "provider": "fast",
+  "providers": [
+    { "name": "fast",  "kind": "openrouter", "model": "anthropic/claude-sonnet-4.5" },
+    { "name": "local", "kind": "ollama",     "model": "qwen2.5-coder" }
+  ]
+}
+```
+
+A project then needs one line — `{ "provider": "local" }` — and you can switch
+for a single run with `--provider local`, or mid-conversation in the TUI with
+`/provider local`. Profiles merge across layers by name, so a project can also
+redefine one it disagrees with while keeping the rest.
+
+The full shape is in
+[chapter 12](12-configuration-reference.md#multiple-providers).
+
 ### 3. Anywhere — `--config <FILE>`
 
 ```sh
@@ -101,18 +124,27 @@ Search paths
             current directory to the filesystem root
 
 Effective configuration
-  provider               openrouter
+  provider               fast  (openrouter)
   model                  anthropic/claude-sonnet-4.5
   api_key_env            ZCODE_OPENROUTER_API_KEY  [set]
   endpoint               https://openrouter.ai/api/v1/chat/completions (provider default)
+  providers              2  (--provider NAME, or /provider NAME in the TUI)
+    ▸ fast         openrouter         anthropic/claude-sonnet-4.5
+                   https://openrouter.ai/api/v1/chat/completions
+      local        ollama             qwen2.5-coder
+                   http://localhost:11434/api/chat
   working_dir            /home/you/my-project
-  mode                   build
+  mode                   auto
   timeout_ms             60000
   max_turns              20
   max_tokens             16384
   max_tool_output_chars  16000
+  max_retries            3
+  rate_limit_backoff_ms  30000ms  (after a 429 with no Retry-After)
   skills_dir             /home/you/my-project/.zcode/skills
   shell_allowed          2 pattern(s)
+  shell_denied           23 built-in + 0 from config
+  rtk                    0.36.0 — shell output is token-optimised  [/opt/homebrew/bin/rtk]
   mcp servers            0
   lsp servers            0
 ```
@@ -165,15 +197,14 @@ A fuller one:
   "max_turns": 20,
   "max_tokens": 16384,
   "max_tool_output_chars": 16000,
-  "mode": "build",
+  "mode": "auto",
 
   "shell_allowed": [
-    "echo .*",
-    "ls .*",
+    "echo( .*)?",
+    "ls( .*)?",
     "cat .*",
-    "git status",
-    "git diff.*",
-    "cargo (build|test|check|fmt|clippy).*"
+    "git (status|diff|log)( .*)?",
+    "cargo (build|test|check|fmt|clippy)( .*)?"
   ],
 
   "skills_dir": ".zcode/skills"
@@ -193,7 +224,18 @@ The equivalent TOML:
 provider = "openrouter"
 model = "anthropic/claude-sonnet-4.5"
 timeout_ms = 120000
-shell_allowed = ["echo .*", "ls .*", "cargo (build|test).*"]
+shell_allowed = ["echo( .*)?", "ls( .*)?", "cargo (build|test)( .*)?"]
+```
+
+**In TOML, every bare key must come before the first `[table]` header.** Once
+you write `[[providers]]` or `[rtk]`, a later `timeout_ms = …` belongs to *that
+table*, not to the top level. zcode reports it rather than ignoring it:
+
+```
+zcode: toml parse error: TOML parse error at line 5, column 1
+  |
+5 | timeout_ms = 120000
+  | ^^^^^^^^^^
 ```
 
 ## Providing the API key

@@ -3,13 +3,13 @@ mid-drag: the selection is highlighted
 
 ┌────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │┌ conversation ────────────────────────────────────────────────────────────────────────────────────┐│
-││17:01:34  zcode                                                                                   ││
+││11:25:12  zcode                                                                                   ││
 ││  Ready when you are. Type /help for commands.                                                    ││
 ││                                                                                                  ││
-││17:01:36  you                                                                                     ││
+││11:25:12  you                                                                                     ││
 ││  say something                                                                                   ││
 ││                                                                                                  ││
-││17:01:36  zcode                                                                                   ││
+││11:25:12  zcode                                                                                   ││
 ││  line 001 of 6                                                                                   ││
 ││  line 002 of 6                                                                                   ││
 ││  line 003 of 6                                                                                   ││
@@ -35,4 +35,4 @@ mid-drag: the selection is highlighted
 │└──────────────────────────────────────────────────────────────────────────────────────────────────┘│
 │ ● ready  │  mode auto  │  openai-compatible/gpt-4o-mini  │  40 in / 6 out  │  <$0.0001             │
 └────────────────────────────────────────────────────────────────────────────────────────────────────┘
-cursor: row 29, col 3, visible=True
+cursor: row 10, col 13, visible=True

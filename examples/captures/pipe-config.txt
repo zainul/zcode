@@ -1,0 +1,5 @@
+$ cd ./examples/demo-go && sh -c /Users/zainul/rust/zcode/target/release/zcode config 2>&1 | head -1
+
+Config sources (later overrides earlier)
+
+[exit 0]

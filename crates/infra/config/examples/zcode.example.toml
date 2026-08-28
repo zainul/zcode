@@ -1,42 +1,47 @@
 # Example zcode configuration file.
 # Copy to `zcode.toml` and adjust as needed.
-# `zcode.toml.local` is gitignored for local overrides.
-
+#
 # The same settings are accepted as JSON in `zcode.json`, which wins when both
-# files exist — see zcode.example.json.
+# files exist — see zcode.example.json. Nothing here is required: every key
+# falls back to a working default. The full list is in
+# docs/guide/12-configuration-reference.md.
+#
+# TOML NOTE: every bare key below must come *before* the first `[table]`
+# header. After `[[providers]]`, a `timeout_ms = …` line becomes a field of
+# that provider entry rather than a top-level setting — and is then ignored.
 
-# LLM provider + model (FR-CONFIG-02 / FR-MODEL-01..08).
-# One of: openai | anthropic | openrouter | deepseek | ollama | vllm | openai-compatible
-# Override at runtime via ZCODE_PROVIDER / ZCODE_MODEL.
-# Omit `model` to get a sensible default for the chosen provider
-# (openrouter -> openai/gpt-4o-mini, deepseek -> deepseek-chat, ...).
-provider = "openai"
-model = "gpt-4o-mini"
+# ---------------------------------------------------------------------------
+# Provider selection (FR-CONFIG-02 / FR-MODEL-01..08)
+# ---------------------------------------------------------------------------
+# `provider` names either an entry in [[providers]] below, or a built-in kind:
+#   openai | anthropic | openrouter | deepseek | ollama | vllm | openai-compatible
+# Switch for one run with `--provider NAME`, or mid-session with `/provider NAME`.
+# Override at runtime via ZCODE_PROVIDER.
+provider = "fast"
 
-# Secrets are resolved BY NAME from env vars — never put keys in this file (NFR-SEC-01).
-# `resolve_api_key()` reads `std::env::var(api_key_env)` at compose time (wire()).
-# Omit it and the provider's conventional variable is used:
-#   openai -> ZCODE_OPENAI_API_KEY, anthropic -> ZCODE_ANTHROPIC_API_KEY,
-#   openrouter -> ZCODE_OPENROUTER_API_KEY, deepseek -> ZCODE_DEEPSEEK_API_KEY.
-api_key_env = "ZCODE_OPENAI_API_KEY"
+# The single-provider form still works, and is all most projects need. These
+# top-level keys apply when `provider` names a bare kind with no [[providers]]
+# entry behind it; a declared entry is complete in itself and ignores them.
+# model = "anthropic/claude-sonnet-4.5"
+# api_key_env = "ZCODE_OPENROUTER_API_KEY"
+# base_url = "http://localhost:8000/v1/chat/completions"
 
-# Optional endpoint override. Defaults per provider (see crate docs):
-#   openai      -> https://api.openai.com/v1/chat/completions
-#   anthropic   -> https://api.anthropic.com/v1/messages
-#   openrouter  -> https://openrouter.ai/api/v1/chat/completions
-#   deepseek    -> https://api.deepseek.com/chat/completions
-#   ollama      -> http://localhost:11434/api/chat
-#   vllm / openai-compatible -> use base_url (required)
-# base_url = "http://localhost:8000/v1"
+# ---------------------------------------------------------------------------
+# Agent behaviour
+# ---------------------------------------------------------------------------
+# Three modes, laddered (FR-MODE-01): "planning" is read-only, "editing" writes
+# files but runs no shell, "auto" does both. ("build" is accepted as "auto".)
+# Override at runtime via ZCODE_MODE, or `--mode`.
+mode = "auto"
 
-# Working directory for agent operations.
-# Override at runtime via ZCODE_WORKING_DIR.
+# Working directory for agent operations. Defaults to the directory holding
+# this file. Override at runtime via ZCODE_WORKING_DIR.
 # working_dir = "."
 
 # Timeout (ms) for LLM/shell operations. Because responses are streamed, this
 # must cover a whole generation, not just the first byte. Raise it for slow or
 # very long-form models. Override at runtime via ZCODE_TIMEOUT_MS.
-timeout_ms = 60000
+timeout_ms = 120000
 
 # Loop caps (FR-LOOP-02/03/04).
 # Env overrides: ZCODE_MAX_TURNS, ZCODE_MAX_TOKENS, ZCODE_MAX_TOOL_OUTPUT_CHARS.
@@ -44,22 +49,113 @@ max_turns = 20
 max_tokens = 16384
 max_tool_output_chars = 16000
 
-# Agent mode (FR-MODE-01): "planning" (read-only) or "build" (autonomous edits).
-# Override at runtime via ZCODE_MODE.
-mode = "build"
+# Retries for a 429 or a transient 5xx. A rate limit waits a *flat*
+# `rate_limit_backoff_ms` rather than backing off exponentially: the window a
+# provider meters over is fixed, so doubling only lengthens the silence. Worst
+# case is max_retries x rate_limit_backoff_ms.
+# Env overrides: ZCODE_MAX_RETRIES, ZCODE_RATE_LIMIT_BACKOFF_MS.
+max_retries = 3
+rate_limit_backoff_ms = 30000
 
-# Directory holding .md skill files (FR-CONFIG-06). Defaults to <working_dir>/.zcode/skills.
+# Directory holding .md skill files (FR-CONFIG-06). This *adds* a root; the
+# project's own `.zcode/skills` and `~/.config/zcode/skills` are still read.
 # Override at runtime via ZCODE_SKILLS_DIR.
 # skills_dir = ".zcode/skills"
 
-# Shell command allowlist (FR-CONFIG-04/05). The command is split on `;` and `|`,
-# and every resulting segment must match at least one pattern *in full* (patterns
-# are anchored). Commands containing `` ` ``, `$(`, `>`, `<` or `&` are refused
-# outright, since those could smuggle an unchecked command past an allowed prefix.
-# Empty list = deny all (fail-safe). Env override: ZCODE_SHELL_ALLOWED (newline-separated;
-# set it to the empty string to deny everything).
-shell_allowed = ["echo .*", "ls .*", "cd .*", "cat .*"]
+# ---------------------------------------------------------------------------
+# Shell safety (FR-CONFIG-04/05)
+# ---------------------------------------------------------------------------
+# Regular expressions, not globs. The command is split on `;`, `|` and newline,
+# and every segment must match at least one pattern *in full* (patterns are
+# anchored). An empty list denies everything.
+#
+# Under a narrow allowlist, commands containing `` ` ``, `$(`, `>`, `<` or `&`
+# are refused outright, since those could smuggle an unchecked command past an
+# allowed prefix. `2>&1` and `>/dev/null` are permitted. A pattern that matches
+# everything (".*") lifts that check too — there is nothing to smuggle past an
+# allowlist that already permits every command.
+#
+# Omit the key entirely to get the shipped default, which covers Go, Rust,
+# Node/TS, Python and the common build tools.
+# Env override: ZCODE_SHELL_ALLOWED (newline-separated; empty string denies all).
+shell_allowed = [
+    "echo( .*)?",
+    "ls( .*)?",
+    "cat .*",
+    "git (status|diff|log)( .*)?",
+    "cargo (build|test|check|fmt|clippy)( .*)?",
+]
 
+# Extra always-on deny rules, added to zcode's built-in denylist. These
+# accumulate across config layers and nothing can remove a built-in.
+# Env override: ZCODE_SHELL_DENIED.
+# shell_denied = ['\bterraform apply\b', '\bkubectl delete\b']
+
+# Extra environment for the agent context (FR-CONFIG-03).
+# A list of [name, value] pairs — NOT an `[env]` table, which will not parse.
+# Secrets are never read from this file.
+# env = [["RUST_BACKTRACE", "1"]]
+
+# ---------------------------------------------------------------------------
+# Providers (tables from here down — no bare top-level keys past this point)
+# ---------------------------------------------------------------------------
+# Each entry is complete in itself: what it does not state comes from the
+# defaults for its `kind`, never from a top-level `model`/`api_key_env`/
+# `base_url`. `name` and `kind` each default to the other, so an entry named
+# after a built-in kind overrides that kind's defaults — which is how you give
+# OpenRouter, or any built-in, a URL of your own.
+[[providers]]
+name = "fast"
+kind = "openrouter"
+model = "anthropic/claude-sonnet-4.5"
+# Secrets are resolved BY NAME from env vars — never put keys in this file
+# (NFR-SEC-01). Omit it and the kind's conventional variable is used:
+#   openai -> ZCODE_OPENAI_API_KEY, anthropic -> ZCODE_ANTHROPIC_API_KEY,
+#   openrouter -> ZCODE_OPENROUTER_API_KEY, deepseek -> ZCODE_DEEPSEEK_API_KEY.
+api_key_env = "ZCODE_OPENROUTER_API_KEY"
+
+[[providers]]
+name = "local"
+kind = "ollama"
+model = "qwen2.5-coder"
+
+# An OpenAI-compatible server — LM Studio, vLLM, a company gateway. `base_url`
+# is required for these two kinds, since there is nothing sensible to guess.
+# [[providers]]
+# name = "lmstudio"
+# kind = "openai-compatible"
+# model = "your-loaded-model"
+# base_url = "http://localhost:1234/v1/chat/completions"
+
+# ---------------------------------------------------------------------------
+# rtk — token-optimised shell output (https://github.com/rtk-ai/rtk)
+# ---------------------------------------------------------------------------
+# On by default. When rtk is installed, shell output is filtered before it
+# reaches the model (`ls -la` comes back ~87% smaller). If it is missing and
+# Homebrew is present, zcode installs it once.
+# Env overrides: ZCODE_RTK, ZCODE_RTK_AUTO_INSTALL, ZCODE_RTK_PATH.
+[rtk]
+enabled = true
+auto_install = true
+# path = "/opt/homebrew/bin/rtk"
+
+# ---------------------------------------------------------------------------
+# Cost estimates
+# ---------------------------------------------------------------------------
+# Per-model rate overrides, ahead of the built-in price table. Matched as a
+# prefix of the model id.
+# [[pricing]]
+# model = "internal-1"
+# input_per_mtok = 1.5
+# output_per_mtok = 6.0
+# cache_per_mtok = 0.15
+# `true` when the provider's input_tokens already includes cached tokens
+# (OpenAI-style); `false` for Anthropic, which reports them separately.
+# cache_within_input = true
+
+# ---------------------------------------------------------------------------
+# External tools
+# ---------------------------------------------------------------------------
 # MCP servers (FR-MCP-02): spawn via stdio JSON-RPC (DQ6).
 [[mcp.servers]]
 name = "everything"
@@ -67,14 +163,14 @@ command = "npx"
 args = ["-y", "@modelcontextprotocol/server-everything"]
 # env = [["KEY", "value"]]
 
-# LSP servers (FR-LSP-03): spawn via stdio JSON-RPC (DQ7).
+# LSP servers (FR-LSP-03): spawn via stdio JSON-RPC (DQ7). Defaults are chosen
+# from the project's own marker files; set `defaults = false` to start none
+# unless listed here.
+[lsp]
+defaults = true
+
 [[lsp.servers]]
 language = "rust"
 command = "rust-analyzer"
-args = ["--stdio"]
+args = []
 # env = [["KEY", "value"]]
-
-# Extra environment variables passed to the agent context.
-# Secrets are NEVER read from this file (FR-CONFIG-03).
-# [env]
-# CUSTOM_VAR = "value"

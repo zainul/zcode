@@ -56,8 +56,8 @@ and every feature step by step.**
 | Command | Interface | Purpose |
 |---------|-----------|---------|
 | `zcode version` | headless | Build metadata (version, git SHA, profile). |
-| `zcode run "<prompt>"` | headless | One agent run. `--json`, `--mode`, `--image`, `--session`, `--timeout`, `--config`. |
-| `zcode` / `zcode repl` | TUI | Interactive session with live tool output. |
+| `zcode run "<prompt>"` | headless | One agent run. `--json`, `--json-format`, `--mode`, `--provider`, `--image`, `--session`, `--timeout`, `--config`. |
+| `zcode` / `zcode repl` | TUI | Interactive session with live tool output. `--mode`, `--provider`, `--session`, `--config`. |
 | `zcode session create` | headless | Allocate a session id (UUIDv7). |
 | `zcode session continue <id> [prompt]` | headless/TUI | Resume; without a prompt it opens the TUI. |
 | `zcode session fork <id> [--as <new>]` | headless | Branch a transcript. |
@@ -132,14 +132,30 @@ the provider's own message.
 
 - Every shell command is checked against the `shell_allowed` regex allowlist
   **before** it reaches `std::process::Command`. An empty list denies
-  everything, and substitution/redirection/chaining (`` ` ``, `$(`, `>`, `&`)
-  is refused outright.
+  everything. Under a narrow allowlist, substitution/redirection/chaining
+  (`` ` ``, `$(`, `>`, `&`) is refused outright; a pattern that already matches
+  every command (`".*"`) lifts that check, since there is nothing left to
+  smuggle past it.
+- A separate always-on denylist refuses the irreversible and the escalating
+  (`sudo`, `dd … of=`, `git push --force`, `curl … | sh`) whatever the
+  allowlist says. Recursive deletes are judged by their *target*, not their
+  flag: `rm -rf node_modules` runs, `rm -rf ~` and `rm -rf $VAR` do not.
 - Planning mode withholds every editing tool from the model and refuses one if
   it is requested anyway.
 - API keys are read from the env var named by `api_key_env` at wiring time and
   never written to disk.
 - Tool output is stripped of terminal escapes before display and capped at
   `max_tool_output_chars` before it enters the transcript.
+
+## Token efficiency
+
+Shell output is routed through [rtk](https://github.com/rtk-ai/rtk) when it is
+available — a CLI proxy that filters what a command returns before it reaches
+the model. `ls -la` comes back 87% smaller, `git status` 59%. It is on by
+default, and zcode installs it (via Homebrew, never a piped script) if it is
+missing. Everything that enters the transcript is also capped at
+`max_tool_output_chars`, and the cost of a session is estimated live from a
+built-in price table.
 
 ## Memory efficiency
 
@@ -153,7 +169,8 @@ TUI panes are bounded so runaway tool output cannot grow the process.
 ## Documentation
 
 - **[User guide](docs/guide/README.md)** — installation through to MCP, LSP and telemetry
-- [Configuration reference](docs/guide/12-configuration-reference.md)
+- [Configuration reference](docs/guide/12-configuration-reference.md) — every key, including several providers at once
+- [Command reference](docs/guide/14-commands.md) — every flag, slash command and key
 - [Troubleshooting](docs/guide/13-troubleshooting.md)
 - [Architecture](docs/architecture/README.md)
 

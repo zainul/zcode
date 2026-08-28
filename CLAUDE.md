@@ -110,6 +110,25 @@ a *translation, not an emulation*: no durable block, no sequence numbers, no
 `message.*`/`session.created`, because zcode has no message store or bus. `wire`
 tees it with a sink-backed `JsonTelemetry` so the report file is still written.
 
+## Usage and cost
+
+`UiEvent::Usage` is emitted after **every** provider call with the turn's
+running totals; `UiEvent::Finish` fires once and means the turn is over. A
+tool-using turn bills on every step, so reporting only at `Finish` left the
+status bar at `0 in / 0 out` for minutes. `Totals::set_turn_usage` adds the
+*difference* since the last report and `record` reconciles against it, because
+the engine sends running totals rather than per-step deltas.
+
+`LlmFinish.cost_usd` carries what the provider says it charged (OpenRouter's
+`usage.cost`, read in `OpenAiDecoder`). It wins over `domain::pricing`, which
+cannot know a model it has never seen — the case that rendered `n/a` on a paid
+route. `Some(0.0)` means free; `None` means unreported.
+
+`base_url` is honoured by every provider. `OpenRouterLlm::at`,
+`AnthropicLlm::at` and `DeepSeekLlm::at` exist because the plain constructors
+hardcoded their hosts, so an override did nothing while `zcode config` printed
+it as the endpoint in use.
+
 ## Cost
 
 `domain::pricing` is a stdlib-only price table (USD per Mtok) with
@@ -152,6 +171,24 @@ boundaries), `wrap.rs`, `command.rs` (slash commands). Notes:
   fourteen blank cells between `read` and what it read. `timeline::tool_icon`
   prefixes each row with what was called; every glyph is one cell wide, since
   a two-cell one would shift every column to its right.
+- **A run of calls folds.** `EntryKind::Tool` carries a `run` id assigned at
+  ingest — positional keys shift when entries drop from the front and would
+  fold the wrong group. Default (`RunSummary::expanded_by_default`): open while
+  any call is `Running` *or* any failed — a header reading "1 failed" hides the
+  text you need to act on — and folded once they have all settled cleanly.
+  `TuiState::run_override` records disagreement.
+  `render_timeline` decides once per run and passes a `Fold` to both walkers,
+  so the counted height and the built rows cannot diverge. It also returns
+  which built rows are headers, which is how a click finds one — the draw is
+  the only place that knows what is on screen after wrapping and scrolling.
+- **A row says what ran.** `finish_tool` keeps the invocation
+  (`annotate_running_tool` set it from the argument stream) on a *successful*
+  row rather than overwriting it with the result's first line — `shell ls -lah`
+  says what happened, `shell total 32` makes you guess. A failure replaces it,
+  because then the error is what needs acting on.
+- **The caret follows the pointer.** `caret_in_conversation` returns the
+  selection head, so clicking the transcript moves the cursor there; typing and
+  Esc clear the selection and give it back to the prompt.
 - **Failures wrap, successes clip.** A successful tool row is an index entry —
   the first line of the result, clipped to the row. A failure is the text the
   user has to act on, so `detail_wraps_below` sends it to `push_detail`, which
@@ -200,6 +237,14 @@ boundaries), `wrap.rs`, `command.rs` (slash commands). Notes:
   `LogRedirect` diverts records into the timeline as notes while the alternate
   screen is up, because stderr is the same terminal and a `log::warn!` paints
   over the UI. The guard restores stderr on every exit path.
+
+## stdout
+
+`cli::out` (and the `outln!` macro) replaces `println!` everywhere the CLI
+prints. Rust ignores `SIGPIPE`, so `zcode config | head -1` returned `EPIPE`
+and `println!` panicked — the panic then showed up inside tool results. A
+broken pipe now exits 0 quietly. The streaming paths (`emit.rs`,
+`infra-telemetry`) already ignored write errors and were never the panic.
 
 ## Engine loop
 

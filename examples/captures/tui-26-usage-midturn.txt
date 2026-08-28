@@ -1,11 +1,19 @@
-### 06-paste
-a 283-byte, 8-line paste
+### 26-usage-midturn
+mid-turn: tokens and cost, not 0 in / 0 out
 
 ┌────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │┌ conversation ────────────────────────────────────────────────────────────────────────────────────┐│
-││11:24:31  zcode                                                                                   ││
+││11:25:16  zcode                                                                                   ││
 ││  Ready when you are. Type /help for commands.                                                    ││
 ││                                                                                                  ││
+││11:25:16  you                                                                                     ││
+││  do something                                                                                    ││
+││  ▸ tools used · 1 call                                                                           ││
+││                                                                                                  ││
+││                                                                                                  ││
+││                                                                                                  ││
+││                                                                                                  ││
+││                                                                                                  ││
 ││                                                                                                  ││
 ││                                                                                                  ││
 ││                                                                                                  ││
@@ -22,17 +30,9 @@ a 283-byte, 8-line paste
 ││                                                                                                  ││
 ││                                                                                                  ││
 │└──────────────────────────────────────────────────────────────────────────────────────────────────┘│
-│┌ Enter sends · Alt-Enter newline · /help ─────────────────────────────────────────────────────────┐│
-││> Here is a long paste that must arrive whole. func handler(w http.ResponseWriter, r              ││
-││  *http.Request) {                                                                                ││
-││      ctx := r.Context()                                                                          ││
-││      if err := svc.Do(ctx); err != nil {                                                         ││
-││          http.Error(w, err.Error(), 500)                                                         ││
-││          return                                                                                  ││
-││      }                                                                                           ││
-││  }                                                                                               ││
-││  The final line proves nothing was truncated: SENTINEL-END                                       ││
+│┌ Esc cancels ─────────────────────────────────────────────────────────────────────────────────────┐│
+││>                                                                                                 ││
 │└──────────────────────────────────────────────────────────────────────────────────────────────────┘│
-│ ● ready  │  mode auto  │  openrouter/poolside/laguna-s-2.1:free  │  0 in / 0 out  │  $0.00         │
+│ ⠸ working · step 2/500 · 1.4s  │  mode auto  │  glm-5.3-flash  │  2280 in / 71 out  │  $0.0002     │
 └────────────────────────────────────────────────────────────────────────────────────────────────────┘
-cursor: row 29, col 60, visible=True
+cursor: row 29, col 3, visible=True

@@ -228,6 +228,45 @@ call gets longer so the number stays readable:
 | under an hour | `2m05s` |
 | beyond that | `1h25m` |
 
+### Folding a run
+
+A run of calls collapses to a single line once every call in it has settled, so
+the conversation stays readable through a long session:
+
+```
+11:14:33  zcode
+  Running that for you now.
+  ▸ tools used · 1 call · 58ms
+```
+
+Two things stay open without being asked for:
+
+- **Work in flight.** While a call is still running the run is open — folding
+  away the only thing on screen that is changing would be exactly the wrong
+  moment to hide it.
+- **A failure.** The error is the text you have to act on. A header reading
+  "1 failed" would say something went wrong while hiding what.
+
+Click the header to open it, and again to fold it:
+
+```
+  ▾ tools used
+  └ ✔ 11:14:33  ❯ shell  ls -lah                                          58ms
+```
+
+`Ctrl-T` folds every run at once, or opens them all if they are already folded.
+
+A folded header carries enough to decide whether opening it is worth doing —
+the number of calls, how long they took, and how many failed. You can always
+fold a failure by hand; the header then accounts for it and turns red:
+
+```
+  ▸ tools used · 3 calls · 1.2s · 1 failed
+```
+
+Dragging across a header still selects it, rather than folding — otherwise the
+header would be the one line in the pane you could not copy.
+
 Each row carries two glyphs: what was called, then how it went.
 
 | Tool | | Status | |
@@ -264,11 +303,11 @@ A failure or a refusal settles the same row rather than adding a second one:
   └ ⊘ 20:24:02  ± apply_patch  planning mode is read-only
 ```
 
-A *successful* row is an index entry — the first line of what came back,
-clipped to fit, because the output itself is not what you are scanning for. An
-error is the opposite: it is the thing you have to read. So when a failure has
-more to say than fits, it wraps below the row in full instead of ending in an
-ellipsis:
+A *successful* row shows **what ran** — the command, the path — rather than the
+first line of what came back. `shell  ls -lah` says what happened; `shell
+total 32` makes you guess. An error is the opposite: it is the thing you have
+to read, so a failure replaces the invocation and, when it has more to say than
+fits, wraps below the row in full instead of ending in an ellipsis:
 
 ```
   tools used
@@ -444,6 +483,10 @@ Two mechanisms, tried in order:
 2. **OSC 52** — asking the terminal to set the clipboard. The only thing that
    works over SSH, where no local tool can help, but not universal: macOS
    Terminal.app ignores it, and tmux and screen need it turned on.
+
+Clicking into the conversation moves the caret to the cell you clicked, so the
+pane you are selecting from is the one showing a cursor. Typing brings it back
+to the prompt.
 
 `Esc` dismisses a highlight. It does that *before* it cancels a turn, because
 cancelling a running turn when you meant to clear a selection is an expensive

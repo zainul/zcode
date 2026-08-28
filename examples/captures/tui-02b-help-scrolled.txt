@@ -2,11 +2,11 @@
 PageUp scrolls back to the start of /help
 
 ┌────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│┌ conversation (scrolled ↑8, PageDown to follow) ──────────────────────────────────────────────────┐│
-││17:00:28  zcode                                                                                   ││
+│┌ conversation (scrolled ↑10, PageDown to follow) ─────────────────────────────────────────────────┐│
+││11:24:24  zcode                                                                                   ││
 ││  Ready when you are. Type /help for commands.                                                    ││
 ││                                                                                                  ││
-││17:00:30  zcode                                                                                   ││
+││11:24:24  zcode                                                                                   ││
 ││  commands:                                                                                       ││
 ││    /help                            show this list                                               ││
 ││    /exit                            quit zcode (also /quit, or Ctrl-C)                           ││
@@ -33,6 +33,6 @@ PageUp scrolls back to the start of /help
 │┌ Enter sends · Alt-Enter newline · /help ─────────────────────────────────────────────────────────┐│
 ││>                                                                                                 ││
 │└──────────────────────────────────────────────────────────────────────────────────────────────────┘│
-│ ● ready  │  mode auto  │  openrouter/laguna-s-2.1:free  │  0 in / 0 out  │  $0.00  │  scrolled ↑8  │
+│ ● ready  │  mode auto  │  openrouter/laguna-s-2.1:free  │  0 in / 0 out  │  $0.00  │  scrolled ↑10 │
 └────────────────────────────────────────────────────────────────────────────────────────────────────┘
 cursor: row 29, col 3, visible=True

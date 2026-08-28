@@ -29,11 +29,11 @@ Run `zcode config` to see which files were read and what they resolve to.
 
 | Key | Type | Default | Env override | Meaning |
 |-----|------|---------|--------------|---------|
-| `provider` | string | `openai` | `ZCODE_PROVIDER` | Which endpoint to use: a name from `providers`, or a built-in kind (`openai`, `anthropic`, `openrouter`, `deepseek`, `ollama`, `vllm`, `openai-compatible`) |
+| `provider` | string | `openai` | `ZCODE_PROVIDER` | Which endpoint to use: a name from `providers`, or a built-in kind (`openai`, `anthropic`, `openrouter`, `deepseek`, `ollama`, `vllm`, `lmstudio`, `openai-compatible`) |
 | `providers` | array | `[]` | — | Named endpoints to switch between (below) |
 | `model` | string | per provider | `ZCODE_MODEL` | Model id as the provider spells it |
 | `api_key_env` | string | per provider | `ZCODE_API_KEY_ENV` | **Name** of the variable holding the key — never the key |
-| `base_url` | string | per provider | `ZCODE_BASE_URL` | Endpoint override; required for `vllm` and `openai-compatible` |
+| `base_url` | string | per provider | `ZCODE_BASE_URL` | Endpoint override, honoured by every provider; required for `vllm` and `openai-compatible` |
 | `working_dir` | path | directory of the project config | `ZCODE_WORKING_DIR` | Root for file tools and `.zcode/`; `~` expanded |
 | `timeout_ms` | integer | `60000` | `ZCODE_TIMEOUT_MS` | HTTP timeout covering a whole streamed response |
 | `max_turns` | integer | `20` | `ZCODE_MAX_TURNS` | Hard cap on steps per run |
@@ -137,7 +137,26 @@ In TOML the same thing is `[[providers]]` tables.
 | `base_url` | Endpoint. Defaults to the kind's |
 
 One of `name` and `kind` must be given; an entry with neither cannot say what
-it talks to and is an error rather than a silent default.
+it talks to.
+
+**An entry zcode cannot understand is skipped, not fatal.** A mistyped `kind`
+in one profile leaves every other provider working and is reported by
+`zcode config`:
+
+```
+Problems
+  - provider entry `mul.ai` is unusable and was skipped: unknown provider: lmstudo
+```
+
+It becomes an error only when it is the one you selected, and then the message
+says what is wrong with it rather than claiming it does not exist:
+
+```
+zcode: provider `mul.ai` is configured but unusable: unknown provider: lmstudo
+```
+
+Making one bad entry fatal meant `zcode config` — the command you reach for to
+*find* the mistake — failed too.
 
 Two rules are worth knowing:
 
@@ -191,8 +210,19 @@ not a thing you export. `ZCODE_PROVIDER` still selects one by name.
 | `ollama` | `llama3.2` | *(none)* | `http://localhost:11434/api/chat` |
 | `vllm` | *(required)* | `ZCODE_API_KEY` | `<base_url>/chat/completions` |
 | `openai-compatible` | *(required)* | `ZCODE_API_KEY` | `<base_url>/chat/completions` |
+| `lmstudio` | *(required)* | *(none)* | `http://localhost:1234/v1/chat/completions` |
+
+`lmstudio` is OpenAI-compatible on the wire; it exists as its own kind so the
+local default endpoint and the absence of a key come for free. A `base_url`
+ending in `/v1` is fine — `/chat/completions` is appended if it is missing.
 
 ## Cost estimates
+
+**Where the provider reports what it charged, that figure is used instead.**
+OpenRouter returns `usage.cost` on every response — exact, for the model
+actually served, at the rate actually charged, including models no local table
+has heard of. The table below is the fallback for providers that report
+nothing.
 
 zcode ships a table of published list prices so the TUI can show a running cost
 without configuration. It is an **estimate, not a bill** — providers change

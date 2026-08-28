@@ -61,7 +61,7 @@ def bracketed(text: str) -> bytes:
 class Tui:
     """A live zcode TUI on a pty, with a screen we can read back."""
 
-    def __init__(self, cwd: Path, args=()):
+    def __init__(self, cwd: Path, args=(), env=None):
         self.screen = pyte.Screen(COLS, ROWS)
         self.stream = pyte.Stream(self.screen)
         # A read can split a multi-byte character; decode across chunks.
@@ -77,12 +77,13 @@ class Tui:
         gobin = os.path.expanduser("~/go/bin")
         if gobin not in path.split(os.pathsep):
             path = gobin + os.pathsep + path
-        env = dict(
+        environ = dict(
             os.environ,
             PATH=path,
             TERM="xterm-256color",
             COLUMNS=str(COLS),
             LINES=str(ROWS),
+            **(env or {}),
         )
         self.proc = subprocess.Popen(
             [str(ZCODE), *args],
@@ -90,7 +91,7 @@ class Tui:
             stdin=slave,
             stdout=slave,
             stderr=slave,
-            env=env,
+            env=environ,
             preexec_fn=os.setsid,
         )
         os.close(slave)
@@ -134,6 +135,19 @@ class Tui:
 
     def text(self) -> str:
         return "\n".join(self.screen.display)
+
+    def ready(self, timeout=30.0):
+        """Block until the opening frame is drawn.
+
+        A fixed `pump(2.0)` was a bet on how long startup takes, and a cold
+        binary — the first run after a build, with a language server to spawn —
+        loses it. Waiting for the thing itself is not slower on a warm machine
+        and does not fail on a cold one.
+        """
+        if not self.wait_for(r"Ready when you are", timeout=timeout, poll=0.1):
+            raise AssertionError(
+                f"the TUI drew no opening frame within {timeout}s:\n{self.text()}"
+            )
 
     def status_line(self) -> str:
         """The bottom bar: state, mode, provider/model, tokens, cost."""
@@ -200,7 +214,7 @@ def check(condition: bool, label: str, screen: str = ""):
 def scenario_startup():
     """Opening screen: three panes, a status bar, and a visible caret."""
     t = Tui(ROOT / "examples" / "demo-go")
-    t.pump(2.0)
+    t.ready()
     t.shot("01-startup", "zcode with no subcommand, nothing typed yet")
     text = t.text()
     check("conversation" in text, "conversation pane is drawn")
@@ -215,7 +229,7 @@ def scenario_startup():
 def scenario_help_and_modes():
     """/help, /mode, and Shift-Tab cycling."""
     t = Tui(ROOT / "examples" / "demo-go")
-    t.pump(2.0)
+    t.ready()
     t.type("/help")
     t.send(ENTER, 1.0)
     t.shot("02-help", "/help — the pane follows the tail, so the keys are shown")
@@ -251,7 +265,7 @@ def scenario_help_and_modes():
 def scenario_paste_and_wrap():
     """A large multi-line paste must land whole, wrapped, with the caret right."""
     t = Tui(ROOT / "examples" / "demo-go")
-    t.pump(2.0)
+    t.ready()
     payload = (
         "Here is a long paste that must arrive whole. "
         "func handler(w http.ResponseWriter, r *http.Request) {\n"
@@ -281,7 +295,7 @@ def scenario_paste_and_wrap():
 def scenario_editing_keys():
     """Word motion and word deletion at the caret."""
     t = Tui(ROOT / "examples" / "demo-go")
-    t.pump(2.0)
+    t.ready()
     t.type("cargo test --workspace --all-features")
     t.send(CTRL_W, 0.4)
     t.send(CTRL_W, 0.4)
@@ -301,7 +315,7 @@ def scenario_live_turn():
     turn itself — otherwise a throttled free route reads as a failure.
     """
     t = Tui(ROOT / "examples" / "demo-go")
-    t.pump(2.0)
+    t.ready()
     t.type("Read main.go, then list this directory, then stop. Use the tools.")
     t.send(ENTER, 1.5)
     t.shot("09-working", "mid-turn: the spinner, the step counter, the elapsed clock")
@@ -335,7 +349,7 @@ def scenario_live_turn():
 def scenario_exit():
     """/exit leaves cleanly and restores the terminal."""
     t = Tui(ROOT / "examples" / "demo-go")
-    t.pump(2.0)
+    t.ready()
     t.type("/exit")
     t.shot("13-exit-typed", "/exit typed, about to be sent")
     t.send(ENTER, 1.5)
@@ -350,7 +364,7 @@ def scenario_exit():
 def scenario_unknown_command():
     """A typo is reported, not sent to the model as a prompt."""
     t = Tui(ROOT / "examples" / "demo-go")
-    t.pump(2.0)
+    t.ready()
     t.type("/exitt")
     t.send(ENTER, 1.0)
     t.shot("14-unknown-command", "an unrecognised /command is caught locally")
@@ -362,7 +376,7 @@ def scenario_unknown_command():
 def scenario_provider_error():
     """A provider failure is shown in red on the status bar, not swallowed."""
     t = Tui(ROOT / "examples" / "broken-model")
-    t.pump(2.0)
+    t.ready()
     t.type("hello")
     t.send(ENTER, 1.0)
     got = t.wait_for(r"error", timeout=60)
@@ -394,7 +408,7 @@ def scenario_rate_limit():
     server = fake.serve(port=8099, fail=2, status=429)
 
     t = Tui(ROOT / "examples" / "rate-limited")
-    t.pump(2.0)
+    t.ready()
     t.type("hello")
     t.send(ENTER, 1.0)
     got = t.wait_for(r"rate limited", timeout=20, poll=0.1)
@@ -425,6 +439,170 @@ def _fake_provider():
     return module
 
 
+def scenario_tool_rows():
+    """A tool row must say what ran, and a broken pipe must not panic."""
+    fake = _fake_provider()
+    server = fake.serve(
+        # The port `examples/open-shell` is configured for.
+        port=8097, fail=0, status=429, tool="shell",
+        tool_args=json.dumps({"command": "ls -lah"}),
+    )
+    t = Tui(ROOT / "examples" / "open-shell")
+    t.ready()
+    t.type("list the files")
+    t.send(ENTER, 1.0)
+    check(t.wait_for(r"tools used", timeout=30), "the shell call settled")
+    # A successful run folds itself; open it to read the row.
+    t.send(b"\x14", 0.6)
+    t.shot("28-tool-row-command", "the row names the command, not the output")
+    row = next((l for l in t.text().splitlines() if "✔" in l and "shell" in l), "")
+    check("ls -lah" in row, f"the command is shown: {row.strip()!r}")
+    t.close()
+    server.shutdown()
+
+
+def scenario_folding():
+    """A settled run of tool calls folds; the one in flight stays open."""
+    fake = _fake_provider()
+    server = fake.serve(
+        port=8097, fail=0, status=429, tool="shell",
+        tool_args=json.dumps({"command": "ls -lah"}),
+    )
+    t = Tui(ROOT / "examples" / "open-shell")
+    t.ready()
+    t.type("list the files")
+    t.send(ENTER, 1.0)
+    check(t.wait_for(r"▸ tools used", timeout=30), "the settled run folded itself")
+
+    folded = t.text()
+    t.shot("29-run-folded", "a settled run, folded to one line")
+    check("1 call" in folded, f"the header counts the calls: {folded!r}"[:120])
+    check("ls -lah" not in folded, "the detail is folded away")
+
+    # Click the header to open it.
+    rows = t.screen.display
+    header = next(i for i, r in enumerate(rows) if "▸ tools used" in r)
+    col = rows[header].index("▸") + 1
+    t.send(mouse(0, col, header + 1), 0.2)
+    t.send(mouse(0, col, header + 1, release=True), 0.6)
+    opened = t.text()
+    t.shot("30-run-expanded", "the same run after clicking its header")
+    check("ls -lah" in opened, f"clicking the header opened it: {opened!r}"[:120])
+    check("▾ tools used" in opened, "and the marker turned")
+
+    # Ctrl-T folds everything again.
+    t.send(b"\x14", 0.6)
+    check("ls -lah" not in t.text(), "Ctrl-T folds every run")
+
+    t.close()
+    server.shutdown()
+
+
+def scenario_usage():
+    """The status bar must move while a multi-step turn is spending money.
+
+    The reported bug: mid-turn the bar read `0 in / 0 out | n/a` for minutes,
+    because usage was only reported when the whole turn ended and the cost came
+    from a local table that had never heard of the model.
+    """
+    import importlib.util
+    import json as _json
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    calls = {"n": 0}
+    gate = threading.Event()
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_):
+            pass
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers["content-length"]))
+            calls["n"] += 1
+            if calls["n"] == 1:
+                # A tool call, so the turn continues — and a cost for a model
+                # no local price table knows.
+                body = [
+                    {
+                        "choices": [
+                            {
+                                "delta": {
+                                    "tool_calls": [
+                                        {
+                                            "index": 0,
+                                            "id": "c1",
+                                            "type": "function",
+                                            "function": {
+                                                "name": "list_dir",
+                                                "arguments": '{"path":"."}',
+                                            },
+                                        }
+                                    ]
+                                }
+                            }
+                        ]
+                    },
+                    {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
+                    {
+                        "choices": [],
+                        "usage": {
+                            "prompt_tokens": 2280,
+                            "completion_tokens": 71,
+                            "cost": 0.000189,
+                        },
+                    },
+                ]
+            else:
+                # Hold the second call open so the screen can be read mid-turn.
+                gate.wait(timeout=30)
+                body = [
+                    {"choices": [{"delta": {"content": "done"}}]},
+                    {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+                    {
+                        "choices": [],
+                        "usage": {
+                            "prompt_tokens": 9393,
+                            "completion_tokens": 167,
+                            "cost": 0.000508,
+                        },
+                    },
+                ]
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream")
+            self.end_headers()
+            for chunk in body:
+                self.wfile.write(f"data: {_json.dumps(chunk)}\n\n".encode())
+                self.wfile.flush()
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+
+    server = HTTPServer(("127.0.0.1", 8162), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    # openrouter requires a key; the stub does not check it.
+    t = Tui(ROOT / "examples" / "paid-usage", env={"ZCODE_API_KEY": "stub"})
+    t.ready()
+    t.type("do something")
+    t.send(ENTER, 1.0)
+
+    # Mid-turn: step 2 is blocked on the gate, so step 1's usage is all there is.
+    check(t.wait_for(r"2,280 in|2280 in", timeout=30), "tokens appear mid-turn")
+    bar = t.status_line()
+    t.shot("26-usage-midturn", "mid-turn: tokens and cost, not 0 in / 0 out")
+    check("0 in / 0 out" not in bar, f"the bar is not stuck at zero: {bar.strip()!r}")
+    check("n/a" not in bar, f"cost is known mid-turn: {bar.strip()!r}")
+
+    gate.set()
+    check(t.wait_for(r"11,673 in|11673 in", timeout=30), "totals settle at the end")
+    final = t.status_line()
+    t.shot("27-usage-settled", "after the turn: provider-reported totals")
+    check("$0.0007" in final or "0.0007" in final, f"the reported cost is shown: {final.strip()!r}")
+
+    t.close()
+    server.shutdown()
+
+
 def scenario_selection():
     """Drag must highlight, and releasing must copy.
 
@@ -437,7 +615,7 @@ def scenario_selection():
     server = fake.serve(port=8093, fail=0, status=429, lines=6)
 
     t = Tui(ROOT / "examples" / "scrolling")
-    t.pump(2.0)
+    t.ready()
     t.type("say something")
     t.send(ENTER, 1.0)
     check(t.wait_for(r"line 006", timeout=30), "there is something to select")
@@ -479,7 +657,7 @@ def scenario_scrolling():
     server = fake.serve(port=8093, fail=0, status=429, lines=60)
 
     t = Tui(ROOT / "examples" / "scrolling")
-    t.pump(2.0)
+    t.ready()
     t.type("say something long")
     t.send(ENTER, 1.0)
     check(t.wait_for(r"line 060", timeout=30), "the answer arrived in full")
@@ -536,7 +714,7 @@ def scenario_providers():
     fake = _fake_provider()
     primary = fake.serve(port=8095, fail=0, status=429, lines=2, label="  [primary]")
     t = Tui(ROOT / "examples" / "multi-provider")
-    t.pump(2.0)
+    t.ready()
 
     t.type("/provider")
     t.send(ENTER, 1.0)
@@ -590,7 +768,7 @@ def scenario_blocked_shell():
         tool_args=json.dumps({"command": blocked}),
     )
     t = Tui(ROOT / "examples" / "blocked-shell")
-    t.pump(2.0)
+    t.ready()
     t.type("build the project")
     t.send(ENTER, 1.0)
     got = t.wait_for(r"blocked by the shell allowlist", timeout=30)
@@ -616,10 +794,13 @@ def scenario_blocked_shell():
         tool_args=json.dumps({"command": ran}),
     )
     t = Tui(ROOT / "examples" / "open-shell")
-    t.pump(2.0)
+    t.ready()
     t.type("run the pipeline")
     t.send(ENTER, 1.0)
-    got = t.wait_for(r"✔.*shell", timeout=30)
+    got = t.wait_for(r"tools used", timeout=30)
+    # A successful run folds itself once it settles; open it to read the row.
+    t.send(b"\x14", 0.6)
+    got = got and t.wait_for(r"✔.*shell", timeout=10)
     t.shot("19-shell-open", 'the same shape of command under "shell_allowed": [".*"]')
     text = t.text()
     server.shutdown()
@@ -648,6 +829,9 @@ SCENARIOS = {
     "blocked": scenario_blocked_shell,
     "scrolling": scenario_scrolling,
     "selection": scenario_selection,
+    "usage": scenario_usage,
+    "toolrows": scenario_tool_rows,
+    "folding": scenario_folding,
     "providers": scenario_providers,
 }
 

@@ -1,13 +1,21 @@
-### 06-paste
-a 283-byte, 8-line paste
+### 28-tool-row-command
+the row names the command, not the output
 
 ┌────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │┌ conversation ────────────────────────────────────────────────────────────────────────────────────┐│
-││11:24:31  zcode                                                                                   ││
+││11:25:19  zcode                                                                                   ││
 ││  Ready when you are. Type /help for commands.                                                    ││
 ││                                                                                                  ││
+││11:25:19  you                                                                                     ││
+││  list the files                                                                                  ││
 ││                                                                                                  ││
+││11:25:19  zcode                                                                                   ││
+││  Running that for you now.                                                                       ││
+││  ▾ tools used                                                                                    ││
+││  └ ✔ 11:25:19  ❯ shell  ls -lah                                                             65ms ││
 ││                                                                                                  ││
+││11:25:19  zcode                                                                                   ││
+││  That is what the shell had to say.                                                              ││
 ││                                                                                                  ││
 ││                                                                                                  ││
 ││                                                                                                  ││
@@ -23,16 +31,8 @@ a 283-byte, 8-line paste
 ││                                                                                                  ││
 │└──────────────────────────────────────────────────────────────────────────────────────────────────┘│
 │┌ Enter sends · Alt-Enter newline · /help ─────────────────────────────────────────────────────────┐│
-││> Here is a long paste that must arrive whole. func handler(w http.ResponseWriter, r              ││
-││  *http.Request) {                                                                                ││
-││      ctx := r.Context()                                                                          ││
-││      if err := svc.Do(ctx); err != nil {                                                         ││
-││          http.Error(w, err.Error(), 500)                                                         ││
-││          return                                                                                  ││
-││      }                                                                                           ││
-││  }                                                                                               ││
-││  The final line proves nothing was truncated: SENTINEL-END                                       ││
+││>                                                                                                 ││
 │└──────────────────────────────────────────────────────────────────────────────────────────────────┘│
-│ ● ready  │  mode auto  │  openrouter/poolside/laguna-s-2.1:free  │  0 in / 0 out  │  $0.00         │
+│ ● ready  │  mode auto  │  openai-compatible/gpt-4o-mini  │  230 in / 27 out  │  <$0.0001           │
 └────────────────────────────────────────────────────────────────────────────────────────────────────┘
-cursor: row 29, col 60, visible=True
+cursor: row 29, col 3, visible=True

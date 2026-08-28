@@ -3,7 +3,7 @@ an unrecognised /command is caught locally
 
 ┌────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │┌ conversation ────────────────────────────────────────────────────────────────────────────────────┐│
-││17:00:49  zcode                                                                                   ││
+││11:24:37  zcode                                                                                   ││
 ││  Ready when you are. Type /help for commands.                                                    ││
 ││  ! unknown command `/exitt` — /help lists them all                                               ││
 ││                                                                                                  ││

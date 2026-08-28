@@ -9,12 +9,12 @@ as a reference.
 | # | Chapter | What you get |
 |---|---------|--------------|
 | 1 | [Installation](01-installation.md) | Install and uninstall scripts; a working `zcode` on your `PATH` |
-| 2 | [Configuration](02-configuration.md) | Where the config file goes, providers, API keys |
+| 2 | [Configuration](02-configuration.md) | Where the config file goes, one provider or several, API keys |
 | 3 | [Your first task](03-first-task.md) | A real edit made by the agent |
 | 4 | [Headless CLI](04-headless-cli.md) | `zcode run` in depth: flags, streaming, exit codes |
-| 5 | [Interactive TUI](05-tui.md) | Conversational multi-step work |
+| 5 | [Interactive TUI](05-tui.md) | Conversational multi-step work; scrolling, selecting, switching provider |
 | 6 | [Sessions](06-sessions.md) | Create, continue, fork, import, export |
-| 7 | [Tools & safety](07-tools-and-safety.md) | File edits, patches, the shell allowlist, skills |
+| 7 | [Tools & safety](07-tools-and-safety.md) | File edits, patches, the shell allowlist, rtk, skills |
 | 8 | [Agent modes](08-agent-modes.md) | Planning, editing, and auto |
 | 9 | [MCP & LSP](09-mcp-and-lsp.md) | External data sources and semantic code intel |
 | 10 | [Multimodal input](10-multimodal.md) | Sending images to vision models |

@@ -424,6 +424,7 @@ fn aggregate(
         input_tokens: 0,
         output_tokens: 0,
         cache_tokens: 0,
+        cost_usd: None,
     };
     for ev in events.into_iter().flatten() {
         match ev {
@@ -595,8 +596,15 @@ impl OpenRouterLlm {
         Self::with_timeout(api_key, model, DEFAULT_TIMEOUT)
     }
     pub fn with_timeout(api_key: &str, model: &str, timeout: Duration) -> Self {
+        Self::at(Self::endpoint(), api_key, model, timeout)
+    }
+    /// As `with_timeout`, against a specific endpoint — a gateway, a proxy, or
+    /// a stub. `base_url` is documented as an endpoint override, so it has to
+    /// override this one too; hardcoding it meant `zcode config` printed the
+    /// configured URL and the client quietly used another.
+    pub fn at(endpoint: &str, api_key: &str, model: &str, timeout: Duration) -> Self {
         Self(
-            OpenAiShapeLlm::with_timeout(Self::endpoint(), api_key, model, timeout)
+            OpenAiShapeLlm::with_timeout(&chat_completions_url(endpoint), api_key, model, timeout)
                 .labelled("openrouter")
                 .with_header(
                     "HTTP-Referer",
@@ -620,8 +628,12 @@ impl DeepSeekLlm {
         Self::with_timeout(api_key, model, DEFAULT_TIMEOUT)
     }
     pub fn with_timeout(api_key: &str, model: &str, timeout: Duration) -> Self {
+        Self::at(Self::endpoint(), api_key, model, timeout)
+    }
+    /// As `with_timeout`, against a specific endpoint. See `OpenRouterLlm::at`.
+    pub fn at(endpoint: &str, api_key: &str, model: &str, timeout: Duration) -> Self {
         Self(
-            OpenAiShapeLlm::with_timeout(Self::endpoint(), api_key, model, timeout)
+            OpenAiShapeLlm::with_timeout(&chat_completions_url(endpoint), api_key, model, timeout)
                 .labelled("deepseek"),
         )
     }
@@ -769,6 +781,9 @@ pub struct OpenAiDecoder {
     /// folded in (FR-OUTPUT-03/04/05).
     pending_finish: Option<LlmFinish>,
     usage: Option<(u64, u64, u64)>,
+    /// Provider-reported cost, held alongside `usage` because it can arrive in
+    /// the same trailing chunk as the token counts — or in a later one.
+    cost_usd: Option<f64>,
 }
 
 impl SseDecode for OpenAiDecoder {
@@ -798,11 +813,18 @@ impl SseDecode for OpenAiDecoder {
                 .and_then(|d| d.get("cached_tokens"))
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
+            // What the provider says it charged. OpenRouter reports this on
+            // every response; it is exact, per-model, and does not depend on a
+            // local table having heard of the model. `0.0` is a real answer —
+            // a free route — so only an absent field means "not reported".
+            let cost = u.get("cost").and_then(|v| v.as_f64()).filter(|c| *c >= 0.0);
             self.usage = Some((in_tok, out_tok, cache));
+            self.cost_usd = cost.or(self.cost_usd);
             if let Some(finish) = self.pending_finish.as_mut() {
                 finish.input_tokens = in_tok;
                 finish.output_tokens = out_tok;
                 finish.cache_tokens = cache;
+                finish.cost_usd = cost.or(finish.cost_usd);
             }
         }
 
@@ -855,6 +877,7 @@ impl SseDecode for OpenAiDecoder {
                 input_tokens: i,
                 output_tokens: o,
                 cache_tokens: c,
+                cost_usd: self.cost_usd,
             });
             self.pending.clear();
             self.started.clear();
@@ -938,6 +961,7 @@ pub struct AnthropicLlm {
     api_key: String,
     model: String,
     retry: RetryPolicy,
+    endpoint: String,
 }
 
 impl AnthropicLlm {
@@ -946,11 +970,19 @@ impl AnthropicLlm {
     }
 
     pub fn with_timeout(api_key: &str, model: &str, timeout: Duration) -> Self {
+        Self::at(Self::endpoint(), api_key, model, timeout)
+    }
+
+    /// As `with_timeout`, against a specific endpoint — a gateway or a proxy.
+    /// `base_url` is documented as an endpoint override, so it has to override
+    /// this one too.
+    pub fn at(endpoint: &str, api_key: &str, model: &str, timeout: Duration) -> Self {
         Self {
             client: build_client(timeout),
             api_key: api_key.to_string(),
             model: model.to_string(),
             retry: RetryPolicy::default(),
+            endpoint: endpoint.to_string(),
         }
     }
 
@@ -971,7 +1003,7 @@ impl AnthropicLlm {
         let payload = build_anthropic_request(req, &self.model);
         send_with_retry("anthropic", self.retry, || {
             self.client
-                .post(Self::endpoint())
+                .post(&self.endpoint)
                 .header("x-api-key", &self.api_key)
                 .header("anthropic-version", "2023-06-01")
                 .header("content-type", "application/json")
@@ -1156,6 +1188,7 @@ impl Default for AnthropicDecoder {
                 input_tokens: 0,
                 output_tokens: 0,
                 cache_tokens: 0,
+                cost_usd: None,
             },
             last_event: String::new(),
             emitted_finish: false,
@@ -1434,6 +1467,7 @@ impl SseDecode for OllamaDecoder {
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0),
                 cache_tokens: 0,
+                cost_usd: None,
             };
             if !self.seen_ids.is_empty() {
                 finish.reason = LlmFinishReason::ToolUse;
@@ -1490,6 +1524,7 @@ impl SseDecode for OllamaDecoder {
                 input_tokens: 0,
                 output_tokens: 0,
                 cache_tokens: 0,
+                cost_usd: None,
             })));
             self.done = true;
         }
@@ -1587,6 +1622,69 @@ mod tests {
             .as_ref()
             .err()
             .is_some_and(|e| e.to_string().contains("rate limited upstream"))));
+    }
+
+    #[test]
+    fn a_provider_reported_cost_is_carried_through() {
+        // OpenRouter reports what it actually charged on every response. That
+        // is exact for any model, including one the local price table has
+        // never heard of — which is the case this fixes.
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":9393,\"completion_tokens\":167,\"cost\":0.000508}}\n",
+            "data: [DONE]\n",
+        );
+        let events = parse_openai_events(body);
+        let finish = events
+            .iter()
+            .find_map(|e| match e {
+                Ok(LlmEvent::Finish(f)) => Some(f),
+                _ => None,
+            })
+            .expect("a finish event");
+        assert_eq!(finish.input_tokens, 9393);
+        assert_eq!(finish.output_tokens, 167);
+        assert_eq!(finish.cost_usd, Some(0.000508));
+    }
+
+    #[test]
+    fn a_free_route_reports_zero_rather_than_nothing() {
+        // `0.0` is an answer — it means free — and must not be mistaken for
+        // "the provider did not say".
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2,\"cost\":0}}\n",
+            "data: [DONE]\n",
+        );
+        let events = parse_openai_events(body);
+        let finish = events
+            .iter()
+            .find_map(|e| match e {
+                Ok(LlmEvent::Finish(f)) => Some(f),
+                _ => None,
+            })
+            .expect("a finish event");
+        assert_eq!(finish.cost_usd, Some(0.0));
+    }
+
+    #[test]
+    fn a_provider_that_reports_no_cost_leaves_it_unknown() {
+        // Everything that is not OpenRouter: the local table has to answer.
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2}}\n",
+            "data: [DONE]\n",
+        );
+        let events = parse_openai_events(body);
+        let finish = events
+            .iter()
+            .find_map(|e| match e {
+                Ok(LlmEvent::Finish(f)) => Some(f),
+                _ => None,
+            })
+            .expect("a finish event");
+        assert_eq!(finish.cost_usd, None);
     }
 
     #[test]

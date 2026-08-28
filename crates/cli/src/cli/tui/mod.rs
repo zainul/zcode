@@ -157,16 +157,57 @@ pub struct Totals {
     pub steps: u64,
     pub turns: u64,
     pub cost: Cost,
+    turn: TurnUsage,
+}
+
+/// What the turn in flight has reported so far.
+///
+/// Kept so each report can add only the *difference*: the engine sends running
+/// totals for the current turn, so adding them whole would count step 1 seven
+/// times over by step 7.
+#[derive(Debug, Default, Clone, Copy)]
+struct TurnUsage {
+    input: u64,
+    output: u64,
+    cache: u64,
+    cost_usd: f64,
 }
 
 impl Totals {
+    /// Fold in usage reported mid-turn, so the display moves while the money
+    /// is being spent rather than only once the turn settles.
+    fn set_turn_usage(&mut self, usage: &domain::LlmFinish) {
+        self.input_tokens += usage.input_tokens.saturating_sub(self.turn.input);
+        self.output_tokens += usage.output_tokens.saturating_sub(self.turn.output);
+        self.cache_tokens += usage.cache_tokens.saturating_sub(self.turn.cache);
+        self.turn.input = usage.input_tokens;
+        self.turn.output = usage.output_tokens;
+        self.turn.cache = usage.cache_tokens;
+
+        if let Some(reported) = usage.cost_usd {
+            let delta = reported - self.turn.cost_usd;
+            if delta > 0.0 {
+                self.cost.add(Cost::from_reported_usd(delta));
+            }
+            self.turn.cost_usd = reported;
+        }
+    }
+
     fn record(&mut self, result: &ExecutionResult) {
-        self.input_tokens += result.input_tokens;
-        self.output_tokens += result.output_tokens;
-        self.cache_tokens += result.cache_tokens;
+        // Reconcile against what the turn already reported rather than adding
+        // it again — the mid-turn reports and the final result describe the
+        // same tokens.
+        self.input_tokens += result.input_tokens.saturating_sub(self.turn.input);
+        self.output_tokens += result.output_tokens.saturating_sub(self.turn.output);
+        self.cache_tokens += result.cache_tokens.saturating_sub(self.turn.cache);
         self.steps += result.steps;
         self.turns += 1;
-        self.cost.add(result.cost);
+        // A cost the provider reported has already been counted and is exact;
+        // the local estimate must not be added on top of it.
+        if self.turn.cost_usd <= 0.0 {
+            self.cost.add(result.cost);
+        }
+        self.turn = TurnUsage::default();
     }
 }
 
@@ -189,6 +230,19 @@ pub struct TuiState {
     pub tool_names: Vec<String>,
     /// Names from the config's `providers` array, for `/provider`.
     pub providers: Vec<String>,
+    /// Runs the user has explicitly folded or unfolded, by run id.
+    ///
+    /// An override, not the state: a run is expanded by default while a call
+    /// in it is still running, and folded once it settles, so the work in
+    /// flight is always visible without anyone asking. This map records only
+    /// the runs someone has since disagreed with.
+    pub run_override: std::collections::HashMap<u32, bool>,
+    /// Screen rows carrying a run header, and the run each one folds.
+    ///
+    /// Recorded during the draw, because only the draw knows which rows are
+    /// on screen after wrapping and scrolling — the same reason `max_scroll`
+    /// lives there.
+    pub header_rows: Vec<(u16, u32)>,
     /// Rows scrolled back from the tail; 0 means "following the tail".
     pub scrollback: u16,
     /// The drag in progress, or the one just finished.
@@ -234,6 +288,8 @@ impl Default for TuiState {
             totals: Totals::default(),
             tool_names: Vec::new(),
             providers: Vec::new(),
+            run_override: std::collections::HashMap::new(),
+            header_rows: Vec::new(),
             selection: None,
             selected_text: String::new(),
             pane: Rect::new(0, 0, 0, 0),
@@ -247,6 +303,82 @@ impl Default for TuiState {
 }
 
 impl TuiState {
+    /// The run whose header occupies screen row `row`, if any.
+    pub fn header_at(&self, row: u16) -> Option<u32> {
+        self.header_rows
+            .iter()
+            .find(|(at, _)| *at == row)
+            .map(|(_, run)| *run)
+    }
+
+    /// Whether a run of tool calls is shown open.
+    ///
+    /// The default follows the work — open while a call is running, folded
+    /// once they have all settled — and an explicit toggle overrides it.
+    pub fn run_is_expanded(&self, run: u32, summary: RunSummary) -> bool {
+        self.run_override
+            .get(&run)
+            .copied()
+            .unwrap_or_else(|| summary.expanded_by_default())
+    }
+
+    /// Fold or unfold one run.
+    pub fn toggle_run(&mut self, run: u32) {
+        let entries = self.timeline.entries();
+        let start = entries
+            .iter()
+            .position(|e| entry_run(e) == Some(run))
+            .unwrap_or(0);
+        let now = self.run_is_expanded(run, run_summary(entries, start));
+        self.run_override.insert(run, !now);
+        // The rows underneath a fold have just moved.
+        self.clear_selection();
+    }
+
+    /// Whether every run on screen is currently folded, so `Ctrl-T` knows
+    /// which way to go.
+    fn every_run_folded(&self) -> bool {
+        let entries = self.timeline.entries();
+        let mut seen = false;
+        for (i, entry) in entries.iter().enumerate() {
+            let Some(run) = entry_run(entry) else {
+                continue;
+            };
+            if i > 0 && entries[i - 1].is_tool() {
+                continue;
+            }
+            seen = true;
+            if self.run_is_expanded(run, run_summary(entries, i)) {
+                return false;
+            }
+        }
+        seen
+    }
+
+    /// Fold or unfold every run at once.
+    fn set_all_runs(&mut self, expanded: bool) {
+        let runs: Vec<u32> = self
+            .timeline
+            .entries()
+            .iter()
+            .filter_map(entry_run)
+            .collect();
+        for run in runs {
+            self.run_override.insert(run, expanded);
+        }
+        self.clear_selection();
+    }
+
+    /// Where to draw the caret when the pointer is in the conversation.
+    ///
+    /// `None` means the prompt keeps it, which is every case except an active
+    /// or just-finished selection.
+    pub fn caret_in_conversation(&self) -> Option<(u16, u16)> {
+        let sel = self.selection?;
+        // The head, not the anchor: it is the end you are still moving.
+        Some(sel.head)
+    }
+
     /// Begin a drag, if it started inside the conversation.
     fn start_selection(&mut self, col: u16, row: u16) {
         if inside(self.pane, col, row) {
@@ -279,11 +411,22 @@ impl TuiState {
         };
         sel.dragging = false;
         if sel.is_empty() {
-            // A plain click is how you dismiss a selection, not an empty copy.
+            // A click that did not move is a click, not a selection. On a run
+            // header it folds; anywhere else it dismisses.
+            let (_, row) = sel.anchor;
             self.selection = None;
+            if let Some(run) = self.header_at(row) {
+                self.toggle_run(run);
+            }
             return;
         }
         let text = std::mem::take(&mut self.selected_text);
+        if text.trim().is_empty() {
+            // A drag across blank space selected nothing. Saying so would be
+            // a warning about a non-event.
+            self.selection = None;
+            return;
+        }
         let lines = text.lines().count().max(1);
         match clipboard::copy(&text, out) {
             Ok(how) => self.push_note(
@@ -432,6 +575,10 @@ impl TuiState {
                 }
             }
             UiEvent::Finish(_) => {}
+            // Usage so far in the turn in flight. Replaces rather than adds:
+            // the engine sends running totals for this turn, so accumulating
+            // them here would count step 1 seven times by step 7.
+            UiEvent::Usage(usage) => self.totals.set_turn_usage(&usage),
         }
     }
 
@@ -467,6 +614,18 @@ impl TuiState {
     }
 
     /// Attach the first fragment of a call's arguments to its running row.
+    /// Record what a running call was asked to do, from its argument stream.
+    ///
+    /// This is what the row shows once the call succeeds, so it is worth
+    /// getting right: the *first* fragment usually carries the command or the
+    /// path, and later fragments are the rest of a JSON object nobody wants
+    /// to read.
+    /// Record what a running call was asked to do, from its argument stream.
+    ///
+    /// This is what the row shows once the call succeeds, so it is worth
+    /// getting right: the first fragment usually carries the command or the
+    /// path, and later fragments are the rest of a JSON object nobody wants
+    /// to read.
     fn annotate_running_tool(&mut self, arguments: &str) {
         let summary = summarize_arguments(arguments);
         if summary.is_empty() {
@@ -1218,6 +1377,13 @@ fn handle_key(
         KeyCode::Char('u') if ctrl => state.input.kill_to_start(),
         KeyCode::Char('k') if ctrl => state.input.kill_to_end(),
         KeyCode::Char('l') if ctrl => state.timeline.clear(),
+        // Fold every run of tool calls, or open them all again. The mouse
+        // folds one at a time; this is the "show me only the conversation"
+        // and "show me everything" pair.
+        KeyCode::Char('t') if ctrl => {
+            let all_folded = state.every_run_folded();
+            state.set_all_runs(all_folded);
+        }
 
         // -- scrolling -------------------------------------------------------
         KeyCode::PageUp => state.scroll_up(PAGE_ROWS),
@@ -1231,6 +1397,10 @@ fn handle_key(
 
         KeyCode::Char('y') if ctrl => copy_last_answer(state),
         KeyCode::Char(c) => {
+            // Typing is prompt work, so the caret comes back to the prompt and
+            // the highlight goes: it would otherwise sit over the transcript
+            // while the text lands somewhere else.
+            state.clear_selection();
             // Typing while a recalled line is shown clears the recall pointer —
             // the edited text becomes the live draft, as in a shell.
             if state.history_cursor != state.history.len() {
@@ -1526,7 +1696,13 @@ fn draw_conversation(frame: &mut ratatui::Frame, state: &mut TuiState, area: Rec
     state.max_scroll = total.saturating_sub(height).min(u16::MAX as usize) as u16;
     state.scrollback = state.scrollback.min(state.max_scroll);
     let offset = tail_offset(total, height, state.scrollback) as usize;
-    let (_, rows) = render_timeline(state, width, Some((offset, height)));
+    let (_, rows, headers) = render_timeline(state, width, Some((offset, height)));
+    // Screen rows, for the click handler: the pane's border, then the row's
+    // position within the window.
+    state.header_rows = headers
+        .into_iter()
+        .map(|(index, run)| (area.y + 1 + index as u16, run))
+        .collect();
 
     let title = match state.scrollback {
         0 => " conversation ".to_string(),
@@ -1613,13 +1789,16 @@ fn render_timeline(
     state: &TuiState,
     width: usize,
     window: Option<(usize, usize)>,
-) -> (usize, Vec<Line<'static>>) {
+) -> (usize, Vec<Line<'static>>, Vec<(usize, u32)>) {
     let entries = state.timeline.entries();
     let body_width = width.saturating_sub(2).max(8);
     // Measured once for the whole frame: both walkers must agree on it or the
     // counted height would not match the rows built.
     let name_col = tool_name_col(entries);
     let mut rows: Vec<Line> = Vec::new();
+    // (index into `rows`, run id) for every header actually built, so a click
+    // can be turned back into the run it landed on.
+    let mut headers: Vec<(usize, u32)> = Vec::new();
     let mut total = 0usize;
     // Whether the row before this entry was blank, so a gap is never doubled
     // and never opens the pane.
@@ -1642,8 +1821,23 @@ fn render_timeline(
         let previous_was_tool = i > 0 && entries[i - 1].is_tool();
         let next_is_tool = entries.get(i + 1).is_some_and(|e| e.is_tool());
         let gap = needs_gap && entry_opens_a_block(entry);
-        let height =
-            gap as usize + entry_height(entry, body_width, width, previous_was_tool, name_col);
+        // A run is folded or open as a whole, so the decision is made once at
+        // its first entry and carried by every entry after it.
+        let fold = entry_run(entry).map(|run| {
+            let start = if previous_was_tool {
+                run_start(entries, i)
+            } else {
+                i
+            };
+            let summary = run_summary(entries, start);
+            Fold {
+                run,
+                summary,
+                expanded: state.run_is_expanded(run, summary),
+                is_header: !previous_was_tool,
+            }
+        });
+        let height = gap as usize + entry_height(entry, body_width, width, fold, name_col);
 
         // Skip entries entirely above the window: count them, build nothing.
         if let Some((skip, count)) = window {
@@ -1663,12 +1857,23 @@ fn render_timeline(
             entry,
             body_width,
             width,
-            previous_was_tool,
+            fold,
             next_is_tool,
             name_col,
             &mut group,
         );
+        // The header is the first row of the group, after any gap.
+        let header_at = fold
+            .filter(|f| f.is_header)
+            .map(|f| (rows.len() + usize::from(gap), f.run));
+        let before = rows.len();
         take(group, &mut total, &mut rows);
+        if let Some((index, run)) = header_at {
+            // Only if it actually landed inside the window.
+            if rows.len() > before && index < rows.len() {
+                headers.push((index, run));
+            }
+        }
         needs_gap = true;
     }
 
@@ -1687,7 +1892,91 @@ fn render_timeline(
         take(group, &mut total, &mut rows);
     }
 
-    (total, rows)
+    (total, rows, headers)
+}
+
+/// What a run of consecutive tool calls amounts to, for its header.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RunSummary {
+    calls: usize,
+    failed: usize,
+    running: usize,
+    elapsed_ms: u32,
+}
+
+impl RunSummary {
+    /// Whether this run is shown open when nobody has said otherwise.
+    ///
+    /// Two things stay visible without being asked for:
+    ///
+    /// * **Work in flight** — folding a call away while it is still happening
+    ///   hides the only thing on screen that is changing.
+    /// * **A failure** — the error is the text you have to act on, and a
+    ///   header reading "1 failed" tells you something went wrong while hiding
+    ///   what. Counting it and folding it would be the worst of both.
+    ///
+    /// Everything else folds once it settles, which is what keeps a long
+    /// session readable.
+    pub fn expanded_by_default(&self) -> bool {
+        self.running > 0 || self.failed > 0
+    }
+}
+
+/// Summarise the run beginning at `start`, which must be a tool entry.
+fn run_summary(entries: &[timeline::Entry], start: usize) -> RunSummary {
+    let mut summary = RunSummary::default();
+    for entry in entries[start..].iter() {
+        let EntryKind::Tool {
+            status, elapsed_ms, ..
+        } = &entry.kind
+        else {
+            break;
+        };
+        summary.calls += 1;
+        summary.elapsed_ms = summary.elapsed_ms.saturating_add(*elapsed_ms);
+        match status {
+            ToolStatus::Running => summary.running += 1,
+            ToolStatus::Failed | ToolStatus::Denied => summary.failed += 1,
+            ToolStatus::Ok => {}
+        }
+    }
+    summary
+}
+
+/// The run id of a tool entry, or `None` for anything else.
+fn entry_run(entry: &timeline::Entry) -> Option<u32> {
+    match entry.kind {
+        EntryKind::Tool { run, .. } => Some(run),
+        _ => None,
+    }
+}
+
+/// The header that opens a run, and folds it.
+fn run_header(summary: RunSummary, expanded: bool) -> Line<'static> {
+    let marker = if expanded { "▾" } else { "▸" };
+    let mut text = format!("  {marker} tools used");
+    if !expanded {
+        // Folded, the header is all there is, so it has to carry enough to
+        // decide whether opening it is worth doing.
+        text.push_str(&format!(
+            " · {} call{}",
+            summary.calls,
+            if summary.calls == 1 { "" } else { "s" }
+        ));
+        let elapsed = timeline::render_duration(summary.elapsed_ms);
+        if !elapsed.is_empty() {
+            text.push_str(&format!(" · {elapsed}"));
+        }
+        if summary.failed > 0 {
+            text.push_str(&format!(" · {} failed", summary.failed));
+        }
+    }
+    let colour = if summary.failed > 0 {
+        Color::Red
+    } else {
+        Color::DarkGray
+    };
+    Line::styled(text, Style::default().fg(colour))
 }
 
 /// Whether an entry starts a new block, and so wants a blank line above it.
@@ -1701,11 +1990,30 @@ fn entry_opens_a_block(entry: &timeline::Entry) -> bool {
 /// Must agree with [`entry_rows`] exactly, or the scroll window would be
 /// placed against a height the renderer does not produce. `rows_match_height`
 /// pins that for every entry kind.
+/// How a run of tool calls is being shown on this frame.
+#[derive(Debug, Clone, Copy)]
+struct Fold {
+    run: u32,
+    summary: RunSummary,
+    expanded: bool,
+    /// This entry is the first of its run, so it draws the header.
+    is_header: bool,
+}
+
+/// Walk back to the first entry of the run containing `i`.
+fn run_start(entries: &[timeline::Entry], i: usize) -> usize {
+    let mut start = i;
+    while start > 0 && entries[start - 1].is_tool() {
+        start -= 1;
+    }
+    start
+}
+
 fn entry_height(
     entry: &timeline::Entry,
     body_width: usize,
     width: usize,
-    previous_was_tool: bool,
+    fold: Option<Fold>,
     name_col: usize,
 ) -> usize {
     match &entry.kind {
@@ -1722,14 +2030,27 @@ fn entry_height(
             detail,
             status,
             elapsed_ms,
+            ..
         } => {
+            let fold = fold.unwrap_or(Fold {
+                run: 0,
+                summary: RunSummary::default(),
+                expanded: true,
+                is_header: true,
+            });
+            let header = usize::from(fold.is_header);
+            if !fold.expanded {
+                // Folded, the run is exactly its header — and only the first
+                // entry draws that.
+                return header;
+            }
             let room = tool_detail_room(name, *elapsed_ms, width, name_col);
             let below = if detail_wraps_below(detail, *status, room) {
                 detail_height(detail, width)
             } else {
                 0
             };
-            usize::from(!previous_was_tool) + 1 + below
+            header + 1 + below
         }
         EntryKind::Note { text, .. } => wrap::height(text, body_width.saturating_sub(2)),
     }
@@ -1742,7 +2063,7 @@ fn entry_rows(
     entry: &timeline::Entry,
     body_width: usize,
     width: usize,
-    previous_was_tool: bool,
+    fold: Option<Fold>,
     next_is_tool: bool,
     name_col: usize,
     out: &mut Vec<Line<'static>>,
@@ -1769,13 +2090,21 @@ fn entry_rows(
             detail,
             status,
             elapsed_ms,
+            ..
         } => {
-            // Head the run with a label, so the group reads as one block.
-            if !previous_was_tool {
-                out.push(Line::styled(
-                    "  tools used",
-                    Style::default().fg(Color::DarkGray),
-                ));
+            let fold = fold.unwrap_or(Fold {
+                run: 0,
+                summary: RunSummary::default(),
+                expanded: true,
+                is_header: true,
+            });
+            // Head the run with a label, so the group reads as one block — and
+            // so there is something to click to fold it.
+            if fold.is_header {
+                out.push(run_header(fold.summary, fold.expanded));
+            }
+            if !fold.expanded {
+                return;
             }
             let branch = if next_is_tool { "├" } else { "└" };
             let room = tool_detail_room(name, *elapsed_ms, width, name_col);
@@ -2021,6 +2350,16 @@ fn draw_input(frame: &mut ratatui::Frame, state: &TuiState, area: Rect) {
     frame.render_widget(widget, area);
 
     // A visible caret: the single most-missed piece of terminal-app etiquette.
+    //
+    // It follows the pointer. Clicking into the conversation puts it on the
+    // cell you clicked, so the thing you are about to select from is the thing
+    // showing a cursor; typing, or Esc, brings it back to the prompt. Leaving
+    // it blinking in the prompt while you drag through the transcript points
+    // at the wrong place entirely.
+    if let Some(at) = state.caret_in_conversation() {
+        frame.set_cursor_position(Position::new(at.0, at.1));
+        return;
+    }
     let x = area.x + 1 + 2 + cursor_col as u16;
     let y = area.y + 1 + (cursor_row - offset) as u16;
     frame.set_cursor_position(Position::new(
@@ -2207,6 +2546,7 @@ mod tests {
             agent_texts(&state),
             vec!["Let me look at the file.".to_string()]
         );
+        open_runs(&mut state);
         let text = text_of(&state);
         let prose = text.find("Let me look").expect("prose is shown");
         let tools = text.find("tools used").expect("the group is labelled");
@@ -2236,6 +2576,7 @@ mod tests {
                 elapsed_ms: 12,
             });
         }
+        open_runs(&mut state);
         let text = text_of(&state);
         // One header for the run, and the last row closes the bracket.
         assert_eq!(text.matches("tools used").count(), 1, "{text}");
@@ -2257,6 +2598,7 @@ mod tests {
             error: Some("blocked by the allowlist".into()),
             elapsed_ms: 12,
         });
+        open_runs(&mut state);
         let text = text_of(&state);
         assert!(text.contains('✖'), "{text}");
         assert!(text.contains("blocked by the allowlist"), "{text}");
@@ -2272,6 +2614,7 @@ mod tests {
         state.apply(UiEvent::Error(
             "tool `apply_patch` denied: planning mode is read-only".into(),
         ));
+        open_runs(&mut state);
         let text = text_of(&state);
         assert!(text.contains('⊘'), "{text}");
         assert_eq!(text.matches("apply_patch").count(), 1, "{text}");
@@ -2292,6 +2635,7 @@ mod tests {
             error: None,
             elapsed_ms: 12,
         });
+        open_runs(&mut state);
         let clock = regex_free_clock_count(&text_of(&state));
         assert!(
             clock >= 2,
@@ -2717,8 +3061,15 @@ mod tests {
          zcode.json/zcode.toml): cd /workspace && go build ./... 2>&1 | head\n  hint: \
          no pattern in `shell_allowed` matches `cd`; add one, e.g. \"cd( .*)?\"";
 
+    /// Open every run, for tests about how a row is drawn rather than about
+    /// whether it is folded. Settled runs fold by default, which is the point
+    /// of the feature and not what those tests are checking.
+    fn open_runs(state: &mut TuiState) {
+        state.set_all_runs(true);
+    }
+
     fn rendered(state: &TuiState, width: usize) -> String {
-        let (_, rows) = render_timeline(state, width, None);
+        let (_, rows, _) = render_timeline(state, width, None);
         rows.iter()
             .map(|line| {
                 line.spans
@@ -2739,6 +3090,7 @@ mod tests {
             .finish_tool("shell", BLOCKED, ToolStatus::Failed, 12);
 
         for width in [40usize, 60, 80, 100, 160] {
+            open_runs(&mut state);
             let text = rendered(&state, width);
             assert!(
                 !text.contains('…'),
@@ -2792,6 +3144,371 @@ mod tests {
         );
     }
 
+    fn usage(input: u64, output: u64, cost: Option<f64>) -> domain::LlmFinish {
+        domain::LlmFinish {
+            reason: domain::LlmFinishReason::ToolUse,
+            input_tokens: input,
+            output_tokens: output,
+            cache_tokens: 0,
+            cost_usd: cost,
+        }
+    }
+
+    #[test]
+    fn tokens_move_while_a_turn_is_still_running() {
+        // The reported bug: the bar read `0 in / 0 out` for the whole of a
+        // multi-step turn, which can be minutes of billed work.
+        let mut state = TuiState::default();
+        state.apply(UiEvent::Usage(usage(2280, 71, Some(0.000189))));
+        assert_eq!(state.totals.input_tokens, 2280);
+        assert_eq!(state.totals.output_tokens, 71);
+        assert!(state.totals.cost.priced, "a reported cost is a known cost");
+    }
+
+    #[test]
+    fn running_totals_are_not_counted_once_per_step() {
+        // The engine reports the turn's running total, not a per-step delta.
+        // Adding each report whole would count step 1 seven times by step 7.
+        let mut state = TuiState::default();
+        state.apply(UiEvent::Usage(usage(2280, 71, Some(0.000189))));
+        state.apply(UiEvent::Usage(usage(11673, 238, Some(0.000697))));
+        assert_eq!(state.totals.input_tokens, 11673);
+        assert_eq!(state.totals.output_tokens, 238);
+        assert!((state.totals.cost.total_usd() - 0.000697).abs() < 1e-9);
+    }
+
+    #[test]
+    fn settling_a_turn_does_not_double_count_what_it_reported() {
+        let mut state = TuiState::default();
+        state.apply(UiEvent::Usage(usage(11673, 238, Some(0.000697))));
+        let mut settled = result(1, "done");
+        settled.input_tokens = 11673;
+        settled.output_tokens = 238;
+        settled.cost = Cost {
+            input_usd: 99.0,
+            priced: true,
+            ..Default::default()
+        };
+        state.finish_turn(Ok(settled));
+        assert_eq!(state.totals.input_tokens, 11673, "counted once");
+        assert_eq!(state.totals.output_tokens, 238);
+        // The provider's own figure wins; the estimate is not added on top.
+        assert!(
+            (state.totals.cost.total_usd() - 0.000697).abs() < 1e-9,
+            "got {}",
+            state.totals.cost.total_usd()
+        );
+    }
+
+    #[test]
+    fn a_second_turn_starts_from_a_clean_slate() {
+        let mut state = TuiState::default();
+        state.apply(UiEvent::Usage(usage(100, 10, Some(0.001))));
+        let mut settled = result(1, "done");
+        settled.input_tokens = 100;
+        settled.output_tokens = 10;
+        state.finish_turn(Ok(settled));
+        state.apply(UiEvent::Usage(usage(50, 5, Some(0.002))));
+        assert_eq!(
+            state.totals.input_tokens, 150,
+            "turn two adds, not replaces"
+        );
+        assert!((state.totals.cost.total_usd() - 0.003).abs() < 1e-9);
+    }
+
+    #[test]
+    fn an_unpriced_model_still_reports_its_tokens() {
+        // A provider that reports no cost leaves the estimate to the table;
+        // the token counts are still real and must show.
+        let mut state = TuiState::default();
+        state.apply(UiEvent::Usage(usage(500, 20, None)));
+        assert_eq!(state.totals.input_tokens, 500);
+        assert!(!state.totals.cost.priced);
+    }
+
+    #[test]
+    fn a_successful_row_shows_what_ran_not_what_came_back() {
+        // The reported bug: a shell row read `total 32` — the first line of
+        // the output — where it should say which command produced it.
+        let mut state = TuiState::default();
+        state.apply(UiEvent::ToolCallStart {
+            id: "1".into(),
+            name: "shell".into(),
+        });
+        state.apply(UiEvent::ToolCallArgs {
+            id: "1".into(),
+            arguments: r#"{"command":"ls -lah"}"#.into(),
+        });
+        state.apply(UiEvent::ToolResult {
+            tool_call_id: "1".into(),
+            name: "shell".into(),
+            content: "total 32
+drwxr-xr-x  ..."
+                .into(),
+            error: None,
+            elapsed_ms: 72,
+        });
+        open_runs(&mut state);
+        let text = rendered(&state, 100);
+        assert!(text.contains("ls -lah"), "{text}");
+        assert!(!text.contains("total 32"), "{text}");
+    }
+
+    #[test]
+    fn a_failed_row_shows_the_error_not_the_command() {
+        // Once it fails, the error is the thing to act on — and the row is
+        // labelled `shell` either way, so nothing is lost.
+        let mut state = TuiState::default();
+        state.apply(UiEvent::ToolCallStart {
+            id: "1".into(),
+            name: "shell".into(),
+        });
+        state.apply(UiEvent::ToolCallArgs {
+            id: "1".into(),
+            arguments: r#"{"command":"asked"}"#.into(),
+        });
+        state.apply(UiEvent::ToolResult {
+            tool_call_id: "1".into(),
+            name: "shell".into(),
+            content: String::new(),
+            error: Some("sh: asked: command not found".into()),
+            elapsed_ms: 72,
+        });
+        open_runs(&mut state);
+        assert!(rendered(&state, 100).contains("command not found"));
+    }
+
+    #[test]
+    fn a_tool_that_reports_no_arguments_still_shows_its_result() {
+        let mut state = TuiState::default();
+        state.timeline.start_tool("read", "");
+        state
+            .timeline
+            .finish_tool("read", "package main", ToolStatus::Ok, 12);
+        open_runs(&mut state);
+        assert!(rendered(&state, 100).contains("package main"));
+    }
+
+    #[test]
+    fn the_caret_follows_the_pointer_into_the_conversation() {
+        // Clicking the transcript should put the cursor where you clicked, not
+        // leave it blinking in the prompt you are not typing into.
+        let mut state = pane_state();
+        assert_eq!(state.caret_in_conversation(), None, "the prompt has it");
+
+        state.start_selection(10, 4);
+        state.extend_selection(30, 6);
+        assert_eq!(
+            state.caret_in_conversation(),
+            Some((30, 6)),
+            "the moving end"
+        );
+
+        state.clear_selection();
+        assert_eq!(
+            state.caret_in_conversation(),
+            None,
+            "and back to the prompt"
+        );
+    }
+
+    #[test]
+    fn typing_takes_the_caret_back_to_the_prompt() {
+        let mut state = pane_state();
+        state.start_selection(10, 4);
+        state.extend_selection(30, 6);
+
+        let (cmd_tx, _rx) = std::sync::mpsc::channel();
+        let cancel = CancelFlag::default();
+        handle_key(
+            &mut state,
+            ratatui::crossterm::event::KeyEvent::new(
+                KeyCode::Char('x'),
+                ratatui::crossterm::event::KeyModifiers::NONE,
+            ),
+            &cancel,
+            &cmd_tx,
+        );
+        assert_eq!(state.caret_in_conversation(), None);
+        assert_eq!(state.input.text(), "x");
+    }
+
+    // ---- folding a run of tool calls ---------------------------------------
+
+    fn run_of(state: &mut TuiState, calls: &[(&str, &str)], settle: bool) {
+        for (id, name) in calls {
+            state.apply(UiEvent::ToolCallStart {
+                id: (*id).into(),
+                name: (*name).into(),
+            });
+            if settle {
+                state.apply(UiEvent::ToolResult {
+                    tool_call_id: (*id).into(),
+                    name: (*name).into(),
+                    content: "ok".into(),
+                    error: None,
+                    elapsed_ms: 12,
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn work_in_flight_is_shown_without_being_asked() {
+        // Folding a call away while it is still happening would hide the only
+        // thing on screen that is changing.
+        let mut state = TuiState::default();
+        run_of(&mut state, &[("c1", "shell")], false);
+        let text = rendered(&state, 100);
+        assert!(text.contains("▾ tools used"), "{text}");
+        assert!(text.contains("shell"), "{text}");
+    }
+
+    #[test]
+    fn a_settled_run_folds_itself_away() {
+        let mut state = TuiState::default();
+        state.timeline.push_agent("I'll look at three things.");
+        run_of(
+            &mut state,
+            &[("c1", "read"), ("c2", "list_dir"), ("c3", "shell")],
+            true,
+        );
+        let text = rendered(&state, 100);
+        assert!(text.contains("▸ tools used · 3 calls"), "{text}");
+        // The conversation survives; only the calls are folded.
+        assert!(text.contains("I'll look at three things."), "{text}");
+        assert!(!text.contains("list_dir"), "{text}");
+    }
+
+    #[test]
+    fn a_folded_header_says_enough_to_decide_whether_to_open_it() {
+        let mut state = TuiState::default();
+        run_of(&mut state, &[("c1", "read"), ("c2", "shell")], true);
+        state.apply(UiEvent::ToolCallStart {
+            id: "c3".into(),
+            name: "shell".into(),
+        });
+        state.apply(UiEvent::ToolResult {
+            tool_call_id: "c3".into(),
+            name: "shell".into(),
+            content: String::new(),
+            error: Some("blocked".into()),
+            elapsed_ms: 5,
+        });
+        // A failure keeps the run open, so the message is right there.
+        let text = rendered(&state, 100);
+        assert!(text.contains("▾ tools used"), "{text}");
+        assert!(
+            text.contains("blocked"),
+            "the failure is not hidden: {text}"
+        );
+
+        // Folded by hand, the header still accounts for it.
+        let run = state
+            .timeline
+            .entries()
+            .iter()
+            .find_map(entry_run)
+            .expect("a tool entry");
+        state.toggle_run(run);
+        let folded = rendered(&state, 100);
+        assert!(folded.contains("3 calls"), "{folded}");
+        assert!(folded.contains("1 failed"), "{folded}");
+    }
+
+    #[test]
+    fn clicking_the_header_folds_and_unfolds_that_run() {
+        let mut state = pane_state();
+        run_of(&mut state, &[("c1", "read"), ("c2", "shell")], true);
+        // Draw once so the header's screen row is recorded.
+        let (_, _, headers) = render_timeline(&state, 100, None);
+        let (index, run) = headers[0];
+        state.header_rows = vec![(state.pane.y + 1 + index as u16, run)];
+        let header_row = state.pane.y + 1 + index as u16;
+
+        assert!(!rendered(&state, 100).contains("read"), "folded to start");
+        // A click that does not move is a click, not a selection.
+        state.start_selection(4, header_row);
+        state.finish_selection(&mut Vec::new());
+        assert!(
+            rendered(&state, 100).contains("read"),
+            "the click opened it"
+        );
+
+        state.header_rows = vec![(header_row, run)];
+        state.start_selection(4, header_row);
+        state.finish_selection(&mut Vec::new());
+        assert!(
+            !rendered(&state, 100).contains("read"),
+            "and folds it again"
+        );
+    }
+
+    #[test]
+    fn a_drag_over_a_header_selects_rather_than_folding() {
+        // Folding on any click would make the header impossible to copy.
+        let mut state = pane_state();
+        run_of(&mut state, &[("c1", "read")], true);
+        state.header_rows = vec![(4, 1)];
+        let before = rendered(&state, 100);
+
+        state.start_selection(4, 4);
+        state.extend_selection(20, 4);
+        state.finish_selection(&mut Vec::new());
+        assert_eq!(rendered(&state, 100), before, "the fold did not change");
+        assert!(state.run_override.is_empty(), "no run was toggled");
+    }
+
+    #[test]
+    fn folding_survives_entries_dropping_off_the_front() {
+        // Run ids are assigned once, so they cannot shift under the override
+        // the way a positional key would.
+        let mut state = TuiState::default();
+        run_of(&mut state, &[("c1", "read")], true);
+        let run = state
+            .timeline
+            .entries()
+            .iter()
+            .find_map(entry_run)
+            .expect("a tool entry");
+        state.toggle_run(run);
+        assert!(rendered(&state, 100).contains("read"), "opened");
+
+        for i in 0..timeline::MAX_ENTRIES {
+            state.timeline.push_agent(&format!("filler {i}"));
+        }
+        // The run is gone from the timeline, and the override is harmless.
+        assert!(state.run_override.contains_key(&run));
+        assert!(!rendered(&state, 100).contains("▸ tools used"));
+    }
+
+    #[test]
+    fn ctrl_t_folds_everything_then_opens_everything() {
+        let mut state = TuiState::default();
+        state.timeline.push_agent("one");
+        run_of(&mut state, &[("c1", "read")], true);
+        state.timeline.push_agent("two");
+        run_of(&mut state, &[("c2", "shell")], true);
+
+        let (cmd_tx, _rx) = std::sync::mpsc::channel();
+        let cancel = CancelFlag::default();
+        let ctrl_t = || {
+            ratatui::crossterm::event::KeyEvent::new(
+                KeyCode::Char('t'),
+                ratatui::crossterm::event::KeyModifiers::CONTROL,
+            )
+        };
+
+        // Everything is folded already, so the first press opens.
+        handle_key(&mut state, ctrl_t(), &cancel, &cmd_tx);
+        let open = rendered(&state, 100);
+        assert!(open.contains("read") && open.contains("shell"), "{open}");
+
+        handle_key(&mut state, ctrl_t(), &cancel, &cmd_tx);
+        let shut = rendered(&state, 100);
+        assert!(!shut.contains("read") && !shut.contains("shell"), "{shut}");
+    }
+
     #[test]
     fn a_short_failure_stays_on_its_row() {
         // Wrapping below costs a line; only pay it when there is no choice.
@@ -2800,6 +3517,7 @@ mod tests {
         state
             .timeline
             .finish_tool("read", "no such file", ToolStatus::Failed, 12);
+        open_runs(&mut state);
         let text = rendered(&state, 100);
         assert_eq!(text.lines().count(), 2, "{text}"); // label + row
         assert!(text.contains("no such file"), "{text}");
@@ -2813,6 +3531,7 @@ mod tests {
         state
             .timeline
             .finish_tool("read", &"x".repeat(1_000), ToolStatus::Ok, 12);
+        open_runs(&mut state);
         let text = rendered(&state, 100);
         assert_eq!(text.lines().count(), 2, "{text}");
         assert!(text.contains('…'), "{text}");
@@ -2825,7 +3544,7 @@ mod tests {
         // every width and every entry kind.
         let state = busy_timeline();
         for width in [20usize, 40, 60, 80, 100, 160] {
-            let (counted, all) = render_timeline(&state, width, None);
+            let (counted, all, _) = render_timeline(&state, width, None);
             assert_eq!(
                 counted,
                 all.len(),
@@ -2841,7 +3560,7 @@ mod tests {
         // are built, never about which.
         let state = busy_timeline();
         let width = 80;
-        let (total, all) = render_timeline(&state, width, None);
+        let (total, all, _) = render_timeline(&state, width, None);
         let text = |line: &Line| {
             line.spans
                 .iter()
@@ -2850,7 +3569,7 @@ mod tests {
         };
         for skip in 0..total {
             for take in [1usize, 5, 12, total] {
-                let (_, window) = render_timeline(&state, width, Some((skip, take)));
+                let (_, window, _) = render_timeline(&state, width, Some((skip, take)));
                 let expected: Vec<String> = all.iter().skip(skip).take(take).map(text).collect();
                 let got: Vec<String> = window.iter().map(text).collect();
                 assert_eq!(got, expected, "skip {skip} take {take}");
@@ -2861,8 +3580,8 @@ mod tests {
     #[test]
     fn a_window_past_the_end_is_empty_not_a_panic() {
         let state = busy_timeline();
-        let (total, _) = render_timeline(&state, 80, None);
-        let (_, rows) = render_timeline(&state, 80, Some((total + 100, 10)));
+        let (total, _, _) = render_timeline(&state, 80, None);
+        let (_, rows, _) = render_timeline(&state, 80, Some((total + 100, 10)));
         assert!(rows.is_empty());
     }
 

@@ -3,18 +3,18 @@ the same shape of command under "shell_allowed": [".*"]
 
 ┌────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │┌ conversation ────────────────────────────────────────────────────────────────────────────────────┐│
-││17:01:03  zcode                                                                                   ││
+││11:24:46  zcode                                                                                   ││
 ││  Ready when you are. Type /help for commands.                                                    ││
 ││                                                                                                  ││
-││17:01:05  you                                                                                     ││
+││11:24:46  you                                                                                     ││
 ││  run the pipeline                                                                                ││
 ││                                                                                                  ││
-││17:01:05  zcode                                                                                   ││
+││11:24:46  zcode                                                                                   ││
 ││  Running that for you now.                                                                       ││
-││  tools used                                                                                      ││
-││  └ ✔ 17:01:05  ❯ shell  b                                                                   43ms ││
+││  ▾ tools used                                                                                    ││
+││  └ ✔ 11:24:46  ❯ shell  cd /tmp && printf 'a\\nb\\n' 2>&1 | tail -1                         45ms ││
 ││                                                                                                  ││
-││17:01:05  zcode                                                                                   ││
+││11:24:46  zcode                                                                                   ││
 ││  That is what the shell had to say.                                                              ││
 ││                                                                                                  ││
 ││                                                                                                  ││

@@ -117,6 +117,12 @@ pub enum EntryKind {
         status: ToolStatus,
         /// Wall time the call took, milliseconds. 0 while running.
         elapsed_ms: u32,
+        /// Which run of consecutive calls this belongs to.
+        ///
+        /// Assigned once, when the call is recorded, so it survives entries
+        /// being dropped from the front — a positional key would shift under
+        /// the collapse state and fold the wrong group.
+        run: u32,
     },
     Note {
         text: Box<str>,
@@ -162,6 +168,10 @@ pub struct Timeline {
     utc_offset: i32,
     /// Monotonic base for `at`.
     started: std::time::Instant,
+    /// Id given to tool calls recorded now. Advances whenever something that
+    /// is not a tool call is pushed, so a run is exactly the calls that
+    /// happened between two messages.
+    run: u32,
 }
 
 impl Default for Timeline {
@@ -180,6 +190,7 @@ impl Timeline {
                 .unwrap_or(0),
             utc_offset,
             started: std::time::Instant::now(),
+            run: 0,
         }
     }
 
@@ -212,8 +223,18 @@ impl Timeline {
         if self.entries.len() >= MAX_ENTRIES {
             self.entries.remove(0);
         }
+        // Anything that is not a call ends the current run, so the next call
+        // starts a new one.
+        if !matches!(kind, EntryKind::Tool { .. }) {
+            self.run = self.run.wrapping_add(1);
+        }
         let at_ms = self.now_offset();
         self.entries.push(Entry { at_ms, kind });
+    }
+
+    /// The run tool calls recorded right now belong to.
+    pub fn current_run(&self) -> u32 {
+        self.run
     }
 
     pub fn push_user(&mut self, text: &str) {
@@ -238,6 +259,7 @@ impl Timeline {
             detail: clamp(detail, MAX_DETAIL),
             status: ToolStatus::Running,
             elapsed_ms: 0,
+            run: self.run,
         });
     }
 
@@ -246,6 +268,13 @@ impl Timeline {
     /// Matching by name from the end rather than by a stored index, because
     /// the index shifts when the bound drops entries from the front — and a
     /// stale index would rewrite an unrelated row.
+    /// A **successful** row keeps the invocation it was annotated with — the
+    /// command, the path — rather than being overwritten by the first line of
+    /// the output. `shell  ls -lah` says what happened; `shell  total 32`
+    /// makes you guess. A **failure** replaces it, because then the error is
+    /// the thing that needs acting on, and the row carries the tool name
+    /// either way.
+    ///
     /// `took_ms` is measured by the engine around the dispatch itself. The
     /// timeline cannot measure it here: events are drained in batches, so the
     /// interval between ingesting a start and ingesting its result describes
@@ -258,10 +287,14 @@ impl Timeline {
                 detail: entry_detail,
                 status: entry_status,
                 elapsed_ms,
+                ..
             } = &mut entry.kind
             {
                 if *entry_status == ToolStatus::Running && &**entry_name == name {
-                    *entry_detail = clamp(detail, MAX_DETAIL);
+                    let keep_invocation = status == ToolStatus::Ok && !entry_detail.is_empty();
+                    if !keep_invocation {
+                        *entry_detail = clamp(detail, MAX_DETAIL);
+                    }
                     *entry_status = status;
                     *elapsed_ms = took;
                     return;
@@ -274,6 +307,7 @@ impl Timeline {
             detail: clamp(detail, MAX_DETAIL),
             status,
             elapsed_ms: took,
+            run: self.run,
         });
     }
 
@@ -446,6 +480,37 @@ mod tests {
             panic!("not a tool entry");
         };
         assert_eq!(*status, ToolStatus::Ok);
+        // The invocation survives: the row says what was read, not what the
+        // file happened to start with.
+        assert_eq!(&**detail, "path=main.go");
+    }
+
+    #[test]
+    fn a_failure_replaces_the_invocation_with_the_error() {
+        let mut t = timeline();
+        t.start_tool("shell", "asked");
+        t.finish_tool(
+            "shell",
+            "sh: asked: command not found",
+            ToolStatus::Failed,
+            72,
+        );
+        let EntryKind::Tool { detail, .. } = &t.entries()[0].kind else {
+            panic!("not a tool entry");
+        };
+        assert_eq!(&**detail, "sh: asked: command not found");
+    }
+
+    #[test]
+    fn a_call_with_no_invocation_falls_back_to_its_result() {
+        // Not every tool reports arguments worth showing; the row must not be
+        // left blank.
+        let mut t = timeline();
+        t.start_tool("read", "");
+        t.finish_tool("read", "package main", ToolStatus::Ok, 12);
+        let EntryKind::Tool { detail, .. } = &t.entries()[0].kind else {
+            panic!("not a tool entry");
+        };
         assert_eq!(&**detail, "package main");
     }
 

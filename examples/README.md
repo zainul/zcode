@@ -9,7 +9,7 @@ limit is legible.
 ```
 examples/
 ├── run-acceptance.sh     40 checks over the CLI surface
-├── tui-screenshot.py     76 checks; drives the TUI on a pty
+├── tui-screenshot.py     88 checks; drives the TUI on a pty
 ├── fake-provider.py      429s, a canned tool call, or N numbered lines
 ├── demo-go/              a Go project the agent edits and builds
 ├── demo-rust/            a Rust project
@@ -20,6 +20,7 @@ examples/
 ├── open-shell/           the same, with `"shell_allowed": [".*"]`
 ├── scrolling/            an answer taller than the pane, for the scroll checks
 ├── multi-provider/       three endpoints, for `/provider` and `--provider`
+├── paid-usage/           a paid model no price table knows, for the usage checks
 ├── fixtures/             pristine copies, restored before each run
 └── captures/             the output — real, regenerated, not hand-written
 ```
@@ -69,6 +70,15 @@ call.
 
 Both write to `examples/captures/` and print a pass/fail tally. Non-zero exit
 means something regressed.
+
+## No timing bets
+
+Scenarios wait for the thing they need rather than for a number of seconds.
+`t.ready()` blocks until the opening frame is actually drawn; `wait_for` polls
+for a pattern. A fixed `pump(2.0)` is a bet on how long startup takes, and a
+cold binary — the first run after a build, with a language server to spawn —
+loses it. That produced a suite that passed locally and failed in CI, which is
+the least useful kind of test.
 
 ## Why a pty
 

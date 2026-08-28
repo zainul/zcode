@@ -15,17 +15,19 @@ Effective configuration
   model                  poolside/laguna-s-2.1:free
   api_key_env            ZCODE_OPENROUTER_API_KEY  [set]
   endpoint               https://openrouter.ai/api/v1/chat/completions (provider default)
-  providers              5  (--provider NAME, or /provider NAME in the TUI)
+  providers              6  (--provider NAME, or /provider NAME in the TUI)
       fast         openrouter         anthropic/claude-sonnet-4.5
                    https://openrouter.ai/api/v1/chat/completions
-      free-openrouter openrouter         liquid/lfm-2.5-2.6b:free
+      free-openrouter openrouter         poolside/laguna-s-2.1:free
+                   https://openrouter.ai/api/v1/chat/completions
+      paid-openrouter openrouter         z-ai/glm-5.3-flash
                    https://openrouter.ai/api/v1/chat/completions
       free-groq    openai-compatible  qwen/qwen3.6-27b
                    https://api.groq.com/openai/v1/chat/completions
       gateway      openai-compatible  internal-1
                    https://gateway.internal/v1/chat/completions
-      local        ollama             qwen2.5-coder
-                   http://127.0.0.1:11434/api/chat
+      mul.ai       lmstudio           qwen/qwen3.5-9b
+                   http://100.123.185.66:1234/v1
   working_dir            /Users/zainul/rust/zcode/examples/broken
   mode                   auto
   timeout_ms             120000

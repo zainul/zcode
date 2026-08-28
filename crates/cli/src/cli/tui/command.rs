@@ -81,6 +81,8 @@ pub const KEYS: &[(&str, &str)] = &[
     ),
     ("Ctrl-Up / Ctrl-Down", "scroll one line"),
     ("Drag", "select; releasing copies to the clipboard"),
+    ("Click a `tools used` header", "fold or unfold that run"),
+    ("Ctrl-T", "fold or unfold every run of tool calls"),
     ("Shift-Tab", "cycle mode"),
     ("Ctrl-Y", "copy the last answer to the clipboard"),
     ("Up / Down", "recall the previous / next sent prompt"),

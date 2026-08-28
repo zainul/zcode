@@ -3,21 +3,21 @@ the configured providers, active one marked
 
 ┌────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │┌ conversation ────────────────────────────────────────────────────────────────────────────────────┐│
-││17:01:24  zcode                                                                                   ││
+││11:25:04  zcode                                                                                   ││
 ││  Ready when you are. Type /help for commands.                                                    ││
 ││                                                                                                  ││
-││17:01:26  zcode                                                                                   ││
-││  7 provider(s) configured:                                                                       ││
+││11:25:04  zcode                                                                                   ││
+││  9 provider(s) configured:                                                                       ││
 ││      fast                                                                                        ││
 ││      free-openrouter                                                                             ││
+││      paid-openrouter                                                                             ││
 ││      free-groq                                                                                   ││
 ││      gateway                                                                                     ││
-││      local                                                                                       ││
+││      mul.ai                                                                                      ││
 ││    ▸ primary                                                                                     ││
 ││      backup                                                                                      ││
+││      local                                                                                       ││
 ││    (/provider <name> to switch)                                                                  ││
-││                                                                                                  ││
-││                                                                                                  ││
 ││                                                                                                  ││
 ││                                                                                                  ││
 ││                                                                                                  ││

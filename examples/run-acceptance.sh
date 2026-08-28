@@ -79,6 +79,22 @@ expect_after() {
   expect "$name" "$pattern"
 }
 
+# refute <name> <pattern> — the capture must NOT contain this.
+#
+# A separate helper rather than a negated pattern: `grep -E` has no negative
+# lookahead, and `^(?!…)` silently becomes an invalid-operand error rather than
+# a passing check. Absence is worth asserting in its own right — a panic in the
+# output is a defect no positive pattern would catch.
+refute() {
+  local name="$1" pattern="$2"
+  if grep -qE "$pattern" "$OUT/$name.txt"; then
+    fail=$((fail+1)); echo "   ✗ UNEXPECTED /$pattern/ in $name"
+  else
+    pass=$((pass+1)); echo "   ✓ absent /$pattern/"
+  fi
+  echo
+}
+
 banner() { echo; echo "═══ $1 ══════════════════════════════════════════"; echo; }
 
 # Free OpenRouter routes are rate limited per minute. Sections that make
@@ -102,6 +118,15 @@ expect  help-run       'planning \(read-only\) \| editing \(edits files\) \| aut
 
 capture help-session   "$ROOT"    "$ZCODE" session --help
 expect  help-session   'fork'
+
+# `cmd | head` must not panic. Rust ignores SIGPIPE, so a write to a closed
+# pipe returns EPIPE and `println!` turns that into a panic — which is what
+# put "failed printing to stdout: Broken pipe" into a tool result.
+capture pipe-config   "$GO_DEMO" sh -c "$ZCODE config 2>&1 | head -1"
+expect  pipe-config   'Config sources'
+refute  pipe-config   'Broken pipe|panicked'
+capture pipe-tools    "$GO_DEMO" sh -c "$ZCODE tools list 2>&1 | head -1"
+refute  pipe-tools    'Broken pipe|panicked'
 
 # A bad flag is a usage error (exit 2), not a crash.
 capture bad-flag       "$ROOT"    "$ZCODE" run --nonsense hi

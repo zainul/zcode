@@ -15,21 +15,25 @@ Effective configuration
   model                  gpt-4o-mini
   api_key_env            ZCODE_API_KEY  [NOT SET]
   endpoint               http://127.0.0.1:8095/v1/chat/completions
-  providers              7  (--provider NAME, or /provider NAME in the TUI)
+  providers              9  (--provider NAME, or /provider NAME in the TUI)
       fast         openrouter         anthropic/claude-sonnet-4.5
                    https://openrouter.ai/api/v1/chat/completions
-      free-openrouter openrouter         liquid/lfm-2.5-2.6b:free
+      free-openrouter openrouter         poolside/laguna-s-2.1:free
+                   https://openrouter.ai/api/v1/chat/completions
+      paid-openrouter openrouter         z-ai/glm-5.3-flash
                    https://openrouter.ai/api/v1/chat/completions
       free-groq    openai-compatible  qwen/qwen3.6-27b
                    https://api.groq.com/openai/v1/chat/completions
       gateway      openai-compatible  internal-1
                    https://gateway.internal/v1/chat/completions
-      local        ollama             llama3.2
-                   http://localhost:11434/api/chat
+      mul.ai       lmstudio           qwen/qwen3.5-9b
+                   http://100.123.185.66:1234/v1
     ▸ primary      openai-compatible  gpt-4o-mini
                    http://127.0.0.1:8095/v1/chat/completions
       backup       openai-compatible  backup-model
                    http://127.0.0.1:8094/v1/chat/completions
+      local        ollama             llama3.2
+                   http://localhost:11434/api/chat
   working_dir            /Users/zainul/rust/zcode/examples/multi-provider
   mode                   auto
   timeout_ms             120000

@@ -115,6 +115,13 @@ pub struct LlmFinish {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_tokens: u64,
+    /// What the provider says the call cost, in USD, when it says so.
+    ///
+    /// Authoritative where present: it is the number that will appear on the
+    /// bill, for the model actually served, at the rate actually charged. The
+    /// local price table is an estimate for providers that report nothing, and
+    /// cannot know about a model it has never heard of.
+    pub cost_usd: Option<f64>,
 }
 
 /// A transient provider failure that was retried rather than surfaced as an
@@ -389,6 +396,13 @@ pub enum UiEvent {
         elapsed_ms: u64,
     },
     Finish(LlmFinish),
+    /// Usage so far in this turn, emitted after every provider call.
+    ///
+    /// Distinct from `Finish`, which arrives once and means the turn is over.
+    /// A turn that calls tools runs for many steps, each already billed, so
+    /// waiting for `Finish` to report anything leaves the display reading
+    /// `0 in / 0 out` through minutes of spending.
+    Usage(LlmFinish),
     /// A provider call was retried (rate limit, transient 5xx, timeout).
     Retry(RetryNotice),
     /// Informational message from the engine itself, not the model.

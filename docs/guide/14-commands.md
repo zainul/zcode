@@ -236,6 +236,8 @@ unknown command `/exitt` — /help lists them all
 | `PageUp` / `PageDown` | Scroll the conversation a page |
 | `Ctrl-↑` / `Ctrl-↓` | Scroll one line |
 | `Ctrl-Home` / `Ctrl-End` | Jump to the oldest / newest line |
+| Click a `tools used` header | Fold or unfold that run of tool calls |
+| `Ctrl-T` | Fold or unfold every run |
 
 zcode asks the terminal to report mouse events so the wheel can scroll, which
 stops the terminal doing its own selection — so zcode does it: drag to select,

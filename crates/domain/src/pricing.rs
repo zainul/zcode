@@ -57,6 +57,23 @@ impl Cost {
         self.input_usd + self.output_usd + self.cache_usd
     }
 
+    /// Adopt a figure the provider reported, in place of the estimate.
+    ///
+    /// Authoritative where available: it is what will appear on the bill, for
+    /// the model actually served, at the rate actually charged — including
+    /// models the local table has never heard of, which is otherwise the one
+    /// case that renders `n/a` while real money is being spent. Recorded as
+    /// input cost because the split is not reported and inventing one would be
+    /// a worse lie than not splitting it.
+    pub fn from_reported_usd(total: f64) -> Self {
+        Self {
+            input_usd: total,
+            output_usd: 0.0,
+            cache_usd: 0.0,
+            priced: true,
+        }
+    }
+
     /// Accumulate another run's cost into this one, as the TUI does across
     /// the turns of a session. A single priced turn makes the total priced:
     /// reporting "n/a" for a session that did cost money would be worse than

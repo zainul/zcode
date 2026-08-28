@@ -80,7 +80,12 @@ impl<W: Write> Emitter for PrettyEmitter<W> {
                 self.break_line();
                 let _ = writeln!(self.out, "· {}", sanitize(&message));
             }
-            UiEvent::ToolCallArgs { .. } | UiEvent::Finish(_) | UiEvent::LoopStart { .. } => {}
+            // Headless output is a transcript, not a live display: the totals
+            // are printed once at the end, so per-step usage has no reader.
+            UiEvent::ToolCallArgs { .. }
+            | UiEvent::Finish(_)
+            | UiEvent::Usage(_)
+            | UiEvent::LoopStart { .. } => {}
         }
         let _ = self.out.flush();
     }
@@ -194,6 +199,7 @@ mod tests {
                 input_tokens: 1,
                 output_tokens: 1,
                 cache_tokens: 0,
+                cost_usd: None,
             }),
         ]);
         assert!(out.is_empty());

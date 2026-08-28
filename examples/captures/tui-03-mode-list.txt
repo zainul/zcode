@@ -3,8 +3,6 @@
 
 ┌────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │┌ conversation ────────────────────────────────────────────────────────────────────────────────────┐│
-││    /stop                            cancel the turn in flight (also Esc)                         ││
-││    /copy [all]                      copy the last answer, or all of the conversation             ││
 ││                                                                                                  ││
 ││  keys:                                                                                           ││
 ││    Enter                            send                                                         ││
@@ -17,13 +15,15 @@
 ││    PageUp / PageDown                scroll the conversation (also the mouse wheel)               ││
 ││    Ctrl-Up / Ctrl-Down              scroll one line                                              ││
 ││    Drag                             select; releasing copies to the clipboard                    ││
+││    Click a `tools used` header      fold or unfold that run                                      ││
+││    Ctrl-T                           fold or unfold every run of tool calls                       ││
 ││    Shift-Tab                        cycle mode                                                   ││
 ││    Ctrl-Y                           copy the last answer to the clipboard                        ││
 ││    Up / Down                        recall the previous / next sent prompt                       ││
 ││                                                                                                  ││
 ││    drag to select and copy · wheel scrolls · Shift-drag for the terminal's own selection         ││
 ││                                                                                                  ││
-││17:00:33  zcode                                                                                   ││
+││11:24:27  zcode                                                                                   ││
 ││  mode: auto — edits files and runs shell                                                         ││
 ││      planning  read-only; proposes changes                                                       ││
 ││      editing   edits files; no shell                                                             ││

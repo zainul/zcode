@@ -291,13 +291,21 @@ impl App {
         reason: LlmFinishReason,
         truncated: bool,
         totals: (u64, u64, u64),
+        reported_cost_usd: Option<f64>,
         started: Instant,
     ) {
         let (input_tokens, output_tokens, cache_tokens) = totals;
         let elapsed_ms = started.elapsed().as_millis() as u64;
-        let cost = self
-            .pricing
-            .estimate(&session.model, input_tokens, output_tokens, cache_tokens);
+        // What the provider charged beats what the table guesses: it covers
+        // models the table has never seen, which is the case that otherwise
+        // reports `n/a` while real money is being spent.
+        let cost = match reported_cost_usd {
+            Some(reported) => domain::Cost::from_reported_usd(reported),
+            None => {
+                self.pricing
+                    .estimate(&session.model, input_tokens, output_tokens, cache_tokens)
+            }
+        };
         self.telemetry.emit(TelemetryEvent {
             kind: "finish".into(),
             model: session.model.clone(),
@@ -367,6 +375,10 @@ impl AgentLoop for App {
         let mut input_tokens: u64 = 0;
         let mut output_tokens: u64 = 0;
         let mut cache_tokens: u64 = 0;
+        // Summed across the turn's calls, when the provider reports it. `None`
+        // means no call reported one, so the local price table is the only
+        // estimate available.
+        let mut reported_cost_usd: Option<f64> = None;
         let mut final_text = String::new();
         let finish_reason;
         let mut truncated = false;
@@ -383,6 +395,7 @@ impl AgentLoop for App {
                     LlmFinishReason::Stop,
                     true,
                     (input_tokens, output_tokens, cache_tokens),
+                    reported_cost_usd,
                     started,
                 );
                 return Err(AppError::Interrupted);
@@ -396,6 +409,7 @@ impl AgentLoop for App {
                         LlmFinishReason::Length,
                         true,
                         (input_tokens, output_tokens, cache_tokens),
+                        reported_cost_usd,
                         started,
                     );
                     return Err(AppError::Timeout(limit));
@@ -523,6 +537,7 @@ impl AgentLoop for App {
                 input_tokens: 0,
                 output_tokens: 0,
                 cache_tokens: 0,
+                cost_usd: None,
             });
 
             // Provider-reported usage is authoritative; the heuristic is only
@@ -541,6 +556,22 @@ impl AgentLoop for App {
                 domain::tokens::estimate_tokens(&assistant.content)
             };
             cache_tokens += finish.cache_tokens;
+            if let Some(step_cost) = finish.cost_usd {
+                reported_cost_usd = Some(reported_cost_usd.unwrap_or(0.0) + step_cost);
+            }
+
+            // Report usage after *every* call, not only the one that ends the
+            // turn. A tool-using turn can run for minutes across many steps,
+            // and each one has already been billed — showing `0 in / 0 out`
+            // until it finishes tells the user nothing about a cost they are
+            // already incurring.
+            self.emitter.emit(UiEvent::Usage(LlmFinish {
+                reason: finish.reason,
+                input_tokens,
+                output_tokens,
+                cache_tokens,
+                cost_usd: reported_cost_usd,
+            }));
 
             // Some providers report `Stop` while still emitting tool calls;
             // trust the calls over the label.
@@ -592,6 +623,7 @@ impl AgentLoop for App {
                         LlmFinishReason::Stop,
                         false,
                         (input_tokens, output_tokens, cache_tokens),
+                        reported_cost_usd,
                         started,
                     );
                     return Err(AppError::Tool(message));
@@ -678,12 +710,17 @@ impl AgentLoop for App {
             finish_reason,
             truncated,
             (input_tokens, output_tokens, cache_tokens),
+            reported_cost_usd,
             started,
         );
 
-        let cost = self
-            .pricing
-            .estimate(&session.model, input_tokens, output_tokens, cache_tokens);
+        let cost = match reported_cost_usd {
+            Some(reported) => domain::Cost::from_reported_usd(reported),
+            None => {
+                self.pricing
+                    .estimate(&session.model, input_tokens, output_tokens, cache_tokens)
+            }
+        };
         Ok(ExecutionResult {
             session_id: session.id,
             final_text,
@@ -773,6 +810,7 @@ mod tests {
             input_tokens: 10,
             output_tokens: 5,
             cache_tokens: 1,
+            cost_usd: None,
         }
     }
 
@@ -1248,6 +1286,7 @@ mod tests {
                     UiEvent::ToolCallArgs { .. } => "tool_call_args",
                     UiEvent::ToolResult { .. } => "tool_result",
                     UiEvent::Finish(_) => "finish",
+                    UiEvent::Usage(_) => "usage",
                     UiEvent::LoopStart { .. } => "loop_start",
                     UiEvent::LoopEnd { .. } => "loop_end",
                     UiEvent::Error(_) => "error",
@@ -1323,6 +1362,7 @@ mod tests {
                     input_tokens: 0,
                     output_tokens: 0,
                     cache_tokens: 0,
+                    cost_usd: None,
                 }),
             ]],
             "ok",

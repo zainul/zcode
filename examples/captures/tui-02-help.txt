@@ -3,8 +3,6 @@
 
 ┌────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │┌ conversation ────────────────────────────────────────────────────────────────────────────────────┐│
-││    /cost                            token usage and estimated spend for this session             ││
-││    /model                           provider, model, and config source                           ││
 ││    /provider [NAME]                 list the configured providers, or switch to one              ││
 ││    /session                         current session id and where it is stored                    ││
 ││    /tools                           tools available in the current mode                          ││
@@ -24,6 +22,8 @@
 ││    PageUp / PageDown                scroll the conversation (also the mouse wheel)               ││
 ││    Ctrl-Up / Ctrl-Down              scroll one line                                              ││
 ││    Drag                             select; releasing copies to the clipboard                    ││
+││    Click a `tools used` header      fold or unfold that run                                      ││
+││    Ctrl-T                           fold or unfold every run of tool calls                       ││
 ││    Shift-Tab                        cycle mode                                                   ││
 ││    Ctrl-Y                           copy the last answer to the clipboard                        ││
 ││    Up / Down                        recall the previous / next sent prompt                       ││

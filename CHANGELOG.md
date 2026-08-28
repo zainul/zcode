@@ -7,6 +7,185 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — a run of tool calls folds into one line
+
+A long session was mostly tool rows. A run of consecutive calls now collapses
+once every call in it has settled:
+
+```
+11:14:33  zcode
+  Running that for you now.
+  ▸ tools used · 1 call · 58ms
+```
+
+Click the header to open it, click again to fold; `Ctrl-T` does every run at
+once. **Work in flight is never folded** — hiding the only thing on screen that
+is changing would be exactly the wrong moment to do it — so the calls behind
+the answer being written are always visible, and fold themselves when done.
+
+**A run that failed also stays open.** A header reading "1 failed" would say
+something went wrong while hiding what — the worst of both. The error is the
+text you have to act on, so it stays on screen; folding it is a choice you can
+still make by hand, and the header then counts it and turns red.
+
+A folded header carries what you need to decide whether to open it: the number
+of calls, how long they took, and how many failed.
+
+Dragging across a header selects it rather than folding, or it would be the one
+line in the pane you could not copy.
+
+Runs are identified by an id assigned when the call is recorded, not by
+position, so folding survives entries dropping off the front of a long
+timeline.
+
+### Fixed — a drag across blank space no longer warns
+
+Selecting a region with no text in it reported `could not copy: nothing
+selected`. It now does nothing, quietly, because that is what happened.
+
+### Fixed — `zcode … | head` panicked instead of exiting
+
+```
+thread 'main' panicked at library/std/src/io/stdio.rs:
+failed printing to stdout: Broken pipe (os error 32)
+```
+
+Rust sets `SIGPIPE` to ignored at startup, so a write to a closed pipe returns
+`EPIPE` and `println!` turns that into a panic. `zcode config | head -1`
+reproduced it exactly — and when the agent ran such a pipeline through the
+shell tool, the panic landed in the tool result, on top of whatever the command
+had actually said.
+
+Restoring the default signal disposition is the one-line fix and needs
+`unsafe`, which this workspace forbids. Stdout is routed through `cli::out`
+instead: a broken pipe ends the program quietly with status 0, which is what
+every other Unix tool does — `head` exiting after one line is a completed
+pipeline, not a failure. Anything else is still reported, on stderr, which may
+still be a terminal when stdout is not.
+
+### Changed — a tool row shows what ran, not what came back
+
+A successful shell row read `total 32` — the first line of the output — where
+it should say which command produced it. The row now keeps the invocation it
+was annotated with:
+
+```
+  └ ✔ 11:01:09  ❯ shell  ls -lah                                          39ms
+```
+
+A **failure** still replaces it with the error, because that is the thing to
+act on, and the row carries the tool name either way. A call that reports no
+arguments still falls back to its result, so nothing is left blank.
+
+### Changed — the caret follows the pointer
+
+Clicking into the conversation now puts the cursor on the cell you clicked, so
+the pane you are selecting from is the one showing a cursor. Typing, or Esc,
+brings it back to the prompt. It used to blink in the prompt while you dragged
+through the transcript, pointing at the wrong place entirely.
+
+### Fixed — token and cost display read `0 in / 0 out · n/a` on a paid model
+
+Three separate bugs, all visible in one status bar:
+
+**Usage was only reported when the turn ended.** `UiEvent::Finish` is emitted
+once, on the step that produces the final answer. A turn that calls tools runs
+for many steps — each one already billed — so the bar read `0 in / 0 out`
+through minutes of spending. There is now a `UiEvent::Usage` after *every*
+provider call, carrying the turn's running totals. Mid-turn now reads
+`2280 in / 71 out  │  $0.0002` where it used to read zero.
+
+The totals are reconciled rather than accumulated: the engine sends running
+totals, so adding each report whole would count step 1 seven times over by
+step 7, and the final result would then count everything twice again.
+
+**Cost came only from a local price table.** `z-ai/glm-5.3-flash` is not in it,
+so a real charge rendered as `n/a`. OpenRouter reports `usage.cost` on every
+response — exact, for the model actually served, at the rate actually charged —
+and zcode now reads it and prefers it over the estimate. The table remains the
+fallback for providers that report nothing. A reported `0.0` is kept as "free"
+rather than mistaken for "not reported".
+
+**`base_url` was ignored for `openrouter`, `anthropic` and `deepseek`.** Those
+three clients hardcoded their endpoints, so a configured override did nothing —
+while `zcode config` printed it back as the endpoint in use. Pointing OpenRouter
+at a gateway, a proxy, or a local stub silently talked to `openrouter.ai`
+instead. All providers now honour `base_url`, and a URL ending in `/v1` still
+gets `/chat/completions` appended.
+
+### Added — `lmstudio` provider kind
+
+LM Studio's local server, as its own kind rather than an `openai-compatible`
+entry that has to spell out the URL:
+
+```json
+{ "name": "local", "kind": "lmstudio", "model": "qwen/qwen3.5-9b" }
+```
+
+It is OpenAI-compatible on the wire; the kind exists so the default endpoint
+(`http://localhost:1234/v1/chat/completions`) and the absence of an API key come
+for free, the way they do for `ollama`. A `base_url` ending in `/v1` works —
+`/chat/completions` is appended when missing. `lm-studio` and `lm_studio` are
+accepted spellings.
+
+### Fixed — one bad `providers` entry no longer breaks the whole config
+
+A single mistyped `kind` made the entire configuration fail to load, so every
+command stopped working — including `zcode config`, which is the command you
+reach for to *find* the mistake. Every other provider went down with it.
+
+An entry that cannot be understood is now recorded and skipped. `zcode config`
+lists it under Problems and exits non-zero, but still prints everything else:
+
+```
+Problems
+  - provider entry `mul.ai` is unusable and was skipped: unknown provider: lmstudo
+```
+
+Selecting that entry is still an error, and now says what is actually wrong
+rather than claiming the name is unknown:
+
+```
+zcode: provider `mul.ai` is configured but unusable: unknown provider: lmstudo
+```
+
+### Fixed — the TUI acceptance suite no longer bets on startup timing
+
+Every scenario opened with a fixed `pump(2.0)` before asserting on the screen.
+That is a bet on how long startup takes, and a cold binary — the first run after
+a build, with a language server to spawn — loses it: the suite passed on a warm
+machine and failed on a fresh one, which is the least useful kind of test. They
+now wait for the opening frame itself (`t.ready()`), verified against a
+deliberately cold binary.
+
+### Fixed — config unit tests no longer read the developer's own config
+
+`Loader::discover_from` layers in `~/.config/zcode/`, so three tests were
+loading whatever the person running them happened to have configured. They
+passed or failed based on a file outside the repository — and did fail, with
+`UnknownProvider`, the moment a real config named a provider they did not
+expect. The tests now point `XDG_CONFIG_HOME` at an empty directory; verified by
+running the suite with a deliberately broken user config in place.
+
+### Fixed — a top-level TOML key written under a `[[providers]]` table is reported
+
+TOML puts every bare key after a table header *inside* that table, so
+`timeout_ms = 120000` written below `[[providers]]` silently became a field of
+that provider and was dropped. `providers` entries now reject unknown fields, so
+the mistake names its own line:
+
+```
+zcode: toml parse error: TOML parse error at line 5, column 1
+  |
+5 | timeout_ms = 120000
+  | ^^^^^^^^^^
+```
+
+The shipped `zcode.example.toml` had exactly this bug — half its settings were
+inert — and also told the reader to uncomment an `[env]` table that does not
+parse (`env` is a list of pairs). Both are fixed, and both example configs now
+cover every key.
+
 ### Added — shell output is token-optimised through rtk, by default
 
 Every byte a shell command returns enters the transcript and is billed on every

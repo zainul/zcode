@@ -181,12 +181,32 @@ command, the one-line error, and — if you can share it — the session file fr
 ## `command refused: it matches zcode's built-in denylist`
 
 Not the allowlist — a separate, always-on list of irreversible commands
-(`rm -rf`, `sudo`, `git push --force`, `npm publish`, …). Widening
-`shell_allowed` will not help, and the message says so. If you genuinely need
-the command, run it yourself.
+(`sudo`, `dd … of=`, `git push --force`, `npm publish`, `curl … | sh`, …).
+Widening `shell_allowed` will not help, and the message says so. If you
+genuinely need the command, run it yourself.
 
 See [chapter 7](07-tools-and-safety.md#2-the-denylist--which-shell_allowed-cannot-override)
 for the full list.
+
+## ``command refused: `rm -r` must name a specific path``
+
+Recursive deletes are **not** banned — `rm -rf node_modules` and
+`rm -rf ./target` run fine. What is refused is a target whose extent cannot be
+read from the command:
+
+```
+command refused: `rm -r` must name a specific path, and "$BUILD_DIR" does not —
+globs, `~`, `..`, `$VAR` and absolute paths outside /tmp are refused because
+what they delete cannot be read from the command: rm -rf $BUILD_DIR
+  hint: name the directory itself, e.g. `rm -rf node_modules` or `rm -rf ./target`
+```
+
+The message names the offending word. Replace it with the literal path:
+`rm -rf build` rather than `rm -rf $BUILD_DIR`, `rm -rf build/out` rather than
+`rm -rf build/*`.
+
+The full table of what passes and what does not is in
+[chapter 7](07-tools-and-safety.md#recursive-deletes-are-judged-by-their-target).
 
 ## `command blocked by the shell allowlist`
 
@@ -253,6 +273,119 @@ Older versions appended `/chat/completions` to `base_url` unconditionally, so a
 full endpoint became a doubled path. Current versions accept either spelling.
 Run `zcode version` — if it predates this fix, update with
 `./scripts/update.sh`.
+
+## `unknown provider` on startup
+
+The `provider` key names neither a `providers` entry nor a built-in kind. The
+error lists both:
+
+```
+zcode: unknown provider `nope` — configured: free, fast, local, gateway;
+built in: openai, anthropic, openrouter, deepseek, ollama, vllm, openai-compatible
+```
+
+If you meant a profile, check the spelling of its `name` in the `providers`
+array. `zcode config` prints the whole list with the active one marked. See
+[chapter 12](12-configuration-reference.md#multiple-providers).
+
+## The wrong model answered after switching provider
+
+A declared `providers` entry is **complete in itself**: what it does not state
+comes from the defaults for its `kind`, not from a top-level `model`. So a
+profile with no `model` uses its kind's default, even if the file has a
+top-level `model` line — deliberately, because a top-level key was written for
+whichever provider the config had at the time.
+
+Put the model in the profile:
+
+```json
+{ "name": "gateway", "kind": "openai-compatible", "model": "internal-1",
+  "base_url": "https://gateway.internal/v1/chat/completions" }
+```
+
+## Dragging does not select text
+
+zcode captures the mouse so the wheel can scroll, which means the terminal
+stops doing its own selection — zcode does it instead. Drag inside the
+**conversation** pane and it highlights; release copies.
+
+If you want the terminal's own selection back (to select across the border, or
+into the prompt), hold **Shift** while dragging — **Option** on macOS Terminal.
+
+## `could not copy` after selecting
+
+zcode says which mechanism it used, so this names the failure. It tries
+`pbcopy`, `wl-copy`, `xclip`, `xsel` and `clip.exe` first, then falls back to
+OSC 52, which asks the terminal to set the clipboard.
+
+| Message | Meaning |
+|---------|---------|
+| `copied (pbcopy)` and similar | a real clipboard tool took it — this is exact |
+| `copied (terminal clipboard)` | OSC 52 was written; whether it worked is up to your terminal |
+| `selection is too large for the terminal clipboard` | over ~75 KB with no local tool available; select less |
+
+On Linux without `wl-copy`/`xclip`/`xsel` installed, and in a terminal that
+ignores OSC 52, nothing can reach the clipboard. Install one of those tools.
+
+Over SSH, only OSC 52 can work, and tmux and screen need it enabled explicitly.
+
+## Shell output looks different from my own terminal
+
+That is [rtk](07-tools-and-safety.md#token-optimised-shell-output-rtk),
+filtering command output before it reaches the model — `ls -la` comes back as
+61 bytes instead of 438. It is on by default whenever rtk is installed.
+
+`zcode config` says whether it is active:
+
+```
+rtk                    0.36.0 — shell output is token-optimised  [/opt/homebrew/bin/rtk]
+```
+
+To turn it off for one run, `ZCODE_RTK=0 zcode run "…"`; permanently,
+`{ "rtk": { "enabled": false } }`.
+
+## zcode installed rtk and I did not ask it to
+
+It did, and it says so before it starts. `rtk.auto_install` is on by default,
+because the point of rtk is a smaller bill and an optimisation nobody turns on
+is not an optimisation.
+
+It only ever runs **Homebrew**, and only when Homebrew is already installed —
+it installs a package, never a package manager, and never downloads a script to
+run. To stop it:
+
+```json
+{ "rtk": { "auto_install": false } }
+```
+
+or `ZCODE_RTK_AUTO_INSTALL=0`. rtk is still used if it is already present;
+`"enabled": false` is what stops that too.
+
+## `could not install rtk automatically`
+
+zcode carries on without it — rtk makes output smaller, its absence is not an
+error. The common causes:
+
+| Message | Fix |
+|---------|-----|
+| `no supported package manager` | `brew install rtk`, or install from [the repo](https://github.com/rtk-ai/rtk) |
+| `brew failed: …` | run `brew install rtk` yourself to see the full output |
+| `a previous install failed within the last day` | fix the cause, then `brew install rtk` — or delete `~/.config/zcode/rtk-install-failed` to retry sooner |
+
+A failed install is recorded machine-wide and not retried for 24 hours, so a
+machine with no network does not pay the package manager's failure cost on
+every single run.
+
+## `failed printing to stdout: Broken pipe`
+
+Fixed. `zcode … | head` used to panic: Rust ignores `SIGPIPE`, so writing to a
+closed pipe returned an error and `println!` turned it into a panic. If the
+agent ran such a pipeline through the shell tool, the panic text landed in the
+tool result on top of the real output.
+
+zcode now exits quietly with status 0 when its reader goes away, as every other
+Unix tool does. If you still see this, you are on a build from before zcode
+0.2.
 
 ## A `/command` was sent to the model instead of running
 
