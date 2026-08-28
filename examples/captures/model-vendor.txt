@@ -1,0 +1,5 @@
+$ cd ./examples/multi-provider && /Users/zainul/rust/zcode/target/release/zcode run -m z-ai/glm-4.6 hi
+
+zcode: unknown provider `z-ai` in `z-ai/glm-4.6` — a model is written `<provider>/<model>`. If `z-ai/glm-4.6` is the model id, name the provider too: `primary/z-ai/glm-4.6`. Configured: fast, free-openrouter, paid-openrouter, free-groq, gateway, mul.ai, primary, backup, local; built in: openai, anthropic, openrouter, deepseek, ollama, vllm, openai-compatible, lmstudio
+
+[exit 1]

@@ -297,6 +297,29 @@ across kinds produced an `api_key_env` that read `[set]` in `zcode config` and
 then failed at the first request — a quiet wrong beats a loud wrong only if
 you never have to debug it.
 
+`Config::select_model` is the same resolution point for `--model` / `-m`, whose
+format is opencode's: **`<provider>/<model>`, split at the first `/`**, so
+`openrouter/z-ai/glm-4.6` is the provider `openrouter` and the model
+`z-ai/glm-4.6`. The split is unconditional. An earlier version read the prefix
+as a provider only when it happened to name one, which made an argument's
+meaning depend on what the config declared — adding a `providers` entry could
+silently redirect an existing command. A leading segment naming no provider is
+now `UnknownProviderInModel`, whose message spells out the fix
+(`primary/z-ai/glm-4.6`) rather than listing names to read through. The one
+shorthand is a spec with no `/` at all: an id on the provider already selected,
+which cannot be mistaken for a pair.
+
+`--provider` and `--model` may both name a provider; `cli::check_provider_agreement`
+refuses a disagreement rather than letting one silently win, and compares what
+each *resolves* to so `lm-studio` and `lmstudio` are not a false conflict. The
+model flag is applied after `select_provider`, so it outranks the profile's own
+model.
+
+The config's `model` key and `ZCODE_MODEL` are unchanged and never split: they
+pair with a separate `provider` key, and the `providers` array is where an
+endpoint is named in a file. The `<provider>/<model>` form belongs to the flag,
+which has no other way to say it.
+
 `App::set_llm` swaps just the client: the tool registry, and every MCP/LSP
 child with it, keeps running, and so does the session — which is the point of
 switching mid-conversation.

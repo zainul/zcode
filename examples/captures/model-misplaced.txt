@@ -1,0 +1,5 @@
+$ cd ./examples/multi-provider && /Users/zainul/rust/zcode/target/release/zcode --model gpt-4o run hi
+
+zcode: `--model` was given before the subcommand, where it does not apply — write it after instead
+
+[exit 2]

@@ -58,6 +58,13 @@ pub struct Cli {
     /// Run without a subcommand to open the interactive TUI.
     #[command(subcommand)]
     pub command: Option<Commands>,
+    /// The flags of the bare invocation, which is `zcode repl` by another
+    /// name — `zcode --model openrouter/z-ai/glm-4.6` has to mean what
+    /// `zcode repl --model …` means, since the bare form is how the TUI is
+    /// normally started. A subcommand parses its own copy; see
+    /// [`ReplArgs::first_set`] for the one case the two can be confused.
+    #[command(flatten)]
+    pub repl: ReplArgs,
 }
 
 #[derive(Subcommand)]
@@ -107,6 +114,13 @@ pub struct RunArgs {
     /// built-in kind (openai, anthropic, openrouter, ollama, …).
     #[arg(long, value_name = "NAME")]
     pub provider: Option<String>,
+    // Beyond FR-IFACE-01's flag set: the model was settable only in the
+    // config file and `ZCODE_MODEL`, so trying one meant editing a file.
+    /// Model as `<provider>/<model>`, e.g. `openrouter/z-ai/glm-4.6` — split
+    /// at the first slash. A value with no slash is an id on the current
+    /// provider.
+    #[arg(long, short = 'm', value_name = "PROVIDER/MODEL")]
+    pub model: Option<String>,
     /// Resume an existing session id.
     #[arg(long)]
     pub session: Option<String>,
@@ -143,12 +157,44 @@ pub struct ReplArgs {
     /// built-in kind. Switch again in the TUI with `/provider <name>`.
     #[arg(long, value_name = "NAME")]
     pub provider: Option<String>,
+    /// Model to start on, as `<provider>/<model>`, e.g.
+    /// `openrouter/z-ai/glm-4.6` — split at the first slash. A value with no
+    /// slash is an id on the current provider.
+    #[arg(long, short = 'm', value_name = "PROVIDER/MODEL")]
+    pub model: Option<String>,
     /// Config file to use instead of ./zcode.json or ./zcode.toml.
     #[arg(long, value_name = "FILE")]
     pub config: Option<PathBuf>,
     /// Resume an existing session id.
     #[arg(long)]
     pub session: Option<String>,
+}
+
+impl ReplArgs {
+    /// The first flag that was given, or `None` when the struct is untouched.
+    ///
+    /// These flags exist twice — once on `Cli` for the bare invocation and
+    /// once on every subcommand that takes them — so `zcode --mode planning
+    /// run "…"` parses cleanly and then does nothing with the mode. Reporting
+    /// it beats honouring a flag the user cannot see was dropped.
+    fn first_set(&self) -> Option<&'static str> {
+        if self.mode.is_some() {
+            return Some("--mode");
+        }
+        if self.provider.is_some() {
+            return Some("--provider");
+        }
+        if self.model.is_some() {
+            return Some("--model");
+        }
+        if self.session.is_some() {
+            return Some("--session");
+        }
+        if self.config.is_some() {
+            return Some("--config");
+        }
+        None
+    }
 }
 
 #[derive(Subcommand)]
@@ -447,24 +493,25 @@ pub fn run() -> CliResult {
             });
         }
     };
-    match cli.command {
-        None => {
-            let cfg = load_config(None, None, None)?;
-            let cancel = install_signal_handler();
-            tui::run_tui(cfg, cancel, None)?;
-            Ok(ExitCode::SUCCESS)
+    // A flag written before the subcommand landed on `Cli`'s copy, where
+    // nothing will read it. Say so rather than run with it silently dropped.
+    if cli.command.is_some() {
+        if let Some(flag) = cli.repl.first_set() {
+            eprintln!(
+                "zcode: `{flag}` was given before the subcommand, where it does \
+                 not apply — write it after instead"
+            );
+            return Ok(ExitCode::from(EXIT_USAGE));
         }
+    }
+    match cli.command {
+        None => cmd_repl(cli.repl),
         Some(Commands::Version) => {
             outln!("zcode v{VERSION} (git: {GIT_SHA}, built: {BUILD_TIME}, {BUILD_PROFILE})");
             Ok(ExitCode::SUCCESS)
         }
         Some(Commands::Run(args)) => cmd_run(args),
-        Some(Commands::Repl(args)) => {
-            let cfg = load_config(args.config.as_deref(), args.mode, args.provider.as_deref())?;
-            let cancel = install_signal_handler();
-            tui::run_tui(cfg, cancel, args.session)?;
-            Ok(ExitCode::SUCCESS)
-        }
+        Some(Commands::Repl(args)) => cmd_repl(args),
         Some(Commands::Session { command }) => cmd_session(command),
         Some(Commands::Config(args)) => cmd_config(args),
         Some(Commands::Tools { command: _ }) => cmd_tools_list(),
@@ -494,22 +541,72 @@ fn describe_rtk(cfg: &infra_config::RtkConfig) -> String {
     }
 }
 
+/// The command-line overrides that outrank the config file and the
+/// environment, kept together so a call site cannot transpose two `&str`
+/// arguments that mean different things.
+#[derive(Default, Clone, Copy)]
+struct Overrides<'a> {
+    mode: Option<AgentMode>,
+    provider: Option<&'a str>,
+    model: Option<&'a str>,
+}
+
 fn load_config(
     path: Option<&Path>,
-    mode: Option<AgentMode>,
-    provider: Option<&str>,
+    over: Overrides<'_>,
 ) -> Result<Config, Box<dyn std::error::Error + Send + Sync>> {
     let mut cfg = Loader::with_default().load_with_override(path)?;
     // A CLI flag beats both the file and the environment (FR-MODE-01/02).
-    if let Some(mode) = mode {
+    if let Some(mode) = over.mode {
         cfg.mode = mode;
     }
     // Re-resolves model, key variable and URL from the chosen profile, so
     // `--provider local` is one word rather than four overrides.
-    if let Some(name) = provider {
+    if let Some(name) = over.provider {
         cfg.select_provider(name)?;
     }
+    // Last, so it beats the model the profile just resolved — stating both is
+    // exactly the case where the flag has to win.
+    if let Some(spec) = over.model {
+        if over.provider.is_some() {
+            check_provider_agreement(&cfg, spec)?;
+        }
+        cfg.select_model(spec)?;
+    }
     Ok(cfg)
+}
+
+/// Refuse `--provider a --model b/...` when `a` and `b` are different
+/// providers.
+///
+/// Both name one, so one of them has to lose, and whichever rule we picked
+/// would be invisible at the call site. Saying so costs a line and removes the
+/// question. Agreeing is fine and common — `--provider openrouter --model
+/// openrouter/z-ai/glm-4.6` is what a shell history plus a copied model id
+/// looks like.
+fn check_provider_agreement(
+    cfg: &Config,
+    spec: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let Some((named, _)) = spec.trim().split_once('/') else {
+        return Ok(());
+    };
+    if !cfg.knows_provider(named) {
+        // Not a provider at all: `select_model` reports that, with the fix.
+        return Ok(());
+    }
+    // Compare what each *resolves* to, not what was typed: `lm-studio` and
+    // `lmstudio` are the same endpoint and must not read as a disagreement.
+    let resolved = cfg.with_provider(named)?.provider_name;
+    if resolved != cfg.provider_name {
+        return Err(format!(
+            "--provider selected `{}` but --model names `{named}` — \
+             give the provider once",
+            cfg.provider_name
+        )
+        .into());
+    }
+    Ok(())
 }
 
 /// Flip a shared flag on SIGINT so the engine can checkpoint and exit cleanly
@@ -525,8 +622,30 @@ fn install_signal_handler() -> CancelFlag {
     CancelFlag::from_shared(flag)
 }
 
+/// The TUI, however it was reached: `zcode`, or `zcode repl`.
+fn cmd_repl(args: ReplArgs) -> CliResult {
+    let cfg = load_config(
+        args.config.as_deref(),
+        Overrides {
+            mode: args.mode,
+            provider: args.provider.as_deref(),
+            model: args.model.as_deref(),
+        },
+    )?;
+    let cancel = install_signal_handler();
+    tui::run_tui(cfg, cancel, args.session)?;
+    Ok(ExitCode::SUCCESS)
+}
+
 fn cmd_run(args: RunArgs) -> CliResult {
-    let cfg = load_config(args.config.as_deref(), args.mode, args.provider.as_deref())?;
+    let cfg = load_config(
+        args.config.as_deref(),
+        Overrides {
+            mode: args.mode,
+            provider: args.provider.as_deref(),
+            model: args.model.as_deref(),
+        },
+    )?;
     let cancel = install_signal_handler();
 
     let telemetry_out: Box<dyn Write + Send> = if args.json {
@@ -583,7 +702,7 @@ fn cmd_run(args: RunArgs) -> CliResult {
 }
 
 fn cmd_session(command: SessionCmd) -> CliResult {
-    let cfg = load_config(None, None, None)?;
+    let cfg = load_config(None, Overrides::default())?;
     let mut store = UuidSessionStore::new(cfg.working_dir.join(".zcode").join("sessions"));
 
     match command {
@@ -602,6 +721,7 @@ fn cmd_session(command: SessionCmd) -> CliResult {
                     images: Vec::new(),
                     mode: None,
                     provider: None,
+                    model: None,
                     session: Some(id),
                     json,
                     json_format,
@@ -888,7 +1008,7 @@ fn cmd_config(args: ConfigArgs) -> CliResult {
 }
 
 fn cmd_tools_list() -> CliResult {
-    let cfg = load_config(None, None, None)?;
+    let cfg = load_config(None, Overrides::default())?;
     // No LLM is constructed here, so `zcode tools list` works without an API key.
     let registry = ToolRegistry::from_config(&cfg)?;
     for warning in registry.warnings() {
@@ -909,7 +1029,7 @@ fn cmd_tools_list() -> CliResult {
 }
 
 fn cmd_skills_list() -> CliResult {
-    let cfg = load_config(None, None, None)?;
+    let cfg = load_config(None, Overrides::default())?;
     let roots = cfg.skills_dirs();
     let index = tools::SkillIndex::discover(&roots);
 
@@ -1012,6 +1132,45 @@ mod tests {
     fn bare_command_opens_the_tui() {
         let cli = Cli::try_parse_from(["zcode"]).unwrap();
         assert!(cli.command.is_none());
+        assert!(cli.repl.first_set().is_none(), "no flag was given");
+    }
+
+    /// The bare invocation is how the TUI is normally started, so it takes the
+    /// same starting flags as `zcode repl`.
+    #[test]
+    fn bare_command_takes_the_repl_flags() {
+        let cli = Cli::try_parse_from([
+            "zcode",
+            "--provider",
+            "local",
+            "--model",
+            "llama3.2",
+            "--mode",
+            "planning",
+        ])
+        .unwrap();
+        assert!(cli.command.is_none());
+        assert_eq!(cli.repl.provider.as_deref(), Some("local"));
+        assert_eq!(cli.repl.model.as_deref(), Some("llama3.2"));
+        assert_eq!(cli.repl.mode, Some(AgentMode::Planning));
+    }
+
+    /// Those flags exist on `Cli` *and* on the subcommands, so a flag written
+    /// on the wrong side of the subcommand parses and is then ignored. `run()`
+    /// refuses that; this pins the detection it uses.
+    #[test]
+    fn a_flag_before_a_subcommand_is_detected() {
+        let cli = Cli::try_parse_from(["zcode", "--model", "gpt-4o", "run", "hi"]).unwrap();
+        assert!(cli.command.is_some());
+        assert_eq!(cli.repl.first_set(), Some("--model"));
+
+        // The same flag written after the subcommand is the one that works.
+        let cli = Cli::try_parse_from(["zcode", "run", "hi", "--model", "gpt-4o"]).unwrap();
+        assert_eq!(cli.repl.first_set(), None);
+        let Some(Commands::Run(args)) = cli.command else {
+            panic!("expected run");
+        };
+        assert_eq!(args.model.as_deref(), Some("gpt-4o"));
     }
 
     #[test]
@@ -1042,6 +1201,84 @@ mod tests {
         assert_eq!(args.timeout, Some(10));
         assert_eq!(args.session.as_deref(), Some("abc"));
         assert_eq!(args.images.len(), 2);
+    }
+
+    #[test]
+    fn run_takes_a_model() {
+        let cli = Cli::try_parse_from(["zcode", "run", "hi", "--model", "openrouter/z-ai/glm-4.6"])
+            .unwrap();
+        let Some(Commands::Run(args)) = cli.command else {
+            panic!("expected run");
+        };
+        assert_eq!(args.model.as_deref(), Some("openrouter/z-ai/glm-4.6"));
+        assert!(args.provider.is_none());
+    }
+
+    #[test]
+    fn repl_takes_a_model() {
+        let cli = Cli::try_parse_from([
+            "zcode",
+            "repl",
+            "--provider",
+            "local",
+            "--model",
+            "llama3.2",
+        ])
+        .unwrap();
+        let Some(Commands::Repl(args)) = cli.command else {
+            panic!("expected repl");
+        };
+        assert_eq!(args.provider.as_deref(), Some("local"));
+        assert_eq!(args.model.as_deref(), Some("llama3.2"));
+    }
+
+    /// `--model` with no value is a usage error, not an empty model id.
+    #[test]
+    fn model_requires_a_value() {
+        assert!(Cli::try_parse_from(["zcode", "run", "hi", "--model"]).is_err());
+    }
+
+    /// The precedence `load_config` implements, exercised without touching the
+    /// filesystem or the environment: `--model` is applied after the provider,
+    /// and is read as an id verbatim once a provider has been named.
+    #[test]
+    fn model_override_outranks_the_selected_provider_profile() {
+        let mut cfg = Config::default();
+        cfg.select_provider("deepseek").unwrap();
+        assert_eq!(cfg.model, "deepseek-chat", "the profile default");
+
+        cfg.select_model("openrouter/deepseek/deepseek-chat")
+            .unwrap();
+        assert_eq!(cfg.provider_name, "openrouter");
+        assert_eq!(cfg.model, "deepseek/deepseek-chat");
+    }
+
+    #[test]
+    fn a_provider_named_twice_must_agree() {
+        let mut cfg = Config::default();
+        cfg.select_provider("openrouter").unwrap();
+
+        // Agreeing is a shell history plus a copied model id — allow it.
+        check_provider_agreement(&cfg, "openrouter/z-ai/glm-4.6").unwrap();
+        // No slash: nothing is claimed, so nothing can disagree.
+        check_provider_agreement(&cfg, "gpt-4o-mini").unwrap();
+        // Not a provider: `select_model` owns that error, with the fix in it.
+        check_provider_agreement(&cfg, "z-ai/glm-4.6").unwrap();
+
+        let err = check_provider_agreement(&cfg, "anthropic/claude-haiku-4-5")
+            .expect_err("two different providers");
+        let msg = err.to_string();
+        assert!(msg.contains("openrouter"), "{msg}");
+        assert!(msg.contains("anthropic"), "{msg}");
+    }
+
+    /// `lm-studio` and `lmstudio` are one endpoint spelled two ways; comparing
+    /// the typed strings would report a disagreement that does not exist.
+    #[test]
+    fn provider_agreement_compares_resolved_names_not_spellings() {
+        let mut cfg = Config::default();
+        cfg.select_provider("lm-studio").unwrap();
+        check_provider_agreement(&cfg, "lmstudio/some-model").unwrap();
     }
 
     #[test]

@@ -18,6 +18,9 @@ Options:
       --provider <NAME>
           Which provider to use: a name from the `providers` array, or a built-in kind (openai, anthropic, openrouter, ollama, …)
 
+  -m, --model <PROVIDER/MODEL>
+          Model as `<provider>/<model>`, e.g. `openrouter/z-ai/glm-4.6` — split at the first slash. A value with no slash is an id on the current provider
+
       --session <SESSION>
           Resume an existing session id
 

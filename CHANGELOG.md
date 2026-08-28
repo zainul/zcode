@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — `--model` / `-m`, as `<provider>/<model>`
+
+The model was settable in the config file and through `ZCODE_MODEL`; trying one
+for a single run meant editing a file or exporting a variable. It is now a flag
+on `zcode run` and `zcode repl`, in the spelling opencode and most agent CLIs
+use:
+
+```sh
+zcode run -m openrouter/z-ai/glm-4.6 "explain this"
+zcode --model anthropic/claude-sonnet-4-5
+```
+
+**Split at the first `/`: the leading segment is the provider, everything after
+it is the model id**, slashes and all — which is exactly how OpenRouter spells
+`z-ai/glm-4.6`. The provider is either an entry in your `providers` array or a
+built-in kind, and it is selected before the model is applied, so the flag
+outranks the model that profile carries.
+
+The split is unconditional. A leading segment that names no provider is an
+error that spells out the fix rather than being folded back into the id:
+
+```
+zcode: unknown provider `z-ai` in `z-ai/glm-4.6` — a model is written
+`<provider>/<model>`. If `z-ai/glm-4.6` is the model id, name the provider too:
+`openrouter/z-ai/glm-4.6`. Configured: primary, backup, local; built in: …
+```
+
+Guessing was the alternative, and it was worse: reading the prefix as a
+provider only when it happened to name one made an argument's meaning depend on
+what the config declared, so adding a `providers` entry could silently redirect
+a command that had worked for months.
+
+The one shorthand is a value with **no** `/` at all — an id on the provider
+already selected, which cannot be mistaken for a pair:
+
+```sh
+zcode run -m gpt-4o-mini "…"          # same endpoint, different model
+```
+
+`--provider` and `--model` may both name a provider. Agreeing is fine;
+disagreeing is refused rather than letting one of them silently win.
+
+The config's `model` key and `ZCODE_MODEL` are unchanged and never split — they
+sit next to a `provider` key, and `providers` is where a file names an endpoint.
+
+### Fixed — the bare invocation takes the flags it was documented to take
+
+`zcode --provider local` was in the guide and had never parsed: the flags lived
+on `zcode repl` only, while the bare command — the normal way to open the TUI —
+accepted none. `--mode`, `--provider`, `--model`, `--session` and `--config`
+now work on both spellings.
+
+A flag written *before* a subcommand (`zcode --mode planning run "…"`) parses
+onto the bare form, where nothing reads it. That is now a usage error rather
+than a run with the mode silently dropped.
+
 ### Added — a run of tool calls folds into one line
 
 A long session was mostly tool rows. A run of consecutive calls now collapses

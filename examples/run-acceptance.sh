@@ -182,6 +182,51 @@ expect  provider-bad   'unknown provider `nope`'
 expect  provider-bad   'configured:.*primary.*backup'
 expect  provider-bad   'exit 1'
 
+# `--model <provider>/<model>` carries the endpoint with it: the config selects
+# `primary` on port 8095, and the prefix has to take the run to Ollama instead.
+# `-m` is the short form, as in opencode.
+capture model-flag     "$MULTI"   "$ZCODE" run -m local/qwen2.5-coder "hi"
+expect  model-flag     'ollama request failed'
+expect  model-flag     '11434'
+refute  model-flag     '8095'
+
+# Split at the *first* slash only: the rest is the id, slashes and all. Sent to
+# `primary` (8095), not to a provider called `z-ai`.
+capture model-nested   "$MULTI"   "$ZCODE" run -m primary/z-ai/glm-4.6 "hi"
+expect  model-nested   '8095'
+
+# No slash at all: an id on the provider already selected.
+capture model-bare     "$MULTI"   "$ZCODE" run -m some-model "hi"
+expect  model-bare     '8095'
+
+# A leading segment that names no provider is refused — and the message spells
+# out the fix rather than listing names to read through.
+capture model-vendor   "$MULTI"   "$ZCODE" run -m z-ai/glm-4.6 "hi"
+expect  model-vendor   'unknown provider `z-ai`'
+expect  model-vendor   '<provider>/<model>'
+expect  model-vendor   'primary/z-ai/glm-4.6'
+expect  model-vendor   'exit 1'
+
+# A provider named and nothing after it: refused before any request.
+capture model-bad      "$MULTI"   "$ZCODE" run -m "local/" "hi"
+expect  model-bad      'names the provider `local` but no model'
+expect  model-bad      'exit 1'
+
+# Both flags may name a provider. Disagreeing is refused rather than letting
+# one of them silently win; agreeing is a shell history plus a copied id.
+capture model-conflict "$MULTI"   "$ZCODE" run --provider local -m backup/some-model "hi"
+expect  model-conflict 'give the provider once'
+expect  model-conflict 'exit 1'
+capture model-agree    "$MULTI"   "$ZCODE" run --provider local -m local/qwen2.5-coder "hi"
+expect  model-agree    '11434'
+
+# The flags of the bare invocation are the flags of `zcode repl`. Written
+# before a subcommand they land where nothing reads them — that is a usage
+# error, not a run with the flag silently dropped.
+capture model-misplaced "$MULTI"  "$ZCODE" --model gpt-4o run "hi"
+expect  model-misplaced 'given before the subcommand'
+expect  model-misplaced 'exit 2'
+
 # ---------------------------------------------------------------------------
 banner "3. Tools and skills"
 
