@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — the release workflow's Windows leg failed before it could build
+
+Two independent breaks in `.github/workflows/release.yml`, both only visible
+on `windows-latest`:
+
+- The checksum step hardcoded `shasum` (macOS/system Perl) first, which does
+  not exist on Windows' bash — `shasum: command not found`, exit 127, after
+  the binary had already built. `scripts/package-release.sh` had the same
+  ordering. Both now prefer `sha256sum` (coreutils, present on Linux and in
+  Git-for-Windows' bash) and fall back to `shasum`, so no single runner's
+  toolchain is assumed.
+- `.zcode/reports/*.json` and `.zcode/sessions/*.json` were committed before
+  `/.zcode/` was added to `.gitignore` and never removed from the index; the
+  report filenames carry a `:` from their ISO8601 timestamp, which
+  `actions/checkout@v4` cannot write on Windows — `git.exe` failed with
+  "invalid path", exit 128, before checkout even finished. Untracked (not
+  deleted locally); `.gitignore` already keeps new runtime state out.
+
+### Fixed — `from_config_builds_the_native_tool_set` depended on host state
+
+`Config::skills_dirs()` always includes the machine-wide
+`~/.config/zcode/skills` root alongside the project one, and the test
+registered no skill in its own tempdir — so it only passed on a machine that
+happened to have skills installed there, and failed on every clean CI runner
+(v0.4.0's own release workflow included). The test now plants a skill in its
+own project directory, making the assertion independent of host state.
+
 ### Fixed — a network error dropped mid-stream ended the turn instead of retrying
 
 `send_with_retry` only retries a failed *connect* — before a response body
