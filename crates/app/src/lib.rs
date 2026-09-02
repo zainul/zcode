@@ -290,6 +290,7 @@ impl App {
         steps: u64,
         reason: LlmFinishReason,
         truncated: bool,
+        stop_cause: Option<&'static str>,
         totals: (u64, u64, u64),
         reported_cost_usd: Option<f64>,
         started: Instant,
@@ -318,6 +319,20 @@ impl App {
             extra: Box::new([
                 ("reason".into(), ExtraField::Text(reason_str(reason).into())),
                 ("truncated".into(), ExtraField::Bool(truncated)),
+                // Distinguishes *why* the run stopped early: `truncated` alone
+                // cannot tell a consumer whether a turn cap, the model's own
+                // token budget, a request timeout, or a user cancellation was
+                // responsible, and those need different, honest messages
+                // (opencode's translation used to report all four as "stopped
+                // at the turn or token cap", which is simply wrong for a
+                // timeout or a cancellation).
+                (
+                    "stop_cause".into(),
+                    match stop_cause {
+                        Some(cause) => ExtraField::Text(cause.into()),
+                        None => ExtraField::Null,
+                    },
+                ),
                 (
                     "mode".into(),
                     ExtraField::Text(session.mode.as_str().into()),
@@ -382,6 +397,10 @@ impl AgentLoop for App {
         let mut final_text = String::new();
         let finish_reason;
         let mut truncated = false;
+        // Why the run stopped early, for a consumer that needs the real cause
+        // rather than a guess (see `finish_run`). `None` until one of the
+        // early-exit or cap branches below sets it.
+        let mut stop_cause: Option<&'static str> = None;
         // Images ride along with the first turn only; re-sending them every
         // turn would re-bill the vision tokens (FR-MODEL-08).
         let mut pending_images = req.images.clone();
@@ -394,6 +413,7 @@ impl AgentLoop for App {
                     steps,
                     LlmFinishReason::Stop,
                     true,
+                    Some("cancelled"),
                     (input_tokens, output_tokens, cache_tokens),
                     reported_cost_usd,
                     started,
@@ -408,6 +428,7 @@ impl AgentLoop for App {
                         steps,
                         LlmFinishReason::Length,
                         true,
+                        Some("timeout"),
                         (input_tokens, output_tokens, cache_tokens),
                         reported_cost_usd,
                         started,
@@ -418,6 +439,7 @@ impl AgentLoop for App {
             if steps >= req.max_turns {
                 // FR-LOOP-02: the turn cap stops the loop and says so.
                 truncated = true;
+                stop_cause = Some("turn_cap");
                 finish_reason = LlmFinishReason::Length;
                 break;
             }
@@ -586,6 +608,7 @@ impl AgentLoop for App {
                 final_text = assistant.content;
                 if finish.reason == LlmFinishReason::Length {
                     truncated = true;
+                    stop_cause = Some("token_cap");
                 }
                 self.emitter.emit(UiEvent::Finish(finish));
                 self.checkpoint(&mut session, &mut history, steps)?;
@@ -622,6 +645,7 @@ impl AgentLoop for App {
                         steps,
                         LlmFinishReason::Stop,
                         false,
+                        None,
                         (input_tokens, output_tokens, cache_tokens),
                         reported_cost_usd,
                         started,
@@ -709,6 +733,7 @@ impl AgentLoop for App {
             steps,
             finish_reason,
             truncated,
+            stop_cause,
             (input_tokens, output_tokens, cache_tokens),
             reported_cost_usd,
             started,
@@ -984,6 +1009,25 @@ mod tests {
             .collect()
     }
 
+    /// The text value of an extra field on the last event of `kind`, if any.
+    fn last_extra_text(telemetry: &FakeTelemetry, kind: &str, key: &str) -> Option<String> {
+        telemetry
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|e| e.kind == kind)
+            .and_then(|e| {
+                e.extra
+                    .iter()
+                    .find_map(|(k, v)| match (k.as_str() == key, v) {
+                        (true, ExtraField::Text(s)) => Some(s.clone()),
+                        _ => None,
+                    })
+            })
+    }
+
     #[test]
     fn dispatches_a_tool_call_then_finishes() {
         let mut h = harness(
@@ -1097,6 +1141,30 @@ mod tests {
         assert!(result.truncated);
         assert_eq!(result.finish_reason, LlmFinishReason::Length);
         assert_eq!(h.tool_calls.0.lock().unwrap().len(), 3);
+        // The turn cap and a genuine provider token cap both set
+        // `finish_reason: Length`; `stop_cause` is what tells a consumer
+        // (e.g. the opencode translation) which one actually happened.
+        assert_eq!(
+            last_extra_text(&h.telemetry, "finish", "stop_cause").as_deref(),
+            Some("turn_cap")
+        );
+    }
+
+    #[test]
+    fn a_provider_token_cap_is_a_distinct_stop_cause_from_the_turn_cap() {
+        let mut h = harness(
+            vec![vec![LlmEvent::Finish(finish(LlmFinishReason::Length))]],
+            "unused",
+        );
+        let req = ExecutionRequest::new("write a lot");
+
+        let result = h.app.execute(&ctx(), req).unwrap();
+        assert!(result.truncated);
+        assert_eq!(result.finish_reason, LlmFinishReason::Length);
+        assert_eq!(
+            last_extra_text(&h.telemetry, "finish", "stop_cause").as_deref(),
+            Some("token_cap")
+        );
     }
 
     #[test]

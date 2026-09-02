@@ -43,9 +43,17 @@ event is an envelope:
 | a tool fails, or a mode refuses it | `session.next.tool.failed` |
 | the provider throttles us | `session.next.retried` |
 | the run ends | `session.next.step.ended`, then `session.idle` |
-| a cap truncated the run | `session.error` before `session.idle` |
+| a turn cap or the model's own token limit truncated the run | `session.error` before `session.idle` |
 
 Faithful details worth knowing:
+
+- `session.error` fires only for a genuine length limit — zcode's own
+  `--max-turns` cap or the provider reporting `length`/`max_tokens` — and its
+  message says which one it was (`stop_cause` in zcode's own JSONL). A run
+  that stops early for another reason (`--timeout-ms`, Ctrl-C) is *not*
+  reported this way: neither is a length limit, and the CLI/TUI already
+  report those through their own channel, so opencode consumers would rather
+  see nothing than a `MessageOutputLengthError` that did not happen.
 
 - `model` is a `{ id, providerID }` ref, not a string.
 - `input` on `tool.called` is an **object**. A model that emits malformed JSON

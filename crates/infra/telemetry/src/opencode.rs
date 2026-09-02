@@ -174,6 +174,52 @@ impl OpencodeTelemetry {
         let index = self.calls.iter().position(|(id, _)| id == call_id)?;
         Some(self.calls.remove(index).1)
     }
+
+    /// The `session.error` opencode reports for a truncated run — or `None`
+    /// when the real cause is not a length limit at all.
+    ///
+    /// `truncated` used to be reported with one hardcoded message regardless
+    /// of `stop_cause`: a genuine provider token limit, zcode's own
+    /// `--max-turns` cap, a `--timeout-ms` deadline, and a user's Ctrl-C all
+    /// read as "stopped at the turn or token cap". That is wrong for the
+    /// last two — neither is a length limit — and told a consumer nothing
+    /// about which of the first two actually happened. `stop_cause` (set by
+    /// `app::AgentLoop::execute`, see `finish_run`) carries the real reason;
+    /// this maps it onto opencode's one length-error type, or withholds the
+    /// event where opencode's schema has nothing that would be true.
+    fn truncation_error(stop_cause: Option<&str>) -> Option<(&'static str, &'static str)> {
+        match stop_cause {
+            // The provider itself cut the message off at its output/token
+            // budget — this is exactly what `MessageOutputLengthError` means.
+            Some("token_cap") => Some((
+                "MessageOutputLengthError",
+                "stopped: the model reached its output token limit",
+            )),
+            // zcode's own step budget (`--max-turns`). opencode has no
+            // separate error for this, so it is reported under the same
+            // name — both are "ran out of length budget" — but the message
+            // says which budget it actually was, rather than leaving the
+            // reader to guess between the two.
+            Some("turn_cap") => Some((
+                "MessageOutputLengthError",
+                "stopped: reached the maximum number of turns",
+            )),
+            // A wall-clock timeout or a user cancellation is not a length
+            // limit; the CLI/TUI already report these through their own
+            // channel (see `cli::mod::run`'s handling of `AppError::Timeout`
+            // / `AppError::Interrupted`), so nothing is emitted here rather
+            // than blaming a cap that was never hit.
+            Some("timeout") | Some("cancelled") => None,
+            // `truncated` is set with no cause we recognise (an older engine
+            // build, or a cause added there but not yet mirrored here): keep
+            // reporting *something* rather than silently dropping a real
+            // truncation.
+            _ => Some((
+                "MessageOutputLengthError",
+                "stopped at the turn or token cap",
+            )),
+        }
+    }
 }
 
 impl TelemetryPort for OpencodeTelemetry {
@@ -334,15 +380,18 @@ impl TelemetryPort for OpencodeTelemetry {
                 );
 
                 if truncated {
-                    let mut data = serde_json::Map::new();
-                    data.insert(
-                        "error".into(),
-                        serde_json::json!({
-                            "name": "MessageOutputLengthError",
-                            "data": { "message": "stopped at the turn or token cap" }
-                        }),
-                    );
-                    self.emit_event("session.error", data);
+                    let stop_cause = Self::text_field(&ev.extra, "stop_cause");
+                    if let Some((name, message)) = Self::truncation_error(stop_cause.as_deref()) {
+                        let mut data = serde_json::Map::new();
+                        data.insert(
+                            "error".into(),
+                            serde_json::json!({
+                                "name": name,
+                                "data": { "message": message }
+                            }),
+                        );
+                        self.emit_event("session.error", data);
+                    }
                 }
                 // opencode signals the end of activity with `session.idle`.
                 self.emit_event("session.idle", serde_json::Map::new());
@@ -675,6 +724,81 @@ mod tests {
                 "session.idle"
             ]
         );
+        // No `stop_cause` on the event: the fallback message, not a guess
+        // dressed up as one of the specific causes.
+        let error = out.iter().find(|e| e["type"] == "session.error").unwrap();
+        assert_eq!(
+            error["data"]["error"]["data"]["message"],
+            "stopped at the turn or token cap"
+        );
+    }
+
+    #[test]
+    fn a_turn_cap_truncation_names_the_real_cause() {
+        let out = render(vec![
+            event("loop_start", vec![]),
+            event(
+                "finish",
+                vec![
+                    ("reason", ExtraField::Text("length".into())),
+                    ("truncated", ExtraField::Bool(true)),
+                    ("stop_cause", ExtraField::Text("turn_cap".into())),
+                ],
+            ),
+        ]);
+        let error = out.iter().find(|e| e["type"] == "session.error").unwrap();
+        assert_eq!(
+            error["data"]["error"]["data"]["message"],
+            "stopped: reached the maximum number of turns"
+        );
+    }
+
+    #[test]
+    fn a_token_cap_truncation_names_the_real_cause() {
+        let out = render(vec![
+            event("loop_start", vec![]),
+            event(
+                "finish",
+                vec![
+                    ("reason", ExtraField::Text("length".into())),
+                    ("truncated", ExtraField::Bool(true)),
+                    ("stop_cause", ExtraField::Text("token_cap".into())),
+                ],
+            ),
+        ]);
+        let error = out.iter().find(|e| e["type"] == "session.error").unwrap();
+        assert_eq!(
+            error["data"]["error"]["data"]["message"],
+            "stopped: the model reached its output token limit"
+        );
+    }
+
+    #[test]
+    fn a_timeout_or_cancellation_is_not_reported_as_a_length_cap() {
+        // Neither is a length limit; reporting `session.error` /
+        // `MessageOutputLengthError` for them would be flatly wrong.
+        for cause in ["timeout", "cancelled"] {
+            let out = render(vec![
+                event("loop_start", vec![]),
+                event(
+                    "finish",
+                    vec![
+                        ("reason", ExtraField::Text("stop".into())),
+                        ("truncated", ExtraField::Bool(true)),
+                        ("stop_cause", ExtraField::Text(cause.into())),
+                    ],
+                ),
+            ]);
+            assert_eq!(
+                kinds(&out),
+                vec![
+                    "session.next.step.started",
+                    "session.next.step.ended",
+                    "session.idle"
+                ],
+                "cause `{cause}` must not emit session.error"
+            );
+        }
     }
 
     #[test]
