@@ -326,6 +326,195 @@ fn retry_events(
     retries.into_iter().map(|n| Ok(LlmEvent::Retry(n)))
 }
 
+/// Whether a failure that reached us *after* a 2xx response — a connection
+/// dropped while reading the body, or an in-band `error` chunk a provider
+/// sends instead of an HTTP status (OpenRouter's "Network connection lost."
+/// being the case that motivated this) — looks transient enough to restart
+/// the request over. `send_with_retry` cannot see these: by the time they
+/// happen the request already succeeded and streaming had begun.
+///
+/// This stays conservative on purpose: unlike an HTTP status, free-text error
+/// prose has no fixed vocabulary, so a message that does not name a
+/// connectivity problem (a policy refusal, a bad request, a context-length
+/// error) is left alone — retrying it verbatim would just fail the same way
+/// again, `max_retries` times, before giving up anyway.
+fn is_retryable_stream_error(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    const NEEDLES: &[&str] = &[
+        "network connection lost",
+        "connection reset",
+        "connection lost",
+        "connection closed",
+        "connection aborted",
+        "broken pipe",
+        "timed out",
+        "timeout",
+        "overloaded",
+        "temporarily unavailable",
+        "bad gateway",
+        "service unavailable",
+        "gateway time-out",
+        "gateway timeout",
+        "internal server error",
+        "reset by peer",
+        "stream read failed",
+        "end of file before message length reached",
+    ];
+    NEEDLES.iter().any(|n| m.contains(n))
+}
+
+/// The short, human reason carried on a stream-level `RetryNotice`.
+///
+/// `is_retryable_stream_error` matched against the full message, which
+/// already carries a source label (`"provider error: ..."`,
+/// `"stream read failed: ..."`); strip that so the notice reads like the
+/// others (`"rate limited by the provider"`) instead of repeating it.
+fn stream_retry_reason(e: &BoxError) -> String {
+    let msg = e.to_string();
+    msg.split_once(": ")
+        .map(|(_, rest)| rest.to_string())
+        .unwrap_or(msg)
+}
+
+/// Wraps a provider's decoded event stream so a transient failure — a
+/// connection dropped mid-generation, or an in-band `error` chunk reported in
+/// place of an HTTP status — restarts the whole request instead of ending the
+/// turn. This is what makes a dropped connection recoverable the same way a
+/// failed *connect* already was in `send_with_retry`; without it, a stream
+/// that made it past the initial handshake had no retry path at all, and any
+/// hiccup mid-generation ended the run outright — fatal for an unattended
+/// agent.
+///
+/// Retrying is only safe before the first content-bearing event of the
+/// current attempt: once a `Delta` or tool-call has already reached the
+/// caller — and, from there, the transcript — silently starting over would
+/// duplicate it rather than resume it. Past that point a failure is reported
+/// as-is, same as before this existed.
+type Attempt = (
+    Box<dyn Iterator<Item = Result<LlmEvent, BoxError>> + Send>,
+    Vec<RetryNotice>,
+);
+
+/// Wraps a provider's decoded event stream so a transient failure — a
+/// connection dropped mid-generation, or an in-band `error` chunk reported in
+/// place of an HTTP status — restarts the whole request instead of ending the
+/// turn. This is what makes a dropped connection recoverable the same way a
+/// failed *connect* already was in `send_with_retry`; without it, a stream
+/// that made it past the initial handshake had no retry path at all, and any
+/// hiccup mid-generation ended the run outright — fatal for an unattended
+/// agent.
+///
+/// `open` is expected to redo the whole exchange from scratch (its own
+/// `send_with_retry` call included) and hand back a fresh decoded event
+/// stream — it takes no arguments precisely so a retry can call it again with
+/// no state left over from the failed attempt. Kept generic over `open`
+/// rather than over the provider's response/decoder types so the retry logic
+/// itself — the part worth testing — can be driven from canned closures with
+/// no real HTTP response in sight.
+///
+/// Retrying is only safe before the first content-bearing event of the
+/// current attempt: once a `Delta` or tool-call has already reached the
+/// caller — and, from there, the transcript — silently starting over would
+/// duplicate it rather than resume it. Past that point a failure is reported
+/// as-is, same as before this existed.
+struct ResilientStream<Open>
+where
+    Open: Fn() -> Result<Attempt, BoxError> + Send,
+{
+    open: Open,
+    policy: RetryPolicy,
+    attempt: u32,
+    produced_content: bool,
+    inner: Box<dyn Iterator<Item = Result<LlmEvent, BoxError>> + Send>,
+}
+
+impl<Open> ResilientStream<Open>
+where
+    Open: Fn() -> Result<Attempt, BoxError> + Send + 'static,
+{
+    /// Opens the first attempt and returns the boxed, retry-capable stream.
+    /// A failure on the very first open (already retried by `open` itself,
+    /// which is expected to wrap `send_with_retry`) is reported immediately —
+    /// there is nothing yet to protect by retrying again.
+    fn start(
+        open: Open,
+        policy: RetryPolicy,
+    ) -> Box<dyn Iterator<Item = Result<LlmEvent, BoxError>> + Send> {
+        match open() {
+            Ok((events, retries)) => {
+                let inner: Box<dyn Iterator<Item = Result<LlmEvent, BoxError>> + Send> =
+                    Box::new(retry_events(retries).chain(events));
+                Box::new(Self {
+                    open,
+                    policy,
+                    attempt: 0,
+                    produced_content: false,
+                    inner,
+                })
+            }
+            Err(e) => Box::new(std::iter::once(Err(e))),
+        }
+    }
+}
+
+impl<Open> Iterator for ResilientStream<Open>
+where
+    Open: Fn() -> Result<Attempt, BoxError> + Send,
+{
+    type Item = Result<LlmEvent, BoxError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            match self.inner.next() {
+                Some(Ok(event)) => {
+                    if matches!(
+                        event,
+                        LlmEvent::Delta(_)
+                            | LlmEvent::ToolCallStart { .. }
+                            | LlmEvent::ToolCallArgs { .. }
+                    ) {
+                        self.produced_content = true;
+                    }
+                    return Some(Ok(event));
+                }
+                Some(Err(e)) => {
+                    if self.produced_content
+                        || self.attempt >= self.policy.max_retries
+                        || !is_retryable_stream_error(&e.to_string())
+                    {
+                        return Some(Err(e));
+                    }
+                    let delay = retry_delay(self.attempt, None, None, self.policy);
+                    let notice = RetryNotice {
+                        attempt: self.attempt + 1,
+                        max_attempts: self.policy.max_retries,
+                        delay_ms: delay.as_millis() as u64,
+                        status: None,
+                        reason: stream_retry_reason(&e),
+                    };
+                    std::thread::sleep(delay);
+                    self.attempt += 1;
+                    match (self.open)() {
+                        Ok((events, retries)) => {
+                            self.inner = Box::new(
+                                std::iter::once(Ok(LlmEvent::Retry(notice)))
+                                    .chain(retry_events(retries))
+                                    .chain(events),
+                            );
+                            continue;
+                        }
+                        // Reopening failed outright (`send_with_retry`
+                        // already exhausted its own connect-level retries) —
+                        // nothing left to try.
+                        Err(open_err) => return Some(Err(open_err)),
+                    }
+                }
+                None => return None,
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Incremental decoding
 // ---------------------------------------------------------------------------
@@ -511,16 +700,13 @@ impl OpenAiShapeLlm {
     }
 
     fn request(&self, payload: &serde_json::Value) -> RequestBuilder {
-        let mut builder = self
-            .client
-            .post(&self.endpoint)
-            .header("authorization", format!("Bearer {}", self.api_key))
-            .header("content-type", "application/json")
-            .header("accept", "text/event-stream");
-        for (name, value) in &self.extra_headers {
-            builder = builder.header(*name, value);
-        }
-        builder.json(payload)
+        build_openai_shape_request(
+            &self.client,
+            &self.endpoint,
+            &self.api_key,
+            &self.extra_headers,
+            payload,
+        )
     }
 
     fn open_stream(&self, req: &LlmRequest) -> Result<RetriedResponse, BoxError> {
@@ -540,13 +726,44 @@ impl OpenAiShapeLlm {
         &self,
         req: &LlmRequest,
     ) -> Box<dyn Iterator<Item = Result<LlmEvent, BoxError>> + Send> {
-        match self.open_stream(req) {
-            Ok(RetriedResponse { response, retries }) => Box::new(retry_events(retries).chain(
+        let payload = build_openai_request(req, &self.model, self.cache_control);
+        let client = self.client.clone();
+        let endpoint = self.endpoint.clone();
+        let api_key = self.api_key.clone();
+        let headers = self.extra_headers.clone();
+        let provider = self.provider;
+        let policy = self.retry;
+        let open = move || -> Result<Attempt, BoxError> {
+            let RetriedResponse { response, retries } = send_with_retry(provider, policy, || {
+                build_openai_shape_request(&client, &endpoint, &api_key, &headers, &payload)
+            })?;
+            let events: Box<dyn Iterator<Item = Result<LlmEvent, BoxError>> + Send> = Box::new(
                 EventStream::from_response(response, OpenAiDecoder::default()),
-            )),
-            Err(e) => Box::new(std::iter::once(Err(e))),
-        }
+            );
+            Ok((events, retries))
+        };
+        ResilientStream::start(open, policy)
     }
+}
+
+/// Shared by the borrowed (`request`) and owned-and-retryable (`stream_events`)
+/// paths so a stream restart does not need to hold a borrow of `self`.
+fn build_openai_shape_request(
+    client: &Client,
+    endpoint: &str,
+    api_key: &str,
+    extra_headers: &[(&'static str, String)],
+    payload: &serde_json::Value,
+) -> RequestBuilder {
+    let mut builder = client
+        .post(endpoint)
+        .header("authorization", format!("Bearer {api_key}"))
+        .header("content-type", "application/json")
+        .header("accept", "text/event-stream");
+    for (name, value) in extra_headers {
+        builder = builder.header(*name, value);
+    }
+    builder.json(payload)
 }
 
 macro_rules! openai_shaped_port {
@@ -1002,13 +1219,7 @@ impl AnthropicLlm {
     fn open_stream(&self, req: &LlmRequest) -> Result<RetriedResponse, BoxError> {
         let payload = build_anthropic_request(req, &self.model);
         send_with_retry("anthropic", self.retry, || {
-            self.client
-                .post(&self.endpoint)
-                .header("x-api-key", &self.api_key)
-                .header("anthropic-version", "2023-06-01")
-                .header("content-type", "application/json")
-                .header("accept", "text/event-stream")
-                .json(&payload)
+            build_anthropic_request_builder(&self.client, &self.endpoint, &self.api_key, &payload)
         })
     }
 
@@ -1020,6 +1231,23 @@ impl AnthropicLlm {
     }
 }
 
+/// Shared by the borrowed (`open_stream`) and owned-and-retryable (`stream`)
+/// paths so a stream restart does not need to hold a borrow of `self`.
+fn build_anthropic_request_builder(
+    client: &Client,
+    endpoint: &str,
+    api_key: &str,
+    payload: &serde_json::Value,
+) -> RequestBuilder {
+    client
+        .post(endpoint)
+        .header("x-api-key", api_key)
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .header("accept", "text/event-stream")
+        .json(payload)
+}
+
 impl domain::LlmPort for AnthropicLlm {
     fn send(&mut self, req: &LlmRequest) -> Result<LlmResponse, BoxError> {
         let body = self.http_body(req)?;
@@ -1029,12 +1257,22 @@ impl domain::LlmPort for AnthropicLlm {
         &mut self,
         req: &LlmRequest,
     ) -> Box<dyn Iterator<Item = Result<LlmEvent, BoxError>> + Send> {
-        match self.open_stream(req) {
-            Ok(RetriedResponse { response, retries }) => Box::new(retry_events(retries).chain(
+        let payload = build_anthropic_request(req, &self.model);
+        let client = self.client.clone();
+        let endpoint = self.endpoint.clone();
+        let api_key = self.api_key.clone();
+        let policy = self.retry;
+        let open = move || -> Result<Attempt, BoxError> {
+            let RetriedResponse { response, retries } =
+                send_with_retry("anthropic", policy, || {
+                    build_anthropic_request_builder(&client, &endpoint, &api_key, &payload)
+                })?;
+            let events: Box<dyn Iterator<Item = Result<LlmEvent, BoxError>> + Send> = Box::new(
                 EventStream::from_response(response, AnthropicDecoder::default()),
-            )),
-            Err(e) => Box::new(std::iter::once(Err(e))),
-        }
+            );
+            Ok((events, retries))
+        };
+        ResilientStream::start(open, policy)
     }
 }
 
@@ -1340,10 +1578,7 @@ impl OllamaLlm {
     fn open_stream(&self, req: &LlmRequest) -> Result<RetriedResponse, BoxError> {
         let payload = build_ollama_request(req, &self.model);
         send_with_retry("ollama", self.retry, || {
-            self.client
-                .post(&self.endpoint)
-                .header("content-type", "application/json")
-                .json(&payload)
+            build_ollama_request_builder(&self.client, &self.endpoint, &payload)
         })
     }
 
@@ -1367,6 +1602,19 @@ impl OllamaLlm {
 
 const OLLAMA_VISION_WARNING: &str = "(warning: ollama does not support vision)";
 
+/// Shared by the borrowed (`open_stream`) and owned-and-retryable (`stream`)
+/// paths so a stream restart does not need to hold a borrow of `self`.
+fn build_ollama_request_builder(
+    client: &Client,
+    endpoint: &str,
+    payload: &serde_json::Value,
+) -> RequestBuilder {
+    client
+        .post(endpoint)
+        .header("content-type", "application/json")
+        .json(payload)
+}
+
 impl domain::LlmPort for OllamaLlm {
     fn send(&mut self, req: &LlmRequest) -> Result<LlmResponse, BoxError> {
         let (events, body) = self.http_body(req)?;
@@ -1377,22 +1625,31 @@ impl domain::LlmPort for OllamaLlm {
         req: &LlmRequest,
     ) -> Box<dyn Iterator<Item = Result<LlmEvent, BoxError>> + Send> {
         let warn = !req.images.is_empty();
-        match self.open_stream(req) {
-            Ok(RetriedResponse { response, retries }) => {
-                let stream = retry_events(retries).chain(EventStream::from_response(
-                    response,
-                    OllamaDecoder::default(),
-                ));
-                if warn {
-                    Box::new(
-                        std::iter::once(Ok(LlmEvent::Delta(OLLAMA_VISION_WARNING.to_string())))
-                            .chain(stream),
-                    )
-                } else {
-                    Box::new(stream)
-                }
-            }
-            Err(e) => Box::new(std::iter::once(Err(e))),
+        let payload = build_ollama_request(req, &self.model);
+        let client = self.client.clone();
+        let endpoint = self.endpoint.clone();
+        let policy = self.retry;
+        let open = move || -> Result<Attempt, BoxError> {
+            let RetriedResponse { response, retries } = send_with_retry("ollama", policy, || {
+                build_ollama_request_builder(&client, &endpoint, &payload)
+            })?;
+            let events: Box<dyn Iterator<Item = Result<LlmEvent, BoxError>> + Send> = Box::new(
+                EventStream::from_response(response, OllamaDecoder::default()),
+            );
+            Ok((events, retries))
+        };
+        let stream = ResilientStream::start(open, policy);
+        // The vision warning is a synthetic, client-side notice rather than
+        // provider content, so it is chained on the outside — it must not
+        // count toward `ResilientStream`'s "has this attempt produced content
+        // yet" check, or a request carrying images would never retry.
+        if warn {
+            Box::new(
+                std::iter::once(Ok(LlmEvent::Delta(OLLAMA_VISION_WARNING.to_string())))
+                    .chain(stream),
+            )
+        } else {
+            stream
         }
     }
 }
@@ -1885,6 +2142,138 @@ mod tests {
         let second = retry_delay(1, None, None, policy);
         assert!(second > first);
         assert!(retry_delay(20, None, None, policy) <= MAX_BACKOFF);
+    }
+
+    #[test]
+    fn stream_error_classification_is_conservative() {
+        // The case that motivated this: OpenRouter reports a dropped
+        // upstream connection as an in-band `error` chunk, not an HTTP
+        // status, so `send_with_retry` never sees it.
+        assert!(is_retryable_stream_error(
+            "provider error: Network connection lost."
+        ));
+        assert!(is_retryable_stream_error(
+            "stream read failed: Connection reset by peer (os error 54)"
+        ));
+        assert!(is_retryable_stream_error(
+            "anthropic stream error: Overloaded"
+        ));
+        // A failure that will just recur identically must not be retried —
+        // that only spends `max_retries` attempts before failing anyway.
+        assert!(!is_retryable_stream_error(
+            "provider error: invalid request: missing field 'model'"
+        ));
+        assert!(!is_retryable_stream_error(
+            "provider error: content filtered by policy"
+        ));
+    }
+
+    fn once_err(message: &str) -> Result<Attempt, BoxError> {
+        let events: Box<dyn Iterator<Item = Result<LlmEvent, BoxError>> + Send> =
+            Box::new(std::iter::once(Err(message.to_string().into())));
+        Ok((events, Vec::new()))
+    }
+
+    #[test]
+    fn a_mid_stream_network_drop_retries_before_any_content_reached_the_caller() {
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let policy = RetryPolicy::default().with_max_retries(2);
+        let counter = attempts.clone();
+        let open = move || -> Result<Attempt, BoxError> {
+            if counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                return once_err("provider error: Network connection lost.");
+            }
+            let events: Box<dyn Iterator<Item = Result<LlmEvent, BoxError>> + Send> = Box::new(
+                vec![
+                    Ok(LlmEvent::Delta("hi".into())),
+                    Ok(LlmEvent::Finish(LlmFinish {
+                        reason: LlmFinishReason::Stop,
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        cache_tokens: 0,
+                        cost_usd: None,
+                    })),
+                ]
+                .into_iter(),
+            );
+            Ok((events, Vec::new()))
+        };
+        let events: Vec<_> = ResilientStream::start(open, policy).collect();
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(
+            events.iter().all(|e| e.is_ok()),
+            "the dropped connection must never reach the caller: {events:?}"
+        );
+        assert!(matches!(events[0], Ok(LlmEvent::Retry(_))));
+        assert!(matches!(events[1], Ok(LlmEvent::Delta(ref t)) if t == "hi"));
+    }
+
+    #[test]
+    fn mid_stream_retries_give_up_after_max_retries_instead_of_looping_forever() {
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let policy = RetryPolicy::default().with_max_retries(2);
+        let counter = attempts.clone();
+        let open = move || -> Result<Attempt, BoxError> {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            once_err("provider error: Network connection lost.")
+        };
+        let events: Vec<_> = ResilientStream::start(open, policy).collect();
+        // The initial attempt plus exactly `max_retries` more, never unbounded.
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, Ok(LlmEvent::Retry(_))))
+                .count(),
+            2
+        );
+        assert!(
+            matches!(events.last(), Some(Err(_))),
+            "must terminate with a reportable error once retries are exhausted, not hang"
+        );
+    }
+
+    #[test]
+    fn a_network_drop_after_content_already_reached_the_caller_is_not_retried() {
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let policy = RetryPolicy::default();
+        let counter = attempts.clone();
+        let open = move || -> Result<Attempt, BoxError> {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let events: Box<dyn Iterator<Item = Result<LlmEvent, BoxError>> + Send> = Box::new(
+                vec![
+                    Ok(LlmEvent::Delta("partial".into())),
+                    Err("provider error: Network connection lost.".into()),
+                ]
+                .into_iter(),
+            );
+            Ok((events, Vec::new()))
+        };
+        let events: Vec<_> = ResilientStream::start(open, policy).collect();
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "restarting after content was already emitted would duplicate it"
+        );
+        assert!(matches!(events.last(), Some(Err(_))));
+    }
+
+    #[test]
+    fn a_non_network_stream_error_is_reported_immediately() {
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let policy = RetryPolicy::default();
+        let counter = attempts.clone();
+        let open = move || -> Result<Attempt, BoxError> {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            once_err("provider error: content filtered by policy")
+        };
+        let events: Vec<_> = ResilientStream::start(open, policy).collect();
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a failure that will just recur must not burn retries"
+        );
+        assert!(matches!(events.last(), Some(Err(_))));
     }
 
     #[test]

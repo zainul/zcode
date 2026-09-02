@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — a network error dropped mid-stream ended the turn instead of retrying
+
+`send_with_retry` only retries a failed *connect* — before a response body
+starts streaming. Once a request got a `200` and streaming began, a dropped
+connection (an I/O error reading the body) or a provider reporting failure
+in-band instead of via HTTP status (OpenRouter's
+`{"error":{"message":"Network connection lost."}}` mid-stream, the case that
+surfaced this) had no retry path at all: the error reached
+`AgentLoop::execute`'s `?` and ended the run outright — fatal for an
+unattended agent. `ResilientStream` (`crates/infra/llm/src/lib.rs`) now wraps
+each provider's decoded event stream and, on a message that looks like a
+transient connectivity failure, reopens the whole request — same
+backoff/`RetryNotice` machinery as a failed connect — as long as nothing from
+the failed attempt has reached the caller yet; past that point, restarting
+would duplicate already-emitted content, so a failure is still reported as
+before.
+
 ## [0.4.0] - 2026-09-02
 
 ### Added — release workflow that builds and publishes platform binaries
