@@ -234,12 +234,7 @@ cmd_tag() {
     grep -q "^## \[$VERSION\]" CHANGELOG.md \
         || die "CHANGELOG.md has no '## [$VERSION]' section — run 'bump' and merge it first"
 
-    NOTES=$(awk -v ver="$VERSION" '
-        BEGIN { p = 0 }
-        $0 ~ "^## \\[" ver "\\]" { p = 1; next }
-        p && /^## \[/ { exit }
-        p { print }
-    ' CHANGELOG.md | sed '/./,$!d')
+    NOTES=$("$REPO_ROOT/scripts/changelog-notes.sh" "$VERSION")
 
     step "Tagging $TAG at $(git rev-parse --short HEAD) on $(git branch --show-current)"
     confirm "Create annotated tag $TAG?" || die "aborted"

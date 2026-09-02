@@ -167,6 +167,43 @@ plain `std::thread`. Domain entities use owned types (`String`, `PathBuf`,
 move the transcript in and out of the session rather than cloning it; and both
 TUI panes are bounded so runaway tool output cannot grow the process.
 
+## Releasing
+
+Version is automatic — read from `[workspace.package].version` in
+`Cargo.toml`, not something you pass on the command line:
+
+```sh
+./scripts/release.sh bump minor          # or patch / major / an explicit X.Y.Z
+./scripts/release.sh bump minor --push   # bumps Cargo.toml, rolls CHANGELOG.md, commits, pushes
+
+# once that commit is on main:
+./scripts/release.sh tag --push          # tags vX.Y.Z — X.Y.Z read back from Cargo.toml — and pushes it
+```
+
+Pushing the tag triggers `.github/workflows/release.yml`, which builds
+`zcode` for Linux x86_64, macOS x86_64/aarch64 and Windows x86_64, and
+attaches the packaged archives plus `.sha256` checksums to the GitHub release
+for that tag — that's what makes each release downloadable as a binary rather
+than something users have to `cargo build` themselves.
+
+To build the same archives locally, with no tag push and no CI wait — version
+still read automatically from `Cargo.toml`, override only with
+`ZCODE_RELEASE_VERSION` if you need a different label:
+
+```sh
+./scripts/package-release.sh                      # mac (both arches) + linux/ubuntu x86_64
+./scripts/package-release.sh aarch64-apple-darwin  # or name specific target(s)
+```
+
+A target that isn't native to your machine (e.g. Linux from a Mac) builds via
+[`cross`](https://github.com/cross-rs/cross) (Docker) if it's on `PATH`, and
+is skipped with a note otherwise — plain `cargo`, no local Docker dependency,
+still gets you every target native to the host you're on.
+
+Once installed, `zcode --version`/`-V` (or `zcode version` for the build
+profile and timestamp too) prints the running binary's version and commit, so
+you can check it against a release's tag without guessing.
+
 ## Documentation
 
 - **[User guide](docs/guide/README.md)** — installation through to MCP, LSP and telemetry
