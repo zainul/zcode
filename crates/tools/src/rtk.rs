@@ -32,7 +32,13 @@ const REWRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// How long to wait for a package manager. Installing is a one-off, but a
 /// startup that never finishes is worse than one without rtk.
-const INSTALL_TIMEOUT: Duration = Duration::from_secs(180);
+///
+/// `cargo install --git` compiles rtk and its dependencies from source rather
+/// than fetching a prebuilt bottle, which is legitimately slower than
+/// Homebrew on a cold cache — 180s was tuned for `brew install` alone and
+/// clipped a from-source build mid-compile, which then counted as a failure
+/// and was remembered for a day.
+const INSTALL_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// A located rtk binary.
 #[derive(Debug, Clone)]
@@ -94,17 +100,36 @@ impl Rtk {
 
 /// Package managers that can install rtk, in the order worth trying.
 ///
-/// Homebrew only, deliberately. `rtk` is in homebrew-core rather than a
-/// third-party tap, so what it installs is auditable. The alternatives are
-/// not: `cargo install rtk` resolves to **an unrelated crate** (Rust Type
-/// Kit), and the upstream shell installer is `curl … | sh` — the exact
-/// pattern zcode's own denylist refuses. A tool that forbids the model from
-/// piping the network into a shell must not do it itself.
-const INSTALLERS: &[(&str, &[&str])] = &[("brew", &["install", "rtk"])];
+/// Both entries only ever run a package manager that is *already present* and
+/// resolve straight to rtk's own upstream — never a piped shell script, which
+/// is the exact pattern zcode's own denylist refuses a model for; a tool that
+/// forbids that must not do it itself.
+///
+/// `brew` comes first: `rtk` is in homebrew-core rather than a third-party
+/// tap, so what it installs is a reviewed, auditable formula. It also covers
+/// Linux machines that have Linuxbrew.
+///
+/// `cargo install --git` is the fallback for the far more common case on
+/// Linux/Ubuntu — no Homebrew, but a Rust toolchain (zcode itself needs one to
+/// build). It must be `--git https://github.com/rtk-ai/rtk`, never plain
+/// `cargo install rtk`: that name on crates.io belongs to an unrelated crate
+/// (Rust Type Kit), and the upstream README calls this out explicitly as the
+/// fix. `--git` builds straight from the source at a specific upstream
+/// repository rather than fetching and running an installer script, which
+/// keeps it in the same trust class as any other git/path dependency zcode
+/// already compiles.
+const INSTALLERS: &[(&str, &[&str])] = &[
+    ("brew", &["install", "rtk"]),
+    (
+        "cargo",
+        &["install", "--git", "https://github.com/rtk-ai/rtk", "rtk"],
+    ),
+];
 
 /// What to tell someone who has no supported package manager.
 pub const MANUAL_INSTALL_HINT: &str =
-    "install rtk from https://github.com/rtk-ai/rtk (`brew install rtk`), or set \
+    "install rtk from https://github.com/rtk-ai/rtk (`brew install rtk`, or on \
+     Linux `cargo install --git https://github.com/rtk-ai/rtk rtk`), or set \
      `rtk.enabled = false` to stop looking for it";
 
 #[derive(Debug)]
@@ -371,6 +396,27 @@ mod tests {
     fn a_machine_without_rtk_reports_nothing_rather_than_failing() {
         // rtk is an optimisation; its absence is not an error condition.
         assert!(Rtk::detect(Some("/nonexistent/rtk")).is_none());
+    }
+
+    #[test]
+    fn brew_is_tried_before_cargo() {
+        // Homebrew installs a reviewed homebrew-core formula; cargo builds
+        // from source. Prefer the more auditable one where both are present.
+        assert_eq!(INSTALLERS[0].0, "brew");
+        assert_eq!(INSTALLERS[1].0, "cargo");
+    }
+
+    #[test]
+    fn the_cargo_installer_never_resolves_to_the_wrong_crate() {
+        // Plain `cargo install rtk` resolves to an unrelated crates.io crate
+        // (Rust Type Kit). Pin `--git` at the upstream repo so this can never
+        // regress into installing the wrong binary.
+        let (_, args) = INSTALLERS
+            .iter()
+            .find(|(name, _)| *name == "cargo")
+            .unwrap();
+        assert!(args.contains(&"--git"));
+        assert!(args.contains(&"https://github.com/rtk-ai/rtk"));
     }
 
     #[test]

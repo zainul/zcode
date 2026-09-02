@@ -350,9 +350,9 @@ It did, and it says so before it starts. `rtk.auto_install` is on by default,
 because the point of rtk is a smaller bill and an optimisation nobody turns on
 is not an optimisation.
 
-It only ever runs **Homebrew**, and only when Homebrew is already installed —
-it installs a package, never a package manager, and never downloads a script to
-run. To stop it:
+It only ever runs **Homebrew** or **Cargo**, and only when one of them is
+already installed — it installs a package, never a package manager, and never
+downloads a script to run. To stop it:
 
 ```json
 { "rtk": { "auto_install": false } }
@@ -368,9 +368,16 @@ error. The common causes:
 
 | Message | Fix |
 |---------|-----|
-| `no supported package manager` | `brew install rtk`, or install from [the repo](https://github.com/rtk-ai/rtk) |
+| `no supported package manager` | `brew install rtk`, or on Linux `cargo install --git https://github.com/rtk-ai/rtk rtk`, or install from [the repo](https://github.com/rtk-ai/rtk) |
 | `brew failed: …` | run `brew install rtk` yourself to see the full output |
-| `a previous install failed within the last day` | fix the cause, then `brew install rtk` — or delete `~/.config/zcode/rtk-install-failed` to retry sooner |
+| `cargo failed: …` | run `cargo install --git https://github.com/rtk-ai/rtk rtk` yourself to see the full output |
+| `a previous install failed within the last day` | fix the cause, then reinstall — or delete `~/.config/zcode/rtk-install-failed` to retry sooner |
+
+On Ubuntu/Linux without Homebrew, zcode falls back to `cargo install --git
+https://github.com/rtk-ai/rtk rtk` — never plain `cargo install rtk`, which
+resolves to an unrelated crate on crates.io (Rust Type Kit). This needs a Rust
+toolchain and takes longer than a Homebrew bottle since it compiles from
+source.
 
 A failed install is recorded machine-wide and not retried for 24 hours, so a
 machine with no network does not pay the package manager's failure cost on

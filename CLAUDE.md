@@ -349,10 +349,14 @@ independently. `install_is_due_at` takes the path rather than reading `HOME`,
 because a unit that reads env can only be tested by moving env, which is
 process-global and breaks whatever else is running.
 
-Auto-install is **Homebrew only**. `rtk` is in homebrew-core (auditable);
-`cargo install rtk` is a *different crate* (Rust Type Kit), and upstream's
-installer is `curl … | sh`, which zcode's own denylist refuses. It only runs a
-package manager that is already present.
+Auto-install tries **Homebrew, then Cargo** — never more than that. `rtk` is in
+homebrew-core (auditable), so brew is tried first; the Cargo fallback covers
+Linux/Ubuntu machines with no Homebrew but a Rust toolchain, and must run
+`cargo install --git https://github.com/rtk-ai/rtk rtk` — plain
+`cargo install rtk` is a *different crate* (Rust Type Kit) on crates.io.
+Upstream's own installer is `curl … | sh`, which zcode's own denylist refuses,
+so `--git` (compiling the pinned upstream source) is used instead of that. It
+only runs a package manager that is already present.
 
 ## Configuration
 

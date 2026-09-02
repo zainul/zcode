@@ -153,8 +153,8 @@ the provider's own message.
 Shell output is routed through [rtk](https://github.com/rtk-ai/rtk) when it is
 available — a CLI proxy that filters what a command returns before it reaches
 the model. `ls -la` comes back 87% smaller, `git status` 59%. It is on by
-default, and zcode installs it (via Homebrew, never a piped script) if it is
-missing. Everything that enters the transcript is also capped at
+default, and zcode installs it (via Homebrew or Cargo, never a piped script) if
+it is missing. Everything that enters the transcript is also capped at
 `max_tool_output_chars`, and the cost of a session is estimated live from a
 built-in price table.
 
