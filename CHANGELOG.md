@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-02
+
 ### Added — release workflow that builds and publishes platform binaries
 
 `.github/workflows/release.yml` triggers on the `vX.Y.Z` tag that

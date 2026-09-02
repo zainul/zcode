@@ -81,7 +81,7 @@ dependencies = [
 
 [[package]]
 name = "app"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "domain",
  "thiserror 1.0.69",
@@ -477,7 +477,7 @@ dependencies = [
 
 [[package]]
 name = "domain"
-version = "0.3.0"
+version = "0.4.0"
 
 [[package]]
 name = "either"
@@ -827,7 +827,7 @@ dependencies = [
 
 [[package]]
 name = "infra-config"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "domain",
  "serde",
@@ -839,7 +839,7 @@ dependencies = [
 
 [[package]]
 name = "infra-filesystem"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "domain",
  "tempfile",
@@ -848,7 +848,7 @@ dependencies = [
 
 [[package]]
 name = "infra-llm"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "domain",
  "reqwest",
@@ -860,7 +860,7 @@ dependencies = [
 
 [[package]]
 name = "infra-lsp"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "domain",
  "lsp-types",
@@ -869,7 +869,7 @@ dependencies = [
 
 [[package]]
 name = "infra-mcp"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "domain",
  "serde_json",
@@ -877,7 +877,7 @@ dependencies = [
 
 [[package]]
 name = "infra-session"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "domain",
  "serde",
@@ -888,7 +888,7 @@ dependencies = [
 
 [[package]]
 name = "infra-shell"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "domain",
  "tempfile",
@@ -897,7 +897,7 @@ dependencies = [
 
 [[package]]
 name = "infra-telemetry"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "domain",
  "serde",
@@ -1914,7 +1914,7 @@ checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 
 [[package]]
 name = "tools"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "domain",
  "infra-config",
@@ -2337,7 +2337,7 @@ dependencies = [
 
 [[package]]
 name = "zcode"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "app",
  "clap",
@@ -2360,7 +2360,7 @@ dependencies = [
 
 [[package]]
 name = "zcode-benches"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "criterion",
  "domain",

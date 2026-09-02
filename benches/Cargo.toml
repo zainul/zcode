@@ -5,7 +5,7 @@ edition.workspace = true
 publish = false
 
 [dependencies]
-domain = { path = "../crates/domain", version = "0.3.0" }
+domain = { path = "../crates/domain", version = "0.4.0" }
 criterion = "0.5"
 
 [[bench]]

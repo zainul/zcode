@@ -6,15 +6,15 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-domain = { path = "../domain", version = "0.3.0" }
-app = { path = "../app", version = "0.3.0" }
-infra-llm = { path = "../infra/llm", version = "0.3.0" }
-infra-filesystem = { path = "../infra/filesystem", version = "0.3.0" }
-infra-shell = { path = "../infra/shell", version = "0.3.0" }
-infra-config = { path = "../infra/config", version = "0.3.0" }
-infra-session = { path = "../infra/session", version = "0.3.0" }
-infra-telemetry = { path = "../infra/telemetry", version = "0.3.0" }
-tools = { path = "../tools", version = "0.3.0", default-features = false }
+domain = { path = "../domain", version = "0.4.0" }
+app = { path = "../app", version = "0.4.0" }
+infra-llm = { path = "../infra/llm", version = "0.4.0" }
+infra-filesystem = { path = "../infra/filesystem", version = "0.4.0" }
+infra-shell = { path = "../infra/shell", version = "0.4.0" }
+infra-config = { path = "../infra/config", version = "0.4.0" }
+infra-session = { path = "../infra/session", version = "0.4.0" }
+infra-telemetry = { path = "../infra/telemetry", version = "0.4.0" }
+tools = { path = "../tools", version = "0.4.0", default-features = false }
 clap = { workspace = true }
 log = { workspace = true }
 env_logger = { workspace = true }
