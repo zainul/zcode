@@ -684,7 +684,28 @@ impl Config {
         if self.skills_dir.as_os_str().is_empty() {
             self.working_dir.join(".zcode").join("skills")
         } else {
-            expand_tilde(self.skills_dir.clone())
+            self.resolve_configured_dir(&self.skills_dir)
+        }
+    }
+
+    /// Expand `~` and, for a relative path, anchor it to `working_dir` rather
+    /// than the process's current directory.
+    ///
+    /// The project config file is found by walking *up* from wherever the CLI
+    /// was launched (see `Loader::discover_from`), so `working_dir` — the
+    /// directory holding that file — and the process's actual cwd are only
+    /// the same directory when the agent happens to be run from the project
+    /// root. A relative `skills_dir = "myskills"` resolved against the
+    /// process cwd instead would report the directory as missing (and the
+    /// skills in it as unreachable) the moment the agent is invoked from any
+    /// subdirectory, even though the config that named it was found and
+    /// loaded correctly.
+    fn resolve_configured_dir(&self, path: &Path) -> PathBuf {
+        let expanded = expand_tilde(path.to_path_buf());
+        if expanded.is_absolute() {
+            expanded
+        } else {
+            self.working_dir.join(expanded)
         }
     }
 
@@ -702,7 +723,7 @@ impl Config {
         };
         push(self.working_dir.join(".zcode").join("skills"));
         if !self.skills_dir.as_os_str().is_empty() {
-            push(expand_tilde(self.skills_dir.clone()));
+            push(self.resolve_configured_dir(&self.skills_dir));
         }
         // The machine-wide library, so a global collection is always available.
         if let Some(user) = user_config_candidates().first().and_then(|p| p.parent()) {
@@ -2409,6 +2430,27 @@ model = "gpt-3.5-turbo"
         // A machine-wide library must not hide the project's own skills.
         assert_eq!(roots[0], dir.path().join(".zcode").join("skills"));
         assert!(roots.contains(&PathBuf::from("/opt/team-skills")));
+    }
+
+    #[test]
+    fn relative_skills_dir_resolves_against_working_dir_not_the_process_cwd() {
+        // A relative `skills_dir` is a natural thing to write in a project
+        // config (e.g. `skills_dir = "myskills"`). The project file is found
+        // by walking *up* from wherever the CLI was launched, so the process's
+        // actual cwd and `working_dir` (the directory holding the config)
+        // disagree the moment the agent runs from a subdirectory — a relative
+        // path must resolve against `working_dir`, not whatever the shell's
+        // cwd happened to be.
+        let _guard = env_guard();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("myskills")).unwrap();
+        let cfg = Config {
+            working_dir: dir.path().to_path_buf(),
+            skills_dir: PathBuf::from("myskills"),
+            ..Default::default()
+        };
+        assert_eq!(cfg.skills_dir(), dir.path().join("myskills"));
+        assert!(cfg.skills_dirs().contains(&dir.path().join("myskills")));
     }
 
     #[test]
