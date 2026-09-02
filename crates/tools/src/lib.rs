@@ -836,6 +836,16 @@ mod tests {
     #[test]
     fn from_config_builds_the_native_tool_set() {
         let dir = tempfile::tempdir().unwrap();
+        // `TOOL_SKILL` is registered only when a skill is discoverable, and
+        // `Config::skills_dirs` always includes the machine-wide
+        // `~/.config/zcode/skills` root alongside the project one — so
+        // without a skill planted here, this test passed only on a machine
+        // that happens to have one installed there, and failed on every
+        // clean CI runner (no such directory exists) despite passing locally.
+        let skills_dir = dir.path().join(".zcode").join("skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        std::fs::write(skills_dir.join("example.md"), "an example skill").unwrap();
+
         let cfg = infra_config::Config {
             working_dir: dir.path().to_path_buf(),
             ..Default::default()
