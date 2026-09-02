@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — release workflow that builds and publishes platform binaries
+
+`.github/workflows/release.yml` triggers on the `vX.Y.Z` tag that
+`scripts/release.sh tag --push` creates, runs `make ci` against the tagged
+commit, then builds `zcode` for Linux x86_64, macOS x86_64/aarch64, and
+Windows x86_64 — every target native to its runner, so no `cross`/Docker
+toolchain is needed — and uploads the packaged archives plus `.sha256`
+checksums to the tag's GitHub release, creating it if `scripts/release.sh tag`
+was run without `gh` on the releaser's `PATH`. The changelog-section extraction
+used for release notes moved out of `scripts/release.sh` into
+`scripts/changelog-notes.sh` so the workflow and the local script render the
+same notes from one place instead of two copies of the same `awk` drifting
+apart.
+
+`scripts/package-release.sh` builds and packages the same archive shape
+(staged dir → `.tar.gz`/`.zip` + `.sha256`) locally, without a tag push or a
+CI wait: every target native to the host — both `apple-darwin` arches from
+any Mac, the host's own arch on Linux — with no extra args, and falls back to
+`cross` (Docker) for a non-native target when it's on `PATH`, or skips with a
+pointer to the workflow when it isn't.
+
+### Changed — `zcode --version`/`-V` now includes the commit
+
+Previously `--version` (clap's built-in flag) printed only the crate version,
+e.g. `zcode 0.3.0` — identical across every build of a release and useless for
+telling a downloaded binary apart from a stale one already on `$PATH`. It now
+renders `zcode 0.3.0 (5b73a2e)` (or `-dirty` for an uncommitted build, same
+suffix `zcode version` already used), built at compile time from the same
+`VERGEN_GIX_SHA` the `version` subcommand reads, so checking a binary against
+a release no longer requires running `zcode version` specifically.
+
 ## [0.3.0] - 2026-09-02
 
 ### Fixed — `default_caps_match_prd` regression test out of sync with defaults

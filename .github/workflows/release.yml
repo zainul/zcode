@@ -1,0 +1,131 @@
+name: Release
+
+# Triggered by the tag `scripts/release.sh tag --push` creates (or a plain
+# `git push origin vX.Y.Z`). `bump` and `tag` stay local/manual — see
+# scripts/release.sh — this workflow only builds the binaries a tag implies
+# and attaches them to the GitHub release, cross-compiling nothing that needs
+# a foreign C toolchain: every target below is native to its runner (macOS's
+# clang cross-arches Intel/Apple Silicon on its own), which is what keeps this
+# workflow dependency-free instead of reaching for `cross`/Docker.
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Same gate `scripts/release.sh bump` already ran locally before the version
+  # commit landed — re-run here against the actual tagged commit on `main`,
+  # not the pre-merge commit someone's machine happened to have checked out.
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: make ci
+
+  build:
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.85.0
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build zcode
+        run: cargo build --release --locked -p zcode --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          set -eu
+          version="${GITHUB_REF_NAME#v}"
+          name="zcode-${version}-${{ matrix.target }}"
+          stage="dist/${name}"
+          mkdir -p "$stage"
+
+          bin="target/${{ matrix.target }}/release/zcode"
+          if [[ "${{ matrix.target }}" == *-windows-* ]]; then
+            bin="${bin}.exe"
+            cp "$bin" "$stage/zcode.exe"
+          else
+            cp "$bin" "$stage/zcode"
+          fi
+          cp README.md CHANGELOG.md "$stage/"
+
+          mkdir -p dist/out
+          if [[ "${{ matrix.target }}" == *-windows-* ]]; then
+            (cd dist && 7z a -bd "out/${name}.zip" "${name}" >/dev/null)
+          else
+            (cd dist && tar czf "out/${name}.tar.gz" "${name}")
+          fi
+          (cd dist/out && shasum -a 256 * > "${name}.sha256")
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zcode-${{ matrix.target }}
+          path: dist/out/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          notes=$(./scripts/changelog-notes.sh "$version")
+
+          # `scripts/release.sh tag --push` may already have created this
+          # release locally (with notes, no binaries, when `gh` was on the
+          # releaser's PATH) — edit it if so instead of failing on a
+          # duplicate, so this job works identically either way a tag arrives.
+          if gh release view "$tag" >/dev/null 2>&1; then
+            printf '%s\n' "$notes" | gh release edit "$tag" --title "$tag" --notes-file -
+          else
+            printf '%s\n' "$notes" | gh release create "$tag" --title "$tag" --notes-file -
+          fi
+          gh release upload "$tag" dist/* --clobber

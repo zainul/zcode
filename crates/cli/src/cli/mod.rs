@@ -37,6 +37,18 @@ pub const GIT_SHA: &str = env!("VERGEN_GIX_SHA", "unknown");
 pub const BUILD_PROFILE: &str = env!("VERGEN_BUILD_PROFILE", "unknown");
 pub const BUILD_TIME: &str = env!("ZCODE_BUILD_TIME", "unknown");
 
+/// What `-V`/`--version` prints. Plain clap `version` only echoes
+/// `CARGO_PKG_VERSION`, which is identical for every build of a given
+/// release — useless for telling a downloaded binary apart from a stale one
+/// on `$PATH`. Folding the commit in here means `zcode --version` alone (no
+/// subcommand) is enough to check a binary against a specific release/commit.
+pub const VERSION_STRING: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("VERGEN_GIX_SHA", "unknown"),
+    ")"
+);
+
 /// Exit code for a run stopped by Ctrl-C, per shell convention.
 const EXIT_INTERRUPTED: u8 = 130;
 /// Exit code for a command-line usage error, per convention.
@@ -47,7 +59,7 @@ type CliResult = Result<ExitCode, Box<dyn std::error::Error + Send + Sync>>;
 #[derive(Parser)]
 #[command(
     name = "zcode",
-    version,
+    version = VERSION_STRING,
     about = "zcode — a lean terminal coding agent",
     long_about = "zcode runs coding tasks against an LLM with native file, \
 shell, MCP and LSP tools.\n\nConfigure it with zcode.json or zcode.toml; API keys are read from the environment \
@@ -1126,6 +1138,24 @@ mod tests {
     fn version_command_parses() {
         let cli = Cli::try_parse_from(["zcode", "version"]).unwrap();
         assert!(matches!(cli.command, Some(Commands::Version)));
+    }
+
+    #[test]
+    fn version_flag_reports_the_commit() {
+        // clap prints to stdout and exits(0) via `DisplayVersion` error kind
+        // rather than returning normally — assert on the rendered string
+        // directly instead of trying to capture process exit/stdout.
+        let err = match Cli::try_parse_from(["zcode", "--version"]) {
+            Ok(_) => panic!("--version should short-circuit parsing"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+        let rendered = err.render().to_string();
+        assert!(
+            rendered.contains(VERSION),
+            "missing crate version: {rendered}"
+        );
+        assert!(rendered.contains(GIT_SHA), "missing commit sha: {rendered}");
     }
 
     #[test]
