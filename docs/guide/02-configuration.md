@@ -136,9 +136,9 @@ Effective configuration
   working_dir            /home/you/my-project
   mode                   auto
   timeout_ms             360000
-  max_turns              20
+  max_turns              220
   max_tokens             16384
-  max_tool_output_chars  16000
+  max_tool_output_chars  32000
   max_retries            3
   rate_limit_backoff_ms  30000ms  (after a 429 with no Retry-After)
   skills_dir             /home/you/my-project/.zcode/skills

@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — `default_caps_match_prd` regression test out of sync with defaults
+
+`DEFAULT_MAX_TURNS` (20 → 220) and `DEFAULT_MAX_TOOL_OUTPUT_CHARS` (16000 →
+32000) changed in the same commit that raised `DEFAULT_TIMEOUT_MS`, but the
+regression test pinning `Config::default()` was never updated, so
+`cargo test -p infra-config` had been failing on `main` since. 220 turns gives
+a long agentic run (edit, run tests, read the failure, edit again) room to
+keep working instead of failing on turn count before the task is actually
+stuck; the test and the docs (`02-configuration.md`, `03-first-task.md`,
+`12-configuration-reference.md`, `07-tools-and-safety.md`) now match the real
+defaults.
+
 ### Added — `cargo install --git` as a second rtk auto-installer, for Linux
 
 Auto-install was Homebrew-only, which left every Ubuntu/Linux machine without

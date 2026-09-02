@@ -14,6 +14,11 @@ const DEFAULT_MODEL: &str = "gpt-4o-mini";
 /// time to first byte. 60s clipped those runs mid-stream; 6 minutes gives a
 /// slow provider room while still failing a truly hung connection.
 const DEFAULT_TIMEOUT_MS: u64 = 360_000;
+/// 20 was tuned for a short single-file edit; a multi-file refactor or a
+/// build-fix loop (edit, run tests, read the failure, edit again) burns a
+/// turn per round trip and hit the cap mid-task, well before the model was
+/// actually stuck. 220 gives a long agentic run room to keep working instead
+/// of failing on turn count rather than on the task itself.
 const DEFAULT_MAX_TURNS: u64 = 220;
 const DEFAULT_MAX_TOKENS: u64 = 16384;
 const DEFAULT_MAX_TOOL_OUTPUT_CHARS: usize = 32000;
@@ -2590,9 +2595,9 @@ model = "gpt-3.5-turbo"
     #[test]
     fn default_caps_match_prd() {
         let config = Config::default();
-        assert_eq!(config.max_turns, 20);
+        assert_eq!(config.max_turns, 220);
         assert_eq!(config.max_tokens, 16384);
-        assert_eq!(config.max_tool_output_chars, 16000);
+        assert_eq!(config.max_tool_output_chars, 32000);
         assert_eq!(config.provider, Provider::Openai);
         assert_eq!(config.mode, AgentMode::Auto);
         assert_eq!(config.max_retries, 3);

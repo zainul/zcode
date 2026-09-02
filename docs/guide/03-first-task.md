@@ -82,7 +82,7 @@ your prompt
 
 Each pass through that loop is one **step**. The run above took two: one to
 call `apply_patch`, one to report back. Two limits keep it bounded —
-`max_turns` (default 20) and `max_tokens` (default 16384).
+`max_turns` (default 220) and `max_tokens` (default 16384).
 
 ## Step 3 — Ask a follow-up
 

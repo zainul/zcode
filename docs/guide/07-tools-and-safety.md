@@ -480,7 +480,7 @@ description gets picked up for Rust work; one called `notes` will not.
 
 ## Tool output limits
 
-Results are truncated to `max_tool_output_chars` (default 16000) *before* they
+Results are truncated to `max_tool_output_chars` (default 32000) *before* they
 enter the transcript, with `...[truncated]` appended. A `cat` of a huge file
 cannot blow up the context window or your token bill.
 

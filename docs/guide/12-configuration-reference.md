@@ -36,9 +36,9 @@ Run `zcode config` to see which files were read and what they resolve to.
 | `base_url` | string | per provider | `ZCODE_BASE_URL` | Endpoint override, honoured by every provider; required for `vllm` and `openai-compatible` |
 | `working_dir` | path | directory of the project config | `ZCODE_WORKING_DIR` | Root for file tools and `.zcode/`; `~` expanded |
 | `timeout_ms` | integer | `360000` | `ZCODE_TIMEOUT_MS` | HTTP timeout covering a whole streamed response |
-| `max_turns` | integer | `20` | `ZCODE_MAX_TURNS` | Hard cap on steps per run |
+| `max_turns` | integer | `220` | `ZCODE_MAX_TURNS` | Hard cap on steps per run |
 | `max_tokens` | integer | `16384` | `ZCODE_MAX_TOKENS` | Output-token ceiling sent to the provider |
-| `max_tool_output_chars` | integer | `16000` | `ZCODE_MAX_TOOL_OUTPUT_CHARS` | Tool results are trimmed to this before entering the transcript |
+| `max_tool_output_chars` | integer | `32000` | `ZCODE_MAX_TOOL_OUTPUT_CHARS` | Tool results are trimmed to this before entering the transcript |
 | `max_retries` | integer | `3` | `ZCODE_MAX_RETRIES` | Retries for a 429 or transient 5xx before the run fails |
 | `rate_limit_backoff_ms` | integer | `30000` | `ZCODE_RATE_LIMIT_BACKOFF_MS` | Flat wait after a 429 that carries no `Retry-After`. Worst case is `max_retries` × this |
 | `mode` | string | `auto` | `ZCODE_MODE` | `planning`, `editing`, or `auto` (`build` is accepted as `auto`) |
