@@ -6,10 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-domain = { path = "../domain", version = "0.4.0" }
-infra-shell = { path = "../infra/shell", version = "0.4.0" }
-infra-filesystem = { path = "../infra/filesystem", version = "0.4.0" }
-infra-config = { path = "../infra/config", version = "0.4.0" }
+domain = { path = "../domain", version = "0.4.1" }
+infra-shell = { path = "../infra/shell", version = "0.4.1" }
+infra-filesystem = { path = "../infra/filesystem", version = "0.4.1" }
+infra-config = { path = "../infra/config", version = "0.4.1" }
 log = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true }
@@ -23,12 +23,12 @@ lsp = ["dep:infra-lsp"]
 
 [dependencies.infra-mcp]
 path = "../infra/mcp"
-version = "0.4.0"
+version = "0.4.1"
 optional = true
 
 [dependencies.infra-lsp]
 path = "../infra/lsp"
-version = "0.4.0"
+version = "0.4.1"
 optional = true
 
 [dev-dependencies]
