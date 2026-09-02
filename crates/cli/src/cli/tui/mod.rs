@@ -1830,14 +1830,17 @@ fn render_timeline(
                 i
             };
             let summary = run_summary(entries, start);
+            // `expanded` must be computed before `summary` moves into the
+            // struct field below.
+            let expanded = state.run_is_expanded(run, summary.clone());
             Fold {
                 run,
                 summary,
-                expanded: state.run_is_expanded(run, summary),
+                expanded,
                 is_header: !previous_was_tool,
             }
         });
-        let height = gap as usize + entry_height(entry, body_width, width, fold, name_col);
+        let height = gap as usize + entry_height(entry, body_width, width, fold.clone(), name_col);
 
         // Skip entries entirely above the window: count them, build nothing.
         if let Some((skip, count)) = window {
@@ -1857,7 +1860,7 @@ fn render_timeline(
             entry,
             body_width,
             width,
-            fold,
+            fold.clone(),
             next_is_tool,
             name_col,
             &mut group,
@@ -1896,12 +1899,20 @@ fn render_timeline(
 }
 
 /// What a run of consecutive tool calls amounts to, for its header.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+///
+/// Not `Copy`: `skills` names the loaded skill(s) so a folded run still says
+/// which one ran (see `run_header`) — without it, a settled `zcode_skill`
+/// call collapsed into a bare "tools used · 1 call", indistinguishable from
+/// any other single-tool run and giving no sign a skill had fired at all.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct RunSummary {
     calls: usize,
     failed: usize,
     running: usize,
     elapsed_ms: u32,
+    /// Comma-joined names of skills loaded by a `zcode_skill` call that
+    /// finished `Ok` in this run. Empty when none did.
+    skills: Box<str>,
 }
 
 impl RunSummary {
@@ -1925,9 +1936,14 @@ impl RunSummary {
 /// Summarise the run beginning at `start`, which must be a tool entry.
 fn run_summary(entries: &[timeline::Entry], start: usize) -> RunSummary {
     let mut summary = RunSummary::default();
+    let mut skills: Vec<&str> = Vec::new();
     for entry in entries[start..].iter() {
         let EntryKind::Tool {
-            status, elapsed_ms, ..
+            name,
+            detail,
+            status,
+            elapsed_ms,
+            ..
         } = &entry.kind
         else {
             break;
@@ -1937,9 +1953,18 @@ fn run_summary(entries: &[timeline::Entry], start: usize) -> RunSummary {
         match status {
             ToolStatus::Running => summary.running += 1,
             ToolStatus::Failed | ToolStatus::Denied => summary.failed += 1,
-            ToolStatus::Ok => {}
+            ToolStatus::Ok => {
+                // `detail` still holds the skill name from its arguments — a
+                // successful row keeps its invocation rather than the result
+                // (see `Timeline::finish_tool`) — so this is exactly what the
+                // model asked to load.
+                if domain::canonical_tool_name(name) == "zcode_skill" && !detail.is_empty() {
+                    skills.push(detail);
+                }
+            }
         }
     }
+    summary.skills = skills.join(", ").into_boxed_str();
     summary
 }
 
@@ -1970,6 +1995,12 @@ fn run_header(summary: RunSummary, expanded: bool) -> Line<'static> {
         if summary.failed > 0 {
             text.push_str(&format!(" · {} failed", summary.failed));
         }
+        // A skill is the one tool call whose *name* the header would
+        // otherwise never say — "tools used · 1 call" gives no sign a skill
+        // fired at all, let alone which one.
+        if !summary.skills.is_empty() {
+            text.push_str(&format!(" · skill: {}", summary.skills));
+        }
     }
     let colour = if summary.failed > 0 {
         Color::Red
@@ -1991,7 +2022,11 @@ fn entry_opens_a_block(entry: &timeline::Entry) -> bool {
 /// placed against a height the renderer does not produce. `rows_match_height`
 /// pins that for every entry kind.
 /// How a run of tool calls is being shown on this frame.
-#[derive(Debug, Clone, Copy)]
+///
+/// Not `Copy` — `summary` carries `RunSummary`'s owned skill-name string —
+/// so the few call sites that need it more than once in `render_timeline`
+/// clone it explicitly.
+#[derive(Debug, Clone)]
 struct Fold {
     run: u32,
     summary: RunSummary,
@@ -3378,6 +3413,24 @@ drwxr-xr-x  ..."
         // The conversation survives; only the calls are folded.
         assert!(text.contains("I'll look at three things."), "{text}");
         assert!(!text.contains("list_dir"), "{text}");
+    }
+
+    #[test]
+    fn a_folded_skill_call_still_names_the_skill() {
+        // A settled `zcode_skill` call folds like any other tool row, but
+        // "tools used · 1 call" alone gives no sign a skill fired at all —
+        // the header must say which one, without requiring the user to open
+        // the run.
+        let mut state = TuiState::default();
+        state
+            .timeline
+            .start_tool("zcode_skill", "golang-graceful-shutdown");
+        state
+            .timeline
+            .finish_tool("zcode_skill", "ok", ToolStatus::Ok, 5);
+        let text = rendered(&state, 100);
+        assert!(text.contains("▸ tools used"), "{text}");
+        assert!(text.contains("skill: golang-graceful-shutdown"), "{text}");
     }
 
     #[test]

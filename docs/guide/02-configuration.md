@@ -135,7 +135,7 @@ Effective configuration
                    http://localhost:11434/api/chat
   working_dir            /home/you/my-project
   mode                   auto
-  timeout_ms             60000
+  timeout_ms             360000
   max_turns              20
   max_tokens             16384
   max_tool_output_chars  16000

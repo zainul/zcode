@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — default `timeout_ms` raised from 60s to 6 minutes
+
+The provider HTTP timeout covers the *whole* streamed response, not just the
+time to first byte (`infra-llm::build_client`). 60s was tight enough to clip a
+long reasoning pass or a large tool-heavy turn on a slower model mid-stream,
+which read as a hung request rather than the timeout it was. The new default,
+`DEFAULT_TIMEOUT_MS` in `infra-config`, is 360000 (6 minutes); `timeout_ms` in
+the config file and `ZCODE_TIMEOUT_MS` still override it either way.
+
 ### Added — `--model` / `-m`, as `<provider>/<model>`
 
 The model was settable in the config file and through `ZCODE_MODEL`; trying one

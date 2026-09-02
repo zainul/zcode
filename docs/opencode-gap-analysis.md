@@ -194,7 +194,10 @@ Not a longer list, but not an empty one.
   `session.next.*` envelopes, so tooling written against opencode works.
 - **Footprint.** A single 5.2 MB static binary, 253 crates in the lockfile, no
   async runtime, no GC. opencode is a 32-package Bun/TypeScript monorepo
-  requiring the Bun runtime.
+  requiring the Bun runtime, 194 MB installed. Running the same multi-file
+  REST-endpoint task to a green build on the same model, zcode held a flat
+  ~15 MB resident set against opencode's 420–590 MB — see the
+  [memory benchmark](memory-benchmark.md).
 
 ---
 

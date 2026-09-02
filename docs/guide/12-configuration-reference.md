@@ -35,7 +35,7 @@ Run `zcode config` to see which files were read and what they resolve to.
 | `api_key_env` | string | per provider | `ZCODE_API_KEY_ENV` | **Name** of the variable holding the key — never the key |
 | `base_url` | string | per provider | `ZCODE_BASE_URL` | Endpoint override, honoured by every provider; required for `vllm` and `openai-compatible` |
 | `working_dir` | path | directory of the project config | `ZCODE_WORKING_DIR` | Root for file tools and `.zcode/`; `~` expanded |
-| `timeout_ms` | integer | `60000` | `ZCODE_TIMEOUT_MS` | HTTP timeout covering a whole streamed response |
+| `timeout_ms` | integer | `360000` | `ZCODE_TIMEOUT_MS` | HTTP timeout covering a whole streamed response |
 | `max_turns` | integer | `20` | `ZCODE_MAX_TURNS` | Hard cap on steps per run |
 | `max_tokens` | integer | `16384` | `ZCODE_MAX_TOKENS` | Output-token ceiling sent to the provider |
 | `max_tool_output_chars` | integer | `16000` | `ZCODE_MAX_TOOL_OUTPUT_CHARS` | Tool results are trimmed to this before entering the transcript |
