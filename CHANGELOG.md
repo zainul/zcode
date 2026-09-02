@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ## [0.3.0] - 2026-09-02
+
 ### Fixed — `default_caps_match_prd` regression test out of sync with defaults
 
 `DEFAULT_MAX_TURNS` (20 → 220) and `DEFAULT_MAX_TOOL_OUTPUT_CHARS` (16000 →

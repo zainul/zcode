@@ -181,11 +181,9 @@ cmd_bump() {
             print
             print ""
             print "## [" new "] - " date
-            skip_blank = 1
             next
         }
-        skip_blank == 1 && /^$/ { skip_blank = 0; next }
-        { skip_blank = 0; print }
+        { print }
     ' CHANGELOG.md > CHANGELOG.md.new
     mv CHANGELOG.md.new CHANGELOG.md
 
