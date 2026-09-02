@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — `cargo install --git` as a second rtk auto-installer, for Linux
+
+Auto-install was Homebrew-only, which left every Ubuntu/Linux machine without
+Homebrew failing with `no supported package manager` even when a Rust
+toolchain (which zcode itself needs to build) was right there. `tools::rtk`
+now also tries `cargo install --git https://github.com/rtk-ai/rtk rtk` when
+`brew` is not on `PATH`. It must be `--git` at the upstream repository, never
+plain `cargo install rtk`: that name on crates.io belongs to an unrelated
+crate (Rust Type Kit), and `--git` compiles the pinned upstream source
+directly rather than running an installer script, keeping the same "never
+pipe the network into a shell" guarantee Homebrew-only install already gave.
+`INSTALL_TIMEOUT` moved from 180s to 300s, since compiling from source is
+legitimately slower than fetching a Homebrew bottle.
+
 ### Changed — default `timeout_ms` raised from 60s to 6 minutes
 
 The provider HTTP timeout covers the *whole* streamed response, not just the

@@ -331,24 +331,33 @@ program.
 |-----------|--------------|
 | rtk on `PATH` | used, silently |
 | not installed, Homebrew present | `brew install rtk` — announced first, then used |
-| not installed, no Homebrew | a warning naming the command to run; zcode continues without it |
+| not installed, no Homebrew but Cargo present | `cargo install --git https://github.com/rtk-ai/rtk rtk` — announced first, then used |
+| not installed, no supported package manager | a warning naming the command to run; zcode continues without it |
 | an install failed | not retried for 24 hours |
 | `rtk.enabled = false` | never looked for |
 
 Detection costs nothing measurable and happens once per process. The install
 happens at most once: it says what it is doing *before* it runs, because
-`brew install` can take a minute and a first run that stalls without
-explanation reads as a hang. If it fails, the failure is recorded machine-wide
-(`~/.config/zcode/rtk-install-failed`) and not retried for a day — otherwise a
-machine with no network would pay the package manager's failure cost on every
-single invocation, forever. A later success clears the record.
+`brew install` (or a from-source `cargo install`) can take a minute or more
+and a first run that stalls without explanation reads as a hang. If it fails,
+the failure is recorded machine-wide (`~/.config/zcode/rtk-install-failed`)
+and not retried for a day — otherwise a machine with no network would pay the
+package manager's failure cost on every single invocation, forever. A later
+success clears the record.
 
-Homebrew only, deliberately. `rtk` is in **homebrew-core** rather than a
-third-party tap, so what it installs is auditable. The alternatives are not:
-`cargo install rtk` resolves to **an unrelated crate** (Rust Type Kit, not the
-token killer), and upstream's shell installer is `curl … | sh` — the exact
-pattern [zcode's own denylist refuses](#2-the-denylist--which-shell_allowed-cannot-override).
-A tool that forbids the model from piping the network into a shell has no
+Two installers, tried in order, and never more than that. `brew` is tried
+first: `rtk` is in **homebrew-core** rather than a third-party tap, so what it
+installs is a reviewed, auditable formula, and it also covers Linux machines
+that have Linuxbrew. `cargo install --git https://github.com/rtk-ai/rtk` is
+the fallback for the much more common Linux/Ubuntu case — no Homebrew, but a
+Rust toolchain, since zcode itself needs one to build. It must be `--git`
+pointed at the upstream repository, never plain `cargo install rtk`: that name
+on crates.io resolves to **an unrelated crate** (Rust Type Kit, not the token
+killer). `--git` compiles straight from the pinned upstream source rather than
+fetching and running an installer script — upstream's own shell installer is
+`curl … | sh`, the exact pattern
+[zcode's own denylist refuses](#2-the-denylist--which-shell_allowed-cannot-override),
+and a tool that forbids the model from piping the network into a shell has no
 business doing it itself.
 
 Installation only ever runs a package manager that is **already present**. It
