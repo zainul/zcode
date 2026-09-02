@@ -54,11 +54,11 @@ Seeing it means the retries were exhausted.
 
 **The run hangs, then times out**
 
-`timeout_ms` covers the whole streamed response, not just the first byte. Raise
-it for slow or long-form models:
+`timeout_ms` covers the whole streamed response, not just the first byte (the
+default is 360000 — 6 minutes). Raise it further for slow or long-form models:
 
 ```json
-{ "timeout_ms": 300000 }
+{ "timeout_ms": 600000 }
 ```
 
 ## Tool problems

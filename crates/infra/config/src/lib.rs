@@ -8,10 +8,15 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const DEFAULT_MODEL: &str = "gpt-4o-mini";
-const DEFAULT_TIMEOUT_MS: u64 = 60_000;
-const DEFAULT_MAX_TURNS: u64 = 20;
+/// A streamed generation can legitimately run for minutes — a long reasoning
+/// pass or a large tool-heavy turn on a slower model — and the HTTP timeout
+/// covers the *whole* request (see `infra-llm::build_client`), not just the
+/// time to first byte. 60s clipped those runs mid-stream; 6 minutes gives a
+/// slow provider room while still failing a truly hung connection.
+const DEFAULT_TIMEOUT_MS: u64 = 360_000;
+const DEFAULT_MAX_TURNS: u64 = 220;
 const DEFAULT_MAX_TOKENS: u64 = 16384;
-const DEFAULT_MAX_TOOL_OUTPUT_CHARS: usize = 16000;
+const DEFAULT_MAX_TOOL_OUTPUT_CHARS: usize = 32000;
 /// Transient provider failures retried before a run is failed (`max_retries`).
 const DEFAULT_MAX_RETRIES: u32 = 3;
 /// Wait after a 429 that carries no `Retry-After` (`rate_limit_backoff_ms`).
