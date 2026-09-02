@@ -66,7 +66,11 @@ is_native() {
 }
 
 checksum() {
-    if command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1"; else sha256sum "$1"; fi
+    # sha256sum (coreutils) first: present on Linux and in Git-for-Windows'
+    # bash, absent on macOS; shasum is the reverse. Matches the same
+    # fallback order in .github/workflows/release.yml, where hardcoding
+    # shasum broke the Windows leg (`shasum: command not found`).
+    if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1"; else shasum -a 256 "$1"; fi
 }
 
 if [ $# -gt 0 ]; then
