@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — `max_tokens` is now clamped to what the model's window actually has room for
+
+`max_tokens` is a reservation, not a target: a provider requires prompt
+tokens + `max_tokens` to fit inside the context window before it accepts the
+request at all, regardless of how many tokens the model goes on to generate.
+A value sized for one model — or left unchanged as a long session's
+transcript grows — could silently reserve more of a smaller window than was
+left, turning an ordinary tool result into a 400 that reads like the
+codebase was too big to understand, when the actual cause was the
+reservation itself.
+
+`domain::context_window::WindowTable` (new, stdlib-only, same shape as
+`domain::pricing::PriceTable`) carries known per-model window sizes and
+clamps each step's `max_tokens` to `window - estimated prompt - safety
+margin`, floored so a turn can never be asked for near-zero tokens. An
+unknown model is sent exactly what was configured, unclamped — no data beats
+guessed data. `[[context_window]]` in the config file overrides or extends
+the built-in table, the same way `[[pricing]]` does; `zcode config` now
+prints whether the active model's window is known. `domain::pricing` and
+`domain::context_window` now share one model-id normaliser
+(`domain::model_id::normalize`) so a model can never be priced under one
+spelling and window-clamped under another.
+
+### Added — a provider's own context-length rejection now self-corrects instead of failing
+
+The static `WindowTable` above is a best-effort guess for models it
+recognises and a pass-through for ones it does not — neither is a source of
+truth. The provider enforcing the limit for the exact request is, and it
+already says so in the 400 it sends back (OpenRouter: `"...maximum context
+length is N tokens..."`).
+
+`OpenAiShapeLlm` (the OpenAI-wire-shape client behind `openai`, `openrouter`,
+`deepseek` and `vllm`/`openai-compatible`/`lm-studio`) now parses that figure
+with the new `domain::context_window::parse_window_from_error`, learns it
+into its own `WindowTable` (`WindowTable::learn`), resends the same request
+once with a corrected `max_tokens` — no backoff, this is not a transient
+failure — and reports it to the rest of the run as a new
+`LlmEvent::LearnedContextWindow`, which `App::execute` folds into its own
+table so every remaining step of a long session benefits, not just the call
+that triggered it. The learned figure is also written to
+`.zcode/context_window_cache.json` (`infra_llm::load_window_cache` /
+`record_window_cache`, best-effort — a failed write never fails the
+already-succeeded request) so the *next* process starts out correct too.
+`cli::resolve_context_window` merges the three sources in one fixed order —
+a hand-written `[[context_window]]` entry always outranks a learned one,
+which always outranks the built-in table. Anthropic-direct and Ollama are
+unchanged; nothing in the project's own `providers` list currently uses
+either.
+
 ## [0.4.1] - 2026-09-02
 
 ### Fixed — the release workflow's Windows leg failed before it could build

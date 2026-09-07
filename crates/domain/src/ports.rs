@@ -173,6 +173,15 @@ pub enum LlmEvent {
     },
     /// Emitted before the events of a request that had to be retried.
     Retry(RetryNotice),
+    /// A provider's own rejection named the model's real context window —
+    /// parsed out of the error, not read from any table — and the client
+    /// already corrected `max_tokens` and retried before this event's
+    /// stream continues. Emitted once, ahead of the retried request's own
+    /// events, so the engine can remember it for the rest of the run.
+    LearnedContextWindow {
+        model: String,
+        tokens: u64,
+    },
     Finish(LlmFinish),
 }
 

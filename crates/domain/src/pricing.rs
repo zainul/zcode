@@ -9,6 +9,8 @@
 //!
 //! Stdlib only, like the rest of `domain` (FR-DI-01).
 
+use crate::model_id::normalize;
+
 /// USD per million tokens for one model.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PriceEntry {
@@ -202,20 +204,6 @@ impl PriceTable {
 
 fn per_mtok(tokens: u64, rate: f64) -> f64 {
     tokens as f64 * rate / 1_000_000.0
-}
-
-/// Strip the vendor namespace (`openai/gpt-4o` → `gpt-4o`), any provider
-/// routing suffix (`…:nitro`), and case, so one entry covers a model however
-/// it is addressed.
-///
-/// Dots in version numbers become dashes, because the same model is spelled
-/// both ways depending on who routes it: Anthropic calls it
-/// `claude-3-5-haiku`, OpenRouter calls it `anthropic/claude-3.5-haiku`, and
-/// an unrecognised spelling silently costs the user their cost display.
-fn normalize(model: &str) -> String {
-    let base = model.rsplit('/').next().unwrap_or(model);
-    let base = base.split(':').next().unwrap_or(base);
-    base.trim().to_ascii_lowercase().replace('.', "-")
 }
 
 /// OpenRouter marks zero-cost routes with a `:free` suffix. Trusting it beats

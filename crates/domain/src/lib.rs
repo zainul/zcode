@@ -8,16 +8,20 @@
 //!    `SessionStorePort`, `TelemetryPort`, `FileSystemPort`, `ShellPort`,
 //!    `PluginRegistryPort`, `LoggerPort`, `Emitter`) and their associated
 //!    message types (`LlmRequest`/`LlmEvent`, `ToolSpec`/`ToolResult`, …).
-//!  * **Pure helpers** (`tokens::estimate_tokens`, `modes::system_prompt`).
+//!  * **Pure helpers** (`tokens::estimate_tokens`, `modes::system_prompt`,
+//!    `pricing::PriceTable`, `context_window::WindowTable`).
 
+pub mod context_window;
 pub mod error;
 pub mod model;
+pub mod model_id;
 pub mod modes;
 pub mod naming;
 pub mod ports;
 pub mod pricing;
 pub mod tokens;
 
+pub use context_window::{parse_window_from_error, WindowEntry, WindowTable};
 pub use error::DomainError;
 pub use model::{
     AgentContext, AgentMode, CancelFlag, FileEdit, ImageRef, LspLocation, LspPosition, LspRange,

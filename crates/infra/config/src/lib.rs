@@ -2,7 +2,7 @@
 //! Secrets are read from `ZCODE_*` env vars only, never written to disk.
 //! Deps (direct): domain, serde, toml, thiserror — no `reqwest`/`regex` here (L3).
 
-use domain::{AgentMode, PriceEntry, PriceTable};
+use domain::{AgentMode, PriceEntry, PriceTable, WindowEntry, WindowTable};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -402,6 +402,10 @@ pub struct Config {
     pub rate_limit_backoff_ms: u64,
     /// Per-model rate overrides for the cost estimate, ahead of the built-ins.
     pub pricing: Vec<PriceEntry>,
+    /// Per-model context-window overrides, ahead of the built-ins — what
+    /// keeps a step's `max_tokens` request from reserving more of the window
+    /// than a provider will accept (see `domain::context_window`).
+    pub context_window: Vec<WindowEntry>,
     /// Set false to skip the built-in language-server defaults.
     pub lsp_defaults: bool,
     /// Token-optimised shell output via rtk.
@@ -462,6 +466,7 @@ impl Default for Config {
             max_retries: DEFAULT_MAX_RETRIES,
             rate_limit_backoff_ms: DEFAULT_RATE_LIMIT_BACKOFF_MS,
             pricing: Vec::new(),
+            context_window: Vec::new(),
             lsp_defaults: true,
             rtk: RtkConfig::default(),
         }
@@ -638,6 +643,13 @@ impl Config {
     /// Cost rates: configured overrides first, then the built-in table.
     pub fn price_table(&self) -> PriceTable {
         PriceTable::with_overrides(self.pricing.clone())
+    }
+
+    /// Context-window sizes: configured overrides first, then the built-in
+    /// table. What lets a per-model `max_tokens` reservation self-correct
+    /// instead of being copied unchanged across every model in `providers`.
+    pub fn context_window_table(&self) -> WindowTable {
+        WindowTable::with_overrides(self.context_window.clone())
     }
 
     /// Language servers actually started: everything in `lsp.servers`, plus
@@ -858,6 +870,8 @@ struct ConfigFile {
     #[serde(default)]
     pricing: Option<Vec<PricingEntryFile>>,
     #[serde(default)]
+    context_window: Option<Vec<ContextWindowEntryFile>>,
+    #[serde(default)]
     rtk: RtkSection,
 }
 
@@ -965,6 +979,20 @@ impl From<PricingEntryFile> for PriceEntry {
             cache_per_mtok: f.cache_per_mtok,
             cache_within_input: f.cache_within_input,
         }
+    }
+}
+
+/// Serde mirror of `domain::WindowEntry` — `domain` carries no derives
+/// (FR-DI-01), so the bridge lives here.
+#[derive(Debug, Clone, Deserialize)]
+struct ContextWindowEntryFile {
+    model: String,
+    tokens: u64,
+}
+
+impl From<ContextWindowEntryFile> for WindowEntry {
+    fn from(f: ContextWindowEntryFile) -> Self {
+        WindowEntry::new(&f.model, f.tokens)
     }
 }
 
@@ -1225,6 +1253,13 @@ impl Loader {
                 let mut merged: Vec<PriceEntry> = rates.into_iter().map(Into::into).collect();
                 merged.append(&mut config.pricing);
                 config.pricing = merged;
+            }
+            if let Some(windows) = file.context_window {
+                // Same precedence as pricing: a project override wins over a
+                // machine-wide one.
+                let mut merged: Vec<WindowEntry> = windows.into_iter().map(Into::into).collect();
+                merged.append(&mut config.context_window);
+                config.context_window = merged;
             }
         }
 
@@ -2681,6 +2716,28 @@ command = "echo"
         let config = Loader::new(&path).load().unwrap();
         assert_eq!(config.mcp_servers.len(), 2);
         assert_eq!(config.mcp_servers[0].name, "a");
+    }
+
+    #[test]
+    fn context_window_entries_parsed_and_override_the_builtin() {
+        let _guard = env_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(
+            &dir,
+            r#"
+[[context_window]]
+model = "z-ai/glm-5.3-flash"
+tokens = 262144
+"#,
+        );
+        let config = Loader::new(&path).load().unwrap();
+        assert_eq!(config.context_window.len(), 1);
+        assert_eq!(config.context_window[0].model, "z-ai/glm-5.3-flash");
+        assert_eq!(config.context_window[0].tokens, 262144);
+        assert_eq!(
+            config.context_window_table().lookup("z-ai/glm-5.3-flash"),
+            Some(262144)
+        );
     }
 
     #[test]
