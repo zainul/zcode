@@ -125,6 +125,11 @@ pub struct App {
     /// Rates behind the cost figure the UI shows. Defaults to the built-in
     /// table; the CLI replaces it with one carrying the config's overrides.
     pricing: domain::PriceTable,
+    /// Known context-window sizes, used to keep a step's `max_tokens` request
+    /// from reserving more of the window than the running transcript leaves
+    /// room for. Defaults to the built-in table; the CLI replaces it with one
+    /// carrying the config's `[[context_window]]` overrides.
+    context_window: domain::WindowTable,
     logger: Box<dyn LoggerPort + Send>,
     emitter: Box<dyn Emitter + Send>,
     cancel: CancelFlag,
@@ -144,6 +149,7 @@ impl App {
             sessions,
             telemetry,
             pricing: domain::PriceTable::builtin(),
+            context_window: domain::WindowTable::builtin(),
             logger,
             emitter: Box::new(NullEmitter),
             cancel: CancelFlag::default(),
@@ -171,6 +177,17 @@ impl App {
 
     pub fn with_pricing(mut self, pricing: domain::PriceTable) -> Self {
         self.set_pricing(pricing);
+        self
+    }
+
+    /// Replace the context-window table, e.g. with the config's
+    /// `[[context_window]]` overrides layered ahead of the built-ins.
+    pub fn set_context_window(&mut self, context_window: domain::WindowTable) {
+        self.context_window = context_window;
+    }
+
+    pub fn with_context_window(mut self, context_window: domain::WindowTable) -> Self {
+        self.set_context_window(context_window);
         self
     }
 
@@ -455,11 +472,28 @@ impl AgentLoop for App {
                 vec![("mode".into(), ExtraField::Text(req.mode.as_str().into()))],
             );
 
+            // `max_tokens` is a reservation, not a target: a provider must fit
+            // prompt + max_tokens inside the model's context window before it
+            // will even accept the request. A value sized for a different
+            // model (or for step one of a long-running session, sent
+            // unchanged on step forty once the transcript has grown) can
+            // reserve more than a smaller window has room for and turn an
+            // ordinary tool result into a 400. Known models get their request
+            // clamped to what is actually left; an unknown model is sent
+            // exactly what was configured, as before.
+            let estimated_prompt_tokens: u64 = history
+                .iter()
+                .map(|m| domain::tokens::estimate_tokens(&m.content))
+                .sum();
+            let max_tokens =
+                self.context_window
+                    .clamp(&session.model, req.max_tokens, estimated_prompt_tokens);
+
             let llm_request = LlmRequest {
                 messages: history.clone().into_boxed_slice(),
                 tools: specs.clone(),
                 model: session.model.clone(),
-                max_tokens: req.max_tokens,
+                max_tokens,
                 temperature: req.temperature,
                 images: std::mem::replace(&mut pending_images, Box::new([])),
             };
@@ -541,6 +575,30 @@ impl AgentLoop for App {
                             ],
                         );
                         self.emitter.emit(UiEvent::Retry(notice));
+                    }
+                    LlmEvent::LearnedContextWindow { model, tokens } => {
+                        // The provider itself just corrected zcode: it refused
+                        // `max_tokens` as too large for `model`'s real window,
+                        // the client parsed the true figure out of that
+                        // rejection and already retried with a corrected
+                        // request. Recorded here so every remaining step of
+                        // *this* run clamps against it too — the client's own
+                        // copy only protects the calls it makes directly, and
+                        // this session may have many steps left.
+                        self.context_window.learn(&model, tokens);
+                        self.emit_telemetry(
+                            "context_window_learned",
+                            &session,
+                            steps + 1,
+                            vec![
+                                ("model".into(), ExtraField::Text(model.clone())),
+                                ("tokens".into(), ExtraField::Number(tokens as f64)),
+                            ],
+                        );
+                        self.emitter.emit(UiEvent::Notice(format!(
+                            "learned {model}'s real context window ({tokens} tokens) from the \
+                             provider and corrected the request"
+                        )));
                     }
                     LlmEvent::Finish(f) => {
                         finish = Some(f);
@@ -792,6 +850,7 @@ mod tests {
         turns: Vec<Vec<LlmEvent>>,
         calls: usize,
         seen_tools: Arc<Mutex<Vec<Vec<String>>>>,
+        seen_max_tokens: Arc<Mutex<Vec<u64>>>,
     }
 
     impl FakeLlm {
@@ -800,6 +859,7 @@ mod tests {
                 turns,
                 calls: 0,
                 seen_tools: Arc::new(Mutex::new(Vec::new())),
+                seen_max_tokens: Arc::new(Mutex::new(Vec::new())),
             }
         }
     }
@@ -817,6 +877,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(req.tools.iter().map(|t| t.name.clone()).collect());
+            self.seen_max_tokens.lock().unwrap().push(req.max_tokens);
             // Past the script, keep answering with a plain stop so cap tests
             // terminate on the cap rather than on running out of script.
             let events = self
@@ -964,11 +1025,13 @@ mod tests {
         sessions: FakeSessions,
         telemetry: FakeTelemetry,
         llm_tools: Arc<Mutex<Vec<Vec<String>>>>,
+        llm_max_tokens: Arc<Mutex<Vec<u64>>>,
     }
 
     fn harness(turns: Vec<Vec<LlmEvent>>, tool_response: &str) -> Harness {
         let llm = FakeLlm::new(turns);
         let llm_tools = llm.seen_tools.clone();
+        let llm_max_tokens = llm.seen_max_tokens.clone();
         let tool_calls = RecordedCalls::default();
         let sessions = FakeSessions::default();
         let telemetry = FakeTelemetry::default();
@@ -988,6 +1051,7 @@ mod tests {
             sessions,
             telemetry,
             llm_tools,
+            llm_max_tokens,
         }
     }
 
@@ -1438,5 +1502,47 @@ mod tests {
         let result = h.app.execute(&ctx(), ExecutionRequest::new("go")).unwrap();
         assert!(result.output_tokens > 0, "heuristic should fill the gap");
         assert!(result.input_tokens > 0);
+    }
+
+    #[test]
+    fn an_unknown_models_max_tokens_request_passes_through_unchanged() {
+        let mut h = harness(
+            vec![vec![LlmEvent::Finish(finish(LlmFinishReason::Stop))]],
+            "ok",
+        );
+        let mut req = ExecutionRequest::new("go");
+        req.max_tokens = 202_144;
+        // "fake-model" matches nothing in the built-in context-window table,
+        // so the configured value must reach the provider exactly as given —
+        // the behaviour before clamping existed.
+        h.app.execute(&ctx(), req).unwrap();
+        assert_eq!(*h.llm_max_tokens.lock().unwrap(), vec![202_144]);
+    }
+
+    #[test]
+    fn a_known_models_max_tokens_reservation_is_clamped_to_its_window() {
+        // A request whose configured max_tokens leaves no room for even a
+        // small prompt in the model's actual window — the shape of the bug
+        // this exists to prevent, just with a tighter window so the test
+        // does not need to fabricate a 60K-token transcript to trigger it.
+        let mut h = harness(
+            vec![vec![LlmEvent::Finish(finish(LlmFinishReason::Stop))]],
+            "ok",
+        );
+        h.app
+            .set_context_window(domain::WindowTable::with_overrides(vec![
+                domain::WindowEntry::new("glm-5.3-flash", 2_000),
+            ]));
+        let ctx = AgentContext {
+            working_dir: std::path::PathBuf::from("."),
+            model: "glm-5.3-flash".into(),
+            env: Vec::new(),
+        };
+        let mut req = ExecutionRequest::new("go");
+        req.max_tokens = 100_000;
+        h.app.execute(&ctx, req).unwrap();
+        let sent = h.llm_max_tokens.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0] < 100_000, "{}", sent[0]);
     }
 }

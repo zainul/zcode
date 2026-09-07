@@ -19,11 +19,13 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use domain::{
     BoxError, LlmEvent, LlmFinish, LlmFinishReason, LlmMessage, LlmRequest, LlmResponse, LlmRole,
-    LlmToolCall, RetryNotice,
+    LlmToolCall, RetryNotice, WindowEntry, WindowTable,
 };
 use reqwest::blocking::{Client, RequestBuilder, Response};
 use reqwest::StatusCode;
@@ -326,6 +328,119 @@ fn retry_events(
     retries.into_iter().map(|n| Ok(LlmEvent::Retry(n)))
 }
 
+/// Lock a shared window table, recovering from poisoning rather than
+/// panicking the whole client over a lock some unrelated bug already broke —
+/// a stale table is still better than an agent that stops responding.
+fn lock_table(table: &Mutex<WindowTable>) -> std::sync::MutexGuard<'_, WindowTable> {
+    table
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Sends one chat-completion request, transparently correcting and resending
+/// exactly once if the provider's own rejection reveals that `max_tokens`
+/// did not fit the model's real context window — OpenRouter's exact wording
+/// is `"...maximum context length is N tokens..."`, parsed by
+/// `domain::context_window::parse_window_from_error`.
+///
+/// This is not a transient failure — `send_with_retry` already excludes 400s
+/// from its own backoff-and-retry — it is a deterministic one with an exact
+/// fix, learned from the strongest source there is: the provider enforcing
+/// the limit for this exact request. So it is corrected once, immediately,
+/// with no backoff, rather than treated as flaky.
+///
+/// `window_table` is updated in place the moment a window is learned (so the
+/// very next call this client makes, on this or a later turn, is already
+/// correct) and, when `cache_path` is set, persisted to disk (so the *next
+/// process* starts out correct too) — best-effort: a failure to write it
+/// never fails the request, which has already succeeded by that point.
+///
+/// Returns the successful response, plus a leading event to tell the rest of
+/// the run about the correction when one happened.
+#[allow(clippy::too_many_arguments)]
+fn send_chat_with_correction(
+    provider: &'static str,
+    policy: RetryPolicy,
+    model: &str,
+    window_table: &Mutex<WindowTable>,
+    cache_path: Option<&Path>,
+    requested_max_tokens: u64,
+    estimated_prompt_tokens: u64,
+    build_request: impl Fn(u64) -> RequestBuilder,
+) -> Result<(RetriedResponse, Option<LlmEvent>), BoxError> {
+    let first_attempt_max_tokens =
+        lock_table(window_table).clamp(model, requested_max_tokens, estimated_prompt_tokens);
+    let err = match send_with_retry(provider, policy, || build_request(first_attempt_max_tokens)) {
+        Ok(resp) => return Ok((resp, None)),
+        Err(e) => e,
+    };
+    let Some(window) = domain::parse_window_from_error(&err.to_string()) else {
+        return Err(err);
+    };
+    let corrected_max_tokens = {
+        let mut table = lock_table(window_table);
+        table.learn(model, window);
+        table.clamp(model, requested_max_tokens, estimated_prompt_tokens)
+    };
+    if let Some(path) = cache_path {
+        // Best-effort: the correction is already live in `window_table` for
+        // this process regardless of whether the write below succeeds.
+        let _ = record_window_cache(path, model, window);
+    }
+    let retried = send_with_retry(provider, policy, || build_request(corrected_max_tokens))?;
+    Ok((
+        retried,
+        Some(LlmEvent::LearnedContextWindow {
+            model: model.to_string(),
+            tokens: window,
+        }),
+    ))
+}
+
+/// Serde mirror of `domain::WindowEntry` for the on-disk cache — `domain`
+/// carries no derives (FR-DI-01).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct WindowCacheEntry {
+    model: String,
+    tokens: u64,
+}
+
+/// Windows learned by an earlier process (or an earlier call in this one),
+/// read once at construction. Missing, empty, or malformed reads as "nothing
+/// learned yet" rather than an error — the cache is a pure optimisation.
+pub fn load_window_cache(path: &Path) -> Vec<WindowEntry> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    serde_json::from_str::<Vec<WindowCacheEntry>>(&text)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|e| WindowEntry::new(&e.model, e.tokens))
+        .collect()
+}
+
+/// Persist one learned window, replacing any earlier entry for the same
+/// model. Best-effort by every caller — see `send_chat_with_correction`.
+fn record_window_cache(path: &Path, model: &str, tokens: u64) -> Result<(), BoxError> {
+    let mut entries: Vec<WindowCacheEntry> = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default();
+    entries.retain(|e| e.model != model);
+    entries.insert(
+        0,
+        WindowCacheEntry {
+            model: model.to_string(),
+            tokens,
+        },
+    );
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, serde_json::to_string_pretty(&entries)?)?;
+    Ok(())
+}
+
 /// Whether a failure that reached us *after* a 2xx response — a connection
 /// dropped while reading the body, or an in-band `error` chunk a provider
 /// sends instead of an HTTP status (OpenRouter's "Network connection lost."
@@ -618,8 +733,10 @@ fn aggregate(
     for ev in events.into_iter().flatten() {
         match ev {
             LlmEvent::Delta(t) => text.push_str(&t),
-            LlmEvent::ToolCallStart { .. } | LlmEvent::ToolCallArgs { .. } | LlmEvent::Retry(_) => {
-            }
+            LlmEvent::ToolCallStart { .. }
+            | LlmEvent::ToolCallArgs { .. }
+            | LlmEvent::Retry(_)
+            | LlmEvent::LearnedContextWindow { .. } => {}
             LlmEvent::Finish(f) => finish = f,
         }
     }
@@ -649,6 +766,19 @@ pub struct OpenAiShapeLlm {
     /// ignored by providers that do not understand it — which is why it is a
     /// per-adapter flag rather than always-on.
     cache_control: bool,
+    /// Known context-window sizes, consulted before every request and
+    /// updated in place the moment a provider's own rejection reveals a real
+    /// figure. `Arc<Mutex<_>>` because a stream reconnect
+    /// (`ResilientStream`) opens a fresh request from an owned, `'static`
+    /// closure with no borrow of `self` — a window learned on the first
+    /// open must still be visible to the next one, and to this client's
+    /// later calls on later turns.
+    window_table: Arc<Mutex<WindowTable>>,
+    /// Where a learned window is persisted so the *next* zcode run starts
+    /// out already correct, not just this process. `None` disables writing
+    /// one anywhere; the correction still happens and still holds for the
+    /// rest of this process either way.
+    window_cache_path: Option<PathBuf>,
 }
 
 impl OpenAiShapeLlm {
@@ -666,12 +796,22 @@ impl OpenAiShapeLlm {
             retry: RetryPolicy::default(),
             extra_headers: Vec::new(),
             cache_control: false,
+            window_table: Arc::new(Mutex::new(WindowTable::builtin())),
+            window_cache_path: None,
         }
     }
 
     /// Replace the retry policy (`max_retries` / `rate_limit_backoff_ms`).
     pub fn set_retry_policy(&mut self, retry: RetryPolicy) {
         self.retry = retry;
+    }
+
+    /// Replace the context-window table (config overrides + previously
+    /// learned entries + built-ins) and where a newly learned window gets
+    /// persisted — typically `<working_dir>/.zcode/context_window_cache.json`.
+    pub fn set_context_window(&mut self, table: WindowTable, cache_path: Option<PathBuf>) {
+        self.window_table = Arc::new(Mutex::new(table));
+        self.window_cache_path = cache_path;
     }
 
     /// Enable provider prompt caching by marking the request prefix with
@@ -710,8 +850,19 @@ impl OpenAiShapeLlm {
     }
 
     fn open_stream(&self, req: &LlmRequest) -> Result<RetriedResponse, BoxError> {
-        let payload = build_openai_request(req, &self.model, self.cache_control);
-        send_with_retry(self.provider, self.retry, || self.request(&payload))
+        let base_payload = build_openai_request(req, &self.model, self.cache_control);
+        let estimated_prompt_tokens = estimate_prompt_tokens(req);
+        let (retried, _learned) = send_chat_with_correction(
+            self.provider,
+            self.retry,
+            &self.model,
+            &self.window_table,
+            self.window_cache_path.as_deref(),
+            req.max_tokens,
+            estimated_prompt_tokens,
+            |max_tokens| self.request(&with_max_tokens(&base_payload, max_tokens)),
+        )?;
+        Ok(retried)
     }
 
     /// Non-streaming read of the whole body (used by `send()`).
@@ -726,24 +877,67 @@ impl OpenAiShapeLlm {
         &self,
         req: &LlmRequest,
     ) -> Box<dyn Iterator<Item = Result<LlmEvent, BoxError>> + Send> {
-        let payload = build_openai_request(req, &self.model, self.cache_control);
+        let base_payload = build_openai_request(req, &self.model, self.cache_control);
+        let estimated_prompt_tokens = estimate_prompt_tokens(req);
         let client = self.client.clone();
         let endpoint = self.endpoint.clone();
         let api_key = self.api_key.clone();
         let headers = self.extra_headers.clone();
         let provider = self.provider;
         let policy = self.retry;
+        let model = self.model.clone();
+        let window_table = self.window_table.clone();
+        let cache_path = self.window_cache_path.clone();
+        let requested_max_tokens = req.max_tokens;
         let open = move || -> Result<Attempt, BoxError> {
-            let RetriedResponse { response, retries } = send_with_retry(provider, policy, || {
-                build_openai_shape_request(&client, &endpoint, &api_key, &headers, &payload)
-            })?;
-            let events: Box<dyn Iterator<Item = Result<LlmEvent, BoxError>> + Send> = Box::new(
+            let (RetriedResponse { response, retries }, learned) = send_chat_with_correction(
+                provider,
+                policy,
+                &model,
+                &window_table,
+                cache_path.as_deref(),
+                requested_max_tokens,
+                estimated_prompt_tokens,
+                |max_tokens| {
+                    build_openai_shape_request(
+                        &client,
+                        &endpoint,
+                        &api_key,
+                        &headers,
+                        &with_max_tokens(&base_payload, max_tokens),
+                    )
+                },
+            )?;
+            let mut events: Box<dyn Iterator<Item = Result<LlmEvent, BoxError>> + Send> = Box::new(
                 EventStream::from_response(response, OpenAiDecoder::default()),
             );
+            if let Some(event) = learned {
+                events = Box::new(std::iter::once(Ok(event)).chain(events));
+            }
             Ok((events, retries))
         };
         ResilientStream::start(open, policy)
     }
+}
+
+/// Rough prompt-token estimate for clamping — the same heuristic
+/// `app::AgentLoop` uses, applied here too because a fresh provider client
+/// (e.g. right after `/provider` in the TUI) has not been through `app`'s own
+/// pre-flight clamp yet on its very first call.
+fn estimate_prompt_tokens(req: &LlmRequest) -> u64 {
+    req.messages
+        .iter()
+        .map(|m| domain::tokens::estimate_tokens(&m.content))
+        .sum()
+}
+
+/// A payload with `max_tokens` overridden — cloned rather than rebuilt so a
+/// stream reconnect or a context-length correction never re-derives the
+/// message/tool JSON, only the one field that changed.
+fn with_max_tokens(payload: &serde_json::Value, max_tokens: u64) -> serde_json::Value {
+    let mut payload = payload.clone();
+    payload["max_tokens"] = serde_json::json!(max_tokens);
+    payload
 }
 
 /// Shared by the borrowed (`request`) and owned-and-retryable (`stream_events`)
@@ -772,6 +966,12 @@ macro_rules! openai_shaped_port {
             /// Replace the retry policy (`max_retries` / `rate_limit_backoff_ms`).
             pub fn set_retry_policy(&mut self, retry: RetryPolicy) {
                 self.0.set_retry_policy(retry);
+            }
+
+            /// Replace the context-window table and where a newly learned
+            /// window is persisted.
+            pub fn set_context_window(&mut self, table: WindowTable, cache_path: Option<PathBuf>) {
+                self.0.set_context_window(table, cache_path);
             }
         }
         impl domain::LlmPort for $ty {
@@ -2753,5 +2953,228 @@ data: {\"type\":\"message_stop\"}
             }
             other => panic!("expected Finish, got {other:?}"),
         }
+    }
+
+    // ---- context-window learning ---------------------------------------------
+
+    #[test]
+    fn with_max_tokens_overrides_only_that_one_field() {
+        let base = serde_json::json!({
+            "model": "x",
+            "messages": [],
+            "max_tokens": 202_144,
+            "temperature": 0.0,
+        });
+        let corrected = with_max_tokens(&base, 4_096);
+        assert_eq!(corrected["max_tokens"], serde_json::json!(4_096));
+        assert_eq!(corrected["model"], serde_json::json!("x"));
+        // The original payload a retry might still need is untouched.
+        assert_eq!(base["max_tokens"], serde_json::json!(202_144));
+    }
+
+    #[test]
+    fn a_missing_cache_file_reads_as_nothing_learned_yet() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does-not-exist.json");
+        assert!(load_window_cache(&path).is_empty());
+    }
+
+    #[test]
+    fn a_malformed_cache_file_is_ignored_rather_than_failing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("context_window_cache.json");
+        std::fs::write(&path, "not json").unwrap();
+        assert!(load_window_cache(&path).is_empty());
+    }
+
+    #[test]
+    fn a_learned_window_round_trips_through_the_cache_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".zcode").join("context_window_cache.json");
+        record_window_cache(&path, "z-ai/glm-5.3-flash", 262_144).unwrap();
+        let entries = load_window_cache(&path);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].model, "z-ai/glm-5.3-flash");
+        assert_eq!(entries[0].tokens, 262_144);
+    }
+
+    #[test]
+    fn recording_the_same_model_again_replaces_rather_than_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.json");
+        record_window_cache(&path, "glm-5.3-flash", 200_000).unwrap();
+        record_window_cache(&path, "glm-5.3-flash", 262_144).unwrap();
+        let entries = load_window_cache(&path);
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].tokens, 262_144);
+    }
+
+    #[test]
+    fn recording_preserves_other_models_already_in_the_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.json");
+        record_window_cache(&path, "model-a", 100_000).unwrap();
+        record_window_cache(&path, "model-b", 200_000).unwrap();
+        let entries = load_window_cache(&path);
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        assert!(entries
+            .iter()
+            .any(|e| e.model == "model-a" && e.tokens == 100_000));
+        assert!(entries
+            .iter()
+            .any(|e| e.model == "model-b" && e.tokens == 200_000));
+    }
+
+    /// A minimal local HTTP/1.1 server: exactly the request/response pairs a
+    /// test hands it, over a real loopback socket, so `OpenAiShapeLlm`'s
+    /// actual network path — not a stand-in for it — is what gets exercised.
+    /// `Connection: close` on every response keeps reqwest from trying to
+    /// reuse a socket this server has already moved on from.
+    struct OneShotServer {
+        addr: std::net::SocketAddr,
+        handle: std::thread::JoinHandle<Vec<String>>,
+    }
+
+    impl OneShotServer {
+        /// Serves `responses` in order, one per accepted connection, and
+        /// records the body of each request received (for a test to inspect
+        /// what `max_tokens` was actually sent). Runs on a background thread
+        /// so the caller can drive a real HTTP client against it inline.
+        fn start(responses: Vec<String>) -> Self {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let handle = std::thread::spawn(move || {
+                let mut bodies = Vec::new();
+                for response in responses {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    bodies.push(read_http_request_body(&mut stream));
+                    std::io::Write::write_all(&mut stream, response.as_bytes()).unwrap();
+                }
+                bodies
+            });
+            Self { addr, handle }
+        }
+
+        fn endpoint(&self) -> String {
+            format!("http://{}/v1/chat/completions", self.addr)
+        }
+
+        /// Waits for every expected connection to be served and returns each
+        /// request's body, in order.
+        fn join(self) -> Vec<String> {
+            self.handle.join().unwrap()
+        }
+    }
+
+    /// Reads one HTTP/1.1 request off `stream`: headers up to the blank
+    /// line, then exactly `Content-Length` bytes of body. Good enough for a
+    /// client (`reqwest`) that always sends one, never chunked, for a JSON
+    /// POST body.
+    fn read_http_request_body(stream: &mut std::net::TcpStream) -> String {
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut content_length = 0usize;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+            if let Some(v) = line
+                .to_ascii_lowercase()
+                .strip_prefix("content-length:")
+                .map(|v| v.trim().to_string())
+            {
+                content_length = v.parse().unwrap_or(0);
+            }
+        }
+        let mut body = vec![0u8; content_length];
+        std::io::Read::read_exact(&mut reader, &mut body).unwrap();
+        String::from_utf8(body).unwrap()
+    }
+
+    fn http_400(body: &str) -> String {
+        format!(
+            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+    }
+
+    fn http_200_sse(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+    }
+
+    /// End-to-end proof of the whole mechanism over a real loopback socket:
+    /// a request sized for a much larger model gets refused with
+    /// OpenRouter's exact wording, the client parses the true window out of
+    /// that rejection, resends with a corrected `max_tokens`, and the caller
+    /// sees a `LearnedContextWindow` event ahead of the successful answer —
+    /// with the corrected figure also on disk for the next process.
+    #[test]
+    fn a_context_length_rejection_is_corrected_and_retried_transparently() {
+        let error_body = serde_json::json!({
+            "error": {
+                "message": "This endpoint's maximum context length is 2000 tokens. \
+                             However, you requested about 50200 tokens."
+            }
+        })
+        .to_string();
+        let success_body = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\
+                             data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\
+                             data: [DONE]\n";
+        let server = OneShotServer::start(vec![http_400(&error_body), http_200_sse(success_body)]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache_path = dir.path().join("context_window_cache.json");
+
+        let mut client = OpenRouterLlm::at(
+            &server.endpoint(),
+            "test-key",
+            "glm-5.3-flash",
+            Duration::from_secs(5),
+        );
+        client.set_context_window(WindowTable::empty(), Some(cache_path.clone()));
+
+        let mut req = req();
+        req.max_tokens = 50_000; // far more than the fake server's real window
+        let events: Vec<LlmEvent> = domain::LlmPort::stream(&mut client, &req)
+            .map(|e| e.expect("no transport error"))
+            .collect();
+
+        assert!(
+            matches!(
+                events.first(),
+                Some(LlmEvent::LearnedContextWindow { tokens: 2000, .. })
+            ),
+            "{events:?}"
+        );
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, LlmEvent::Delta(t) if t == "hi")));
+        assert!(events.iter().any(|e| matches!(e, LlmEvent::Finish(_))));
+
+        // Persisted, so the next process starts out already correct.
+        let cached = load_window_cache(&cache_path);
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0].model, "glm-5.3-flash");
+        assert_eq!(cached[0].tokens, 2000);
+
+        // And the corrected retry actually asked for less, not the same
+        // value again.
+        let bodies = server.join();
+        assert_eq!(bodies.len(), 2);
+        let first_sent: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
+        let second_sent: serde_json::Value = serde_json::from_str(&bodies[1]).unwrap();
+        assert_eq!(first_sent["max_tokens"], serde_json::json!(50_000));
+        assert!(
+            second_sent["max_tokens"].as_u64().unwrap() < 50_000,
+            "{second_sent}"
+        );
     }
 }

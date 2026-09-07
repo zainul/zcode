@@ -1045,6 +1045,7 @@ fn engine_thread(
     app.set_emitter(Box::new(EventBridge(msg_tx.clone())));
     app.set_cancel(cancel.clone());
     app.set_pricing(cfg.price_table());
+    app.set_context_window(super::resolve_context_window(&cfg).0);
 
     let ctx = cfg.to_agent_context();
     // One session spans the whole REPL, so context carries across turns.
@@ -1074,6 +1075,7 @@ fn engine_thread(
                     Ok((next, llm)) => {
                         app.set_llm(llm);
                         app.set_pricing(next.price_table());
+                        app.set_context_window(super::resolve_context_window(&next).0);
                         let priced = next.price_table().knows(&next.model);
                         let _ = msg_tx.send(EngineMsg::Provider {
                             name: next.provider_name.clone(),

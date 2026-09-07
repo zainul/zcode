@@ -315,6 +315,25 @@ impl LoggerPort for StdLogger {
 
 /// Build the provider client named by the configuration (FR-MODEL-01..06).
 /// An unusable combination is a typed error, never a panic (NFR-REL-02).
+/// The context-window table used both to pre-clamp a step's `max_tokens`
+/// (`App`, via [`Config::context_window_table`]) and to seed a provider
+/// client's own copy (`build_llm`) — the same precedence, with one more
+/// layer beneath the config's `[[context_window]]` and above the built-ins:
+/// windows this project already learned directly from a provider's own
+/// rejection, on this or an earlier run.
+///
+/// Also returns the cache file path, so a freshly learned window has
+/// somewhere to be written back to.
+pub(crate) fn resolve_context_window(cfg: &Config) -> (domain::WindowTable, PathBuf) {
+    let cache_path = cfg
+        .working_dir
+        .join(".zcode")
+        .join("context_window_cache.json");
+    let mut entries = cfg.context_window.clone();
+    entries.extend(infra_llm::load_window_cache(&cache_path));
+    (domain::WindowTable::with_overrides(entries), cache_path)
+}
+
 pub(crate) fn build_llm(cfg: &Config) -> Result<Box<dyn domain::LlmPort + Send>, AppError> {
     // Local/self-hosted providers are keyless; hosted ones fail fast so the
     // user learns about a missing key before a request is attempted.
@@ -347,6 +366,10 @@ pub(crate) fn build_llm(cfg: &Config) -> Result<Box<dyn domain::LlmPort + Send>,
     let retries = RetryPolicy::default()
         .with_max_retries(cfg.max_retries)
         .with_rate_limit_backoff(cfg.rate_limit_backoff());
+    // Likewise the same context-window table: a `max_tokens` reservation
+    // must be clamped the same way regardless of which OpenAI-shaped
+    // provider is actually issuing the request.
+    let (window_table, window_cache_path) = resolve_context_window(cfg);
     let llm: Box<dyn domain::LlmPort + Send> = match cfg.provider {
         Provider::Openai => {
             let mut client = OpenAiLlm::with_timeout(
@@ -356,6 +379,7 @@ pub(crate) fn build_llm(cfg: &Config) -> Result<Box<dyn domain::LlmPort + Send>,
                 timeout,
             );
             client.set_retry_policy(retries);
+            client.set_context_window(window_table.clone(), Some(window_cache_path.clone()));
             Box::new(client)
         }
         // These three have their own hosts, but `base_url` is documented as an
@@ -380,6 +404,7 @@ pub(crate) fn build_llm(cfg: &Config) -> Result<Box<dyn domain::LlmPort + Send>,
                 timeout,
             );
             client.set_retry_policy(retries);
+            client.set_context_window(window_table.clone(), Some(window_cache_path.clone()));
             Box::new(client)
         }
         Provider::Deepseek => {
@@ -390,6 +415,7 @@ pub(crate) fn build_llm(cfg: &Config) -> Result<Box<dyn domain::LlmPort + Send>,
                 timeout,
             );
             client.set_retry_policy(retries);
+            client.set_context_window(window_table.clone(), Some(window_cache_path.clone()));
             Box::new(client)
         }
         Provider::Ollama => {
@@ -406,6 +432,7 @@ pub(crate) fn build_llm(cfg: &Config) -> Result<Box<dyn domain::LlmPort + Send>,
         Provider::Vllm | Provider::OpenaiCompatible | Provider::LmStudio => {
             let mut client = VllmLlm::with_timeout(&base_url()?, &api_key, &cfg.model, timeout);
             client.set_retry_policy(retries);
+            client.set_context_window(window_table.clone(), Some(window_cache_path.clone()));
             Box::new(client)
         }
     };
@@ -460,7 +487,8 @@ pub fn wire_with_format(
         telemetry,
         Box::new(StdLogger::new()),
     )
-    .with_pricing(cfg.price_table()))
+    .with_pricing(cfg.price_table())
+    .with_context_window(resolve_context_window(cfg).0))
 }
 
 /// Sends every event to two ports. Only `report` writes the report file, so
@@ -967,6 +995,22 @@ fn cmd_config(args: ConfigArgs) -> CliResult {
         None => outln!(
             "  {:<22} no rate for `{}` — cost will show as n/a",
             "pricing",
+            cfg.model
+        ),
+    }
+
+    // Whether a step's max_tokens can actually be clamped to fit the window
+    // is worth stating up front — an unmatched model silently keeps sending
+    // whatever `max_tokens` says, which is the failure this table exists to
+    // prevent.
+    match resolve_context_window(&cfg).0.lookup(&cfg.model) {
+        Some(tokens) => outln!(
+            "  {:<22} {tokens} tokens (max_tokens is clamped to fit)",
+            "context_window"
+        ),
+        None => outln!(
+            "  {:<22} unknown for `{}` — max_tokens is sent as configured, unclamped",
+            "context_window",
             cfg.model
         ),
     }
