@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-07
+
 ### Added — `max_tokens` is now clamped to what the model's window actually has room for
 
 `max_tokens` is a reservation, not a target: a provider requires prompt

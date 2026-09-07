@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-domain = { path = "../../domain", version = "0.4.1" }
+domain = { path = "../../domain", version = "0.5.0" }
 thiserror = { workspace = true }
 
 [dev-dependencies]
