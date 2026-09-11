@@ -89,6 +89,16 @@ pub enum Provider {
     /// separate kind only so its default endpoint and keyless-ness come for
     /// free, the way `ollama` does.
     LmStudio,
+    /// [Meridian](https://github.com/rynfar/meridian), a local proxy that
+    /// bridges a Claude Max/Team/Enterprise subscription to the standard
+    /// Anthropic wire protocol. It speaks the same `/v1/messages` SSE format
+    /// as `anthropic` — same client, same request/response shapes — so it is
+    /// a separate kind only for its default local endpoint and keyless-ness,
+    /// the way `lmstudio` is a separate kind of `openai-compatible`. The key
+    /// value is never checked by Meridian itself (auth flows through the
+    /// Claude Agent SDK's own OAuth session, set up once via `claude login`
+    /// / `meridian setup`), so `requires_api_key` is `false`.
+    Meridian,
 }
 
 impl Provider {
@@ -102,6 +112,7 @@ impl Provider {
             Self::Vllm => "vllm",
             Self::OpenaiCompatible => "openai-compatible",
             Self::LmStudio => "lmstudio",
+            Self::Meridian => "meridian",
         }
     }
 
@@ -116,6 +127,7 @@ impl Provider {
             Self::Deepseek => "ZCODE_DEEPSEEK_API_KEY",
             Self::Ollama => "ZCODE_OLLAMA_API_KEY",
             Self::Vllm | Self::OpenaiCompatible | Self::LmStudio => "ZCODE_API_KEY",
+            Self::Meridian => "ZCODE_MERIDIAN_API_KEY",
         }
     }
 
@@ -125,7 +137,9 @@ impl Provider {
     pub fn default_model(&self) -> &'static str {
         match self {
             Self::Openai => "gpt-4o-mini",
-            Self::Anthropic => "claude-sonnet-4-5",
+            // Meridian re-exposes Claude models under their normal Anthropic
+            // ids — it is a local proxy in front of the same catalogue.
+            Self::Anthropic | Self::Meridian => "claude-sonnet-4-5",
             // OpenRouter ids are namespaced by vendor.
             Self::Openrouter => "openai/gpt-4o-mini",
             Self::Deepseek => "deepseek-chat",
@@ -142,7 +156,7 @@ impl Provider {
     pub fn requires_api_key(&self) -> bool {
         !matches!(
             self,
-            Self::Ollama | Self::Vllm | Self::OpenaiCompatible | Self::LmStudio
+            Self::Ollama | Self::Vllm | Self::OpenaiCompatible | Self::LmStudio | Self::Meridian
         )
     }
 
@@ -155,6 +169,10 @@ impl Provider {
             Self::Ollama => Some("http://localhost:11434/api/chat"),
             // LM Studio's server listens here out of the box.
             Self::LmStudio => Some("http://localhost:1234/v1/chat/completions"),
+            // Meridian's default bind address, documented in its README
+            // (`meridian` with no flags listens on 127.0.0.1:3456) and its
+            // Anthropic-compatible route.
+            Self::Meridian => Some("http://127.0.0.1:3456/v1/messages"),
             Self::Vllm | Self::OpenaiCompatible => None,
         }
     }
@@ -171,6 +189,7 @@ pub const BUILTIN_PROVIDERS: &[&str] = &[
     "vllm",
     "openai-compatible",
     "lmstudio",
+    "meridian",
 ];
 
 impl std::str::FromStr for Provider {
@@ -186,6 +205,7 @@ impl std::str::FromStr for Provider {
             "vllm" => Ok(Self::Vllm),
             "openai-compatible" => Ok(Self::OpenaiCompatible),
             "lmstudio" | "lm-studio" | "lm_studio" => Ok(Self::LmStudio),
+            "meridian" => Ok(Self::Meridian),
             other => Err(format!("unknown provider: {other}")),
         }
     }
@@ -1594,6 +1614,22 @@ name = "anthropic"
         assert_eq!(cfg.provider, Provider::Deepseek);
         assert_eq!(cfg.provider_name, "deepseek");
         assert_eq!(cfg.model, "deepseek-chat");
+    }
+
+    #[test]
+    fn meridian_is_selectable_without_a_profile_and_needs_no_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Loader::new(&write_config(&dir, MULTI)).load().unwrap();
+        cfg.select_provider("meridian").unwrap();
+
+        assert_eq!(cfg.provider, Provider::Meridian);
+        assert_eq!(cfg.provider_name, "meridian");
+        assert_eq!(cfg.model, "claude-sonnet-4-5");
+        assert!(!cfg.provider.requires_api_key());
+        assert_eq!(
+            cfg.provider.default_endpoint(),
+            Some("http://127.0.0.1:3456/v1/messages")
+        );
     }
 
     #[test]

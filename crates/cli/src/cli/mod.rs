@@ -386,9 +386,16 @@ pub(crate) fn build_llm(cfg: &Config) -> Result<Box<dyn domain::LlmPort + Send>,
         // endpoint override and has to work here too — for a gateway, a proxy,
         // or a stub. Hardcoding them meant `zcode config` printed the
         // configured URL while the client quietly used another.
-        Provider::Anthropic => {
+        //
+        // Meridian (github.com/rynfar/meridian) speaks the identical
+        // Anthropic `/v1/messages` SSE wire format — it is a local proxy in
+        // front of it, not a different API — so it shares `AnthropicLlm`
+        // rather than growing a client of its own; only the default endpoint
+        // and key requirement (`Provider::default_endpoint` /
+        // `requires_api_key`) differ.
+        Provider::Anthropic | Provider::Meridian => {
             let mut client = AnthropicLlm::at(
-                &endpoint_or_default(Provider::Anthropic),
+                &endpoint_or_default(cfg.provider),
                 &api_key,
                 &cfg.model,
                 timeout,
@@ -1477,6 +1484,7 @@ mod tests {
             Provider::Ollama,
             Provider::Vllm,
             Provider::OpenaiCompatible,
+            Provider::Meridian,
         ] {
             let cfg = Config {
                 provider,

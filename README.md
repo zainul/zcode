@@ -44,10 +44,26 @@ The smallest possible config — everything else has a per-provider default:
 ```
 
 Supported providers: `openrouter`, `openai`, `anthropic`, `deepseek`,
-`ollama`, `vllm`, and any `openai-compatible` endpoint via `base_url`. Omit
-`model` and each provider gets a working default; omit `api_key_env` and the
-conventional variable for that provider is used
+`ollama`, `vllm`, `lmstudio`, `meridian`, and any `openai-compatible` endpoint
+via `base_url`. Omit `model` and each provider gets a working default; omit
+`api_key_env` and the conventional variable for that provider is used
 (`ZCODE_OPENROUTER_API_KEY`, `ZCODE_ANTHROPIC_API_KEY`, `ZCODE_DEEPSEEK_API_KEY`, …).
+
+[Meridian](https://github.com/rynfar/meridian) bridges a Claude
+Max/Team/Enterprise subscription to the standard Anthropic wire protocol —
+`zcode` talks to it exactly as it talks to `anthropic`, since Meridian speaks
+the same `/v1/messages` SSE format:
+
+```sh
+# one-time: npm install -g @rynfar/meridian && claude login && meridian
+zcode --provider meridian run "…"          # defaults to http://127.0.0.1:3456
+```
+
+No API key is required — Meridian authenticates through the Claude Agent
+SDK's own OAuth session, not a bearer token — but `ZCODE_MERIDIAN_API_KEY` (or
+a profile's `api_key_env`) is honoured if set. Point at a non-default host
+with `base_url`, e.g. a Meridian instance on another machine sharing one
+subscription across a team.
 
 **New here? The [user guide](docs/guide/README.md) walks through installation
 and every feature step by step.**
