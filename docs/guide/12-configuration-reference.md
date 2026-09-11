@@ -29,7 +29,7 @@ Run `zcode config` to see which files were read and what they resolve to.
 
 | Key | Type | Default | Env override | Meaning |
 |-----|------|---------|--------------|---------|
-| `provider` | string | `openai` | `ZCODE_PROVIDER` | Which endpoint to use: a name from `providers`, or a built-in kind (`openai`, `anthropic`, `openrouter`, `deepseek`, `ollama`, `vllm`, `lmstudio`, `openai-compatible`) |
+| `provider` | string | `openai` | `ZCODE_PROVIDER` | Which endpoint to use: a name from `providers`, or a built-in kind (`openai`, `anthropic`, `openrouter`, `deepseek`, `ollama`, `vllm`, `lmstudio`, `openai-compatible`, `meridian`) |
 | `providers` | array | `[]` | — | Named endpoints to switch between (below) |
 | `model` | string | per provider | `ZCODE_MODEL` | Model id as the provider spells it — an id, never `<provider>/<model>`; the `provider` key names the endpoint. The `--model` flag overrides it and *does* take the pair — see [chapter 14](14-commands.md#--model--pick-a-provider-and-model-for-one-run) |
 | `api_key_env` | string | per provider | `ZCODE_API_KEY_ENV` | **Name** of the variable holding the key — never the key |
@@ -216,10 +216,22 @@ written: in a file the two are separate keys.
 | `vllm` | *(required)* | `ZCODE_API_KEY` | `<base_url>/chat/completions` |
 | `openai-compatible` | *(required)* | `ZCODE_API_KEY` | `<base_url>/chat/completions` |
 | `lmstudio` | *(required)* | *(none)* | `http://localhost:1234/v1/chat/completions` |
+| `meridian` | `claude-sonnet-4-5` | *(none)* | `http://127.0.0.1:3456/v1/messages` |
 
 `lmstudio` is OpenAI-compatible on the wire; it exists as its own kind so the
 local default endpoint and the absence of a key come for free. A `base_url`
 ending in `/v1` is fine — `/chat/completions` is appended if it is missing.
+
+[`meridian`](https://github.com/rynfar/meridian) is Anthropic-compatible on
+the wire — it is a local proxy in front of `/v1/messages`, not a different
+API — so it reuses the `anthropic` client outright; only its default local
+endpoint and keyless-ness are its own. It bridges a Claude
+Max/Team/Enterprise subscription (authenticated once via `claude login` /
+`meridian setup`, outside zcode) rather than an API key, so no key is
+required; `ZCODE_MERIDIAN_API_KEY` is read if you set one, but Meridian does
+not check its value. Run `meridian` before `zcode --provider meridian`, or
+point `base_url` at a Meridian instance running elsewhere (e.g. shared across
+a team on the LAN).
 
 ## Cost estimates
 

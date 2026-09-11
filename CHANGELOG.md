@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — `meridian` provider: bridge a Claude Max/Team/Enterprise subscription
+
+[Meridian](https://github.com/rynfar/meridian) is a local proxy that
+translates Claude Agent SDK output into the standard Anthropic
+`/v1/messages` wire format, letting a Claude subscription (not an API key)
+back any tool that speaks that protocol. Since the wire format is identical
+to `anthropic`'s, `Provider::Meridian` reuses `AnthropicLlm` outright rather
+than growing a client of its own — it differs only in its default endpoint
+(`http://127.0.0.1:3456/v1/messages`, Meridian's default bind address) and in
+`requires_api_key` being `false`: Meridian authenticates through its own
+OAuth session (`claude login` / `meridian setup`, run outside zcode) and does
+not validate the `x-api-key` header's value. `ZCODE_MERIDIAN_API_KEY` is
+still honoured if set, for parity with every other provider and for anyone
+running Meridian behind something that does check the header. `--provider
+meridian` (or a `[[providers]]` profile of that kind) is enough to switch —
+no other configuration is required with Meridian running on its default port.
+
 ## [0.5.0] - 2026-09-07
 
 ### Added — `max_tokens` is now clamped to what the model's window actually has room for
