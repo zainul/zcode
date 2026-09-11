@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-11
+
 ### Added — `meridian` provider: bridge a Claude Max/Team/Enterprise subscription
 
 [Meridian](https://github.com/rynfar/meridian) is a local proxy that
