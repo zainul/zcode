@@ -173,7 +173,12 @@ impl ToolRegistry {
                         };
                         (wire, def.name.clone(), spec)
                     })
-                    .collect();
+                    .collect::<Vec<_>>();
+                // FR-CACHE-02: tool schemas render first in every request, so
+                // their order is part of the cached prefix. A server is free to
+                // list its tools in any order on each start; sort them.
+                let mut tools = tools;
+                tools.sort_by(|a, b| a.0.cmp(&b.0));
                 self.mcp.push(McpEntry {
                     prefix: format!("{MCP_PREFIX}{}__", canonical_tool_name(server)),
                     tools,
@@ -540,6 +545,46 @@ mod tests {
         fn ping(&mut self) -> Result<bool, BoxError> {
             Ok(true)
         }
+    }
+
+    /// A server that lists its tools in whatever order it likes.
+    struct ShuffledMcp(Vec<&'static str>);
+    impl McpPort for ShuffledMcp {
+        fn list_tools(&mut self) -> Result<Box<[McpToolDef]>, BoxError> {
+            Ok(self
+                .0
+                .iter()
+                .map(|n| McpToolDef {
+                    name: (*n).into(),
+                    description: String::new(),
+                    input_schema: "{}".into(),
+                })
+                .collect())
+        }
+        fn call(&mut self, _name: &str, _args: String) -> Result<String, BoxError> {
+            Ok(String::new())
+        }
+        fn ping(&mut self) -> Result<bool, BoxError> {
+            Ok(true)
+        }
+    }
+
+    /// FR-CACHE-02: tool specs head every request; a server listing its tools
+    /// in a different order on each start must not change those bytes.
+    #[test]
+    fn mcp_tools_are_listed_in_sorted_order() {
+        let names = |order: Vec<&'static str>| -> Vec<String> {
+            ToolRegistry::new(std::path::PathBuf::from("."))
+                .with_mcp("srv", Box::new(ShuffledMcp(order)))
+                .list()
+                .iter()
+                .map(|s| s.name.clone())
+                .collect()
+        };
+        let a = names(vec!["zeta", "alpha", "mid"]);
+        let b = names(vec!["mid", "zeta", "alpha"]);
+        assert_eq!(a, b);
+        assert_eq!(a, ["mcp__srv__alpha", "mcp__srv__mid", "mcp__srv__zeta"]);
     }
 
     /// An MCP server that is up but whose discovery fails (FR-MCP-05).

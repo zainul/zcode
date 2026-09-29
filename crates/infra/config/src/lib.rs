@@ -1513,6 +1513,11 @@ mod tests {
     /// concurrently. Without this the suite is flaky (NFR-REL-01).
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Serialises every test that touches the process environment — the
+    /// ones that *set* `ZCODE_*` variables and, just as much, the ones that
+    /// *read* them through `Loader::load()`. A reader without the guard picks
+    /// up whatever a concurrent writer set (a `ZCODE_PROVIDER=anthropic`
+    /// silently overriding the file under test) and fails intermittently.
     fn env_guard() -> std::sync::MutexGuard<'static, ()> {
         ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -1560,6 +1565,9 @@ name = "anthropic"
 
     #[test]
     fn the_named_provider_is_the_one_selected() {
+        // Reads the ZCODE_* env layer via `load()`, so it must not run
+        // while another test has that environment modified.
+        let _env = env_guard();
         let dir = tempfile::tempdir().unwrap();
         let cfg = Loader::new(&write_config(&dir, MULTI)).load().unwrap();
 
@@ -1576,6 +1584,9 @@ name = "anthropic"
 
     #[test]
     fn switching_provider_takes_the_whole_profile_with_it() {
+        // Reads the ZCODE_* env layer via `load()`, so it must not run
+        // while another test has that environment modified.
+        let _env = env_guard();
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = Loader::new(&write_config(&dir, MULTI)).load().unwrap();
         cfg.select_provider("local").unwrap();
@@ -1592,6 +1603,9 @@ name = "anthropic"
 
     #[test]
     fn a_profile_that_states_nothing_falls_back_to_its_kind() {
+        // Reads the ZCODE_* env layer via `load()`, so it must not run
+        // while another test has that environment modified.
+        let _env = env_guard();
         // `[[providers]] name = "anthropic"` names a kind and nothing else:
         // every field must come from the built-in defaults for Anthropic, not
         // from the profile that happened to be selected before it.
@@ -1607,6 +1621,9 @@ name = "anthropic"
 
     #[test]
     fn a_builtin_kind_is_selectable_without_a_profile() {
+        // Reads the ZCODE_* env layer via `load()`, so it must not run
+        // while another test has that environment modified.
+        let _env = env_guard();
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = Loader::new(&write_config(&dir, MULTI)).load().unwrap();
         cfg.select_provider("deepseek").unwrap();
@@ -1618,6 +1635,9 @@ name = "anthropic"
 
     #[test]
     fn meridian_is_selectable_without_a_profile_and_needs_no_key() {
+        // Reads the ZCODE_* env layer via `load()`, so it must not run
+        // while another test has that environment modified.
+        let _env = env_guard();
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = Loader::new(&write_config(&dir, MULTI)).load().unwrap();
         cfg.select_provider("meridian").unwrap();
@@ -1634,6 +1654,9 @@ name = "anthropic"
 
     #[test]
     fn a_profile_may_give_a_builtin_provider_its_own_url() {
+        // Reads the ZCODE_* env layer via `load()`, so it must not run
+        // while another test has that environment modified.
+        let _env = env_guard();
         // The short form: one entry, named after the kind it overrides. This
         // is the "let me point OpenRouter somewhere else" case.
         let dir = tempfile::tempdir().unwrap();
@@ -1663,6 +1686,9 @@ base_url = "https://gateway.internal/v1/chat/completions"
 
     #[test]
     fn two_profiles_may_share_one_kind() {
+        // Reads the ZCODE_* env layer via `load()`, so it must not run
+        // while another test has that environment modified.
+        let _env = env_guard();
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = Loader::new(&write_config(
             &dir,
@@ -1691,6 +1717,9 @@ model = "poolside/laguna-s-2.1:free"
 
     #[test]
     fn a_declared_profile_is_complete_in_itself() {
+        // Reads the ZCODE_* env layer via `load()`, so it must not run
+        // while another test has that environment modified.
+        let _env = env_guard();
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = Loader::new(&write_config(
             &dir,
@@ -1727,6 +1756,9 @@ base_url = "https://gateway.internal/v1/chat/completions"
 
     #[test]
     fn top_level_settings_still_serve_a_bare_kind() {
+        // Reads the ZCODE_* env layer via `load()`, so it must not run
+        // while another test has that environment modified.
+        let _env = env_guard();
         // The single-provider form, which is every config written before
         // `providers` existed — and still what `--provider ollama` gets when
         // no profile is declared for it.
@@ -1761,6 +1793,9 @@ kind = "ollama"
 
     #[test]
     fn an_unknown_provider_name_says_what_is_available() {
+        // Reads the ZCODE_* env layer via `load()`, so it must not run
+        // while another test has that environment modified.
+        let _env = env_guard();
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = Loader::new(&write_config(&dir, MULTI)).load().unwrap();
         let err = cfg.select_provider("nope").unwrap_err();
@@ -1772,6 +1807,9 @@ kind = "ollama"
 
     #[test]
     fn selecting_a_provider_that_no_layer_declares_is_an_error() {
+        // Reads the ZCODE_* env layer via `load()`, so it must not run
+        // while another test has that environment modified.
+        let _env = env_guard();
         let dir = tempfile::tempdir().unwrap();
         let path = write_config(&dir, r#"provider = "made-up""#);
         let err = Loader::new(&path).load().unwrap_err();
@@ -1786,6 +1824,9 @@ kind = "ollama"
 
     #[test]
     fn a_top_level_key_written_under_a_provider_table_is_reported() {
+        // Reads the ZCODE_* env layer via `load()`, so it must not run
+        // while another test has that environment modified.
+        let _env = env_guard();
         // The TOML footgun: everything after `[[providers]]` belongs to that
         // entry. Silently ignoring it means the setting appears to be there
         // and does nothing, which is the worst of both.
@@ -1817,6 +1858,9 @@ kind = "ollama"
 
     #[test]
     fn one_unusable_entry_does_not_take_the_whole_config_with_it() {
+        // Reads the ZCODE_* env layer via `load()`, so it must not run
+        // while another test has that environment modified.
+        let _env = env_guard();
         // The reported breakage: a single mistyped `kind` stopped the config
         // loading at all, so `zcode config` — the command you use to find the
         // mistake — failed too, and every other provider went with it.
@@ -1855,6 +1899,9 @@ kind = "not-a-provider"
 
     #[test]
     fn selecting_an_unusable_entry_says_what_is_wrong_with_it() {
+        // Reads the ZCODE_* env layer via `load()`, so it must not run
+        // while another test has that environment modified.
+        let _env = env_guard();
         // "unknown provider `typo`" would be a lie: it is known, and broken.
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = Loader::new(&write_config(
@@ -1879,6 +1926,9 @@ kind = "not-a-provider"
 
     #[test]
     fn a_later_layer_can_repair_a_broken_entry() {
+        // Reads the ZCODE_* env layer via `load()`, so it must not run
+        // while another test has that environment modified.
+        let _env = env_guard();
         // A machine-wide typo must be fixable from the project file, not just
         // reported at it.
         let dir = tempfile::tempdir().unwrap();
@@ -1902,6 +1952,9 @@ kind = "not-a-provider"
 
     #[test]
     fn a_provider_entry_must_say_what_it_is() {
+        // Reads the ZCODE_* env layer via `load()`, so it must not run
+        // while another test has that environment modified.
+        let _env = env_guard();
         // Neither `name` nor `kind`, so it cannot say what it talks to. Like
         // any other unusable entry it is recorded and skipped rather than
         // taking the config down — it is not the one selected.
@@ -1919,6 +1972,9 @@ kind = "not-a-provider"
 
     #[test]
     fn with_provider_leaves_the_original_alone() {
+        // Reads the ZCODE_* env layer via `load()`, so it must not run
+        // while another test has that environment modified.
+        let _env = env_guard();
         // The TUI builds a second client from this without disturbing the one
         // already running.
         let dir = tempfile::tempdir().unwrap();
@@ -1934,6 +1990,9 @@ kind = "not-a-provider"
 
     #[test]
     fn a_model_id_with_no_slash_stays_on_the_selected_provider() {
+        // Reads the ZCODE_* env layer via `load()`, so it must not run
+        // while another test has that environment modified.
+        let _env = env_guard();
         // The one shorthand: "same endpoint, different model".
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = Loader::new(&write_config(&dir, MULTI)).load().unwrap();
@@ -1946,6 +2005,9 @@ kind = "not-a-provider"
 
     #[test]
     fn the_split_is_at_the_first_slash_and_the_rest_is_the_id() {
+        // Reads the ZCODE_* env layer via `load()`, so it must not run
+        // while another test has that environment modified.
+        let _env = env_guard();
         // `openrouter/z-ai/glm-4.6` is the provider `openrouter` and the model
         // `z-ai/glm-4.6` — the id keeps every slash after the first.
         let dir = tempfile::tempdir().unwrap();
@@ -1959,6 +2021,9 @@ kind = "not-a-provider"
 
     #[test]
     fn a_provider_prefix_brings_the_whole_profile_with_it() {
+        // Reads the ZCODE_* env layer via `load()`, so it must not run
+        // while another test has that environment modified.
+        let _env = env_guard();
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = Loader::new(&write_config(&dir, MULTI)).load().unwrap();
         cfg.select_model("local/qwen2.5-coder").unwrap();
@@ -1978,6 +2043,9 @@ kind = "not-a-provider"
 
     #[test]
     fn a_builtin_kind_needs_no_profile_to_be_a_prefix() {
+        // Reads the ZCODE_* env layer via `load()`, so it must not run
+        // while another test has that environment modified.
+        let _env = env_guard();
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = Loader::new(&write_config(&dir, MULTI)).load().unwrap();
         cfg.select_model("deepseek/deepseek-reasoner").unwrap();
@@ -1988,6 +2056,9 @@ kind = "not-a-provider"
 
     #[test]
     fn a_named_profile_shadows_the_builtin_of_the_same_name() {
+        // Reads the ZCODE_* env layer via `load()`, so it must not run
+        // while another test has that environment modified.
+        let _env = env_guard();
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = Loader::new(&write_config(&dir, MULTI)).load().unwrap();
         cfg.select_model("anthropic/claude-haiku-4-5").unwrap();
@@ -2001,6 +2072,9 @@ kind = "not-a-provider"
     /// meaning of an argument would depend on what the config declares.
     #[test]
     fn a_leading_segment_that_names_no_provider_is_refused() {
+        // Reads the ZCODE_* env layer via `load()`, so it must not run
+        // while another test has that environment modified.
+        let _env = env_guard();
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = Loader::new(&write_config(&dir, MULTI)).load().unwrap();
         let before = cfg.model.clone();
@@ -2046,6 +2120,9 @@ kind = "not-a-provider"
 
     #[test]
     fn a_prefix_naming_a_broken_profile_reports_why() {
+        // Reads the ZCODE_* env layer via `load()`, so it must not run
+        // while another test has that environment modified.
+        let _env = env_guard();
         // Reading it as "unknown provider" would send the user hunting for a
         // typo in a name that is right there in their config.
         let dir = tempfile::tempdir().unwrap();
@@ -2071,6 +2148,9 @@ kind = "not-a-provider"
 
     #[test]
     fn the_rtk_section_overrides_only_what_it_names() {
+        // Reads the ZCODE_* env layer via `load()`, so it must not run
+        // while another test has that environment modified.
+        let _env = env_guard();
         let dir = tempfile::tempdir().unwrap();
         let cfg = Loader::new(&write_config(&dir, "[rtk]\nauto_install = false\n"))
             .load()
@@ -2081,6 +2161,9 @@ kind = "not-a-provider"
 
     #[test]
     fn rtk_can_be_turned_off_entirely() {
+        // Reads the ZCODE_* env layer via `load()`, so it must not run
+        // while another test has that environment modified.
+        let _env = env_guard();
         let dir = tempfile::tempdir().unwrap();
         let cfg = Loader::new(&write_config(&dir, "[rtk]\nenabled = false\n"))
             .load()

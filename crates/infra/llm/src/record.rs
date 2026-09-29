@@ -102,8 +102,8 @@ impl From<&LlmEvent> for EventFile {
                 reason: reason_to_str(f.reason).into(),
                 input_tokens: f.input_tokens,
                 output_tokens: f.output_tokens,
-                cache_read_tokens: f.cache_tokens,
-                cache_write_tokens: 0,
+                cache_read_tokens: f.cache_read_tokens,
+                cache_write_tokens: f.cache_write_tokens,
                 cost_usd: f.cost_usd,
             },
         }
@@ -143,7 +143,8 @@ impl From<EventFile> for LlmEvent {
                 reason: reason_from_str(&reason),
                 input_tokens,
                 output_tokens,
-                cache_tokens: cache_read_tokens + cache_write_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
                 cost_usd,
             }),
         }
@@ -227,6 +228,10 @@ impl RecordingLlm {
 }
 
 impl LlmPort for RecordingLlm {
+    fn set_session(&mut self, session_id: &str) {
+        self.inner.set_session(session_id);
+    }
+
     fn send(&mut self, req: &LlmRequest) -> Result<LlmResponse, BoxError> {
         collect_response(self.stream(req))
     }
@@ -324,7 +329,8 @@ mod tests {
                 reason: LlmFinishReason::ToolUse,
                 input_tokens: 120,
                 output_tokens: 7,
-                cache_tokens: 30,
+                cache_read_tokens: 30,
+                cache_write_tokens: 5,
                 cost_usd: Some(0.001),
             }),
         ]

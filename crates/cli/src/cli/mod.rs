@@ -754,7 +754,7 @@ fn cmd_run(args: RunArgs) -> CliResult {
                     result.steps,
                     result.input_tokens,
                     result.output_tokens,
-                    result.cache_tokens,
+                    result.cache_tokens(),
                     result.cost.render(),
                     result.session_id
                 );

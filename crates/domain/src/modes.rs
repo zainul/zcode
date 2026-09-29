@@ -169,4 +169,20 @@ mod tests {
         assert_eq!(seen, AgentMode::all().to_vec());
         assert_eq!(mode.next(), AgentMode::Planning);
     }
+
+    /// FR-CACHE-02: the system prompt sits at the front of every request, so
+    /// anything volatile in it (a date, a counter, a path) would invalidate
+    /// the whole prompt cache on every change. The prompts must be fixed text.
+    #[test]
+    fn system_prompts_contain_no_volatile_data() {
+        for mode in [AgentMode::Planning, AgentMode::Editing, AgentMode::Auto] {
+            let prompt = system_prompt(mode);
+            assert!(!prompt.contains('{') && !prompt.contains('}'), "{mode:?}");
+            assert!(
+                !prompt.chars().any(|c| c.is_ascii_digit()),
+                "{mode:?} prompt contains digits: {prompt}"
+            );
+            assert_eq!(prompt, system_prompt(mode), "deterministic");
+        }
+    }
 }

@@ -179,10 +179,10 @@ impl Totals {
     fn set_turn_usage(&mut self, usage: &domain::LlmFinish) {
         self.input_tokens += usage.input_tokens.saturating_sub(self.turn.input);
         self.output_tokens += usage.output_tokens.saturating_sub(self.turn.output);
-        self.cache_tokens += usage.cache_tokens.saturating_sub(self.turn.cache);
+        self.cache_tokens += usage.cache_tokens().saturating_sub(self.turn.cache);
         self.turn.input = usage.input_tokens;
         self.turn.output = usage.output_tokens;
-        self.turn.cache = usage.cache_tokens;
+        self.turn.cache = usage.cache_tokens();
 
         if let Some(reported) = usage.cost_usd {
             let delta = reported - self.turn.cost_usd;
@@ -199,7 +199,7 @@ impl Totals {
         // same tokens.
         self.input_tokens += result.input_tokens.saturating_sub(self.turn.input);
         self.output_tokens += result.output_tokens.saturating_sub(self.turn.output);
-        self.cache_tokens += result.cache_tokens.saturating_sub(self.turn.cache);
+        self.cache_tokens += result.cache_tokens().saturating_sub(self.turn.cache);
         self.steps += result.steps;
         self.turns += 1;
         // A cost the provider reported has already been counted and is exact;
@@ -2472,7 +2472,8 @@ mod tests {
             truncated: false,
             input_tokens: 7,
             output_tokens: 3,
-            cache_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             peak_context_tokens: 0,
             cost: Cost {
                 output_usd: 0.5,
@@ -3187,7 +3188,8 @@ mod tests {
             reason: domain::LlmFinishReason::ToolUse,
             input_tokens: input,
             output_tokens: output,
-            cache_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             cost_usd: cost,
         }
     }

@@ -81,13 +81,59 @@ pub struct ExecutionResult {
     pub truncated: bool,
     pub input_tokens: u64,
     pub output_tokens: u64,
-    pub cache_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
     /// Estimated spend for this run. `priced` is false when the model is not
     /// in the price table, so the UI can say "n/a" rather than "$0.00".
     pub cost: domain::Cost,
     /// The largest live context seen before any request in this run
     /// (FR-BUDGET-04, PRD M7), in calibrated tokens.
     pub peak_context_tokens: u64,
+}
+
+impl ExecutionResult {
+    /// Cache reads and writes together.
+    pub fn cache_tokens(&self) -> u64 {
+        self.cache_read_tokens + self.cache_write_tokens
+    }
+}
+
+/// Running token totals for one run (FR-CACHE-04: reads and writes apart).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RunUsage {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+}
+
+impl RunUsage {
+    /// Cache reads as a share of all prompt tokens sent. `None` when the
+    /// provider reported nothing about caching.
+    pub fn cache_hit_ratio(&self, cache_within_input: bool) -> Option<f64> {
+        if self.cache_read + self.cache_write == 0 {
+            return None;
+        }
+        let prompt = if cache_within_input {
+            self.input + self.cache_write
+        } else {
+            self.input + self.cache_read + self.cache_write
+        };
+        (prompt > 0).then(|| self.cache_read as f64 / prompt as f64)
+    }
+
+    /// For the price table. Writes are priced at the 5-minute rate: the
+    /// provider reports them as one figure, and the 5-minute cache is the
+    /// default TTL.
+    fn token_usage(&self) -> domain::TokenUsage {
+        domain::TokenUsage {
+            input: self.input,
+            output: self.output,
+            cache_read: self.cache_read,
+            cache_write_5m: self.cache_write,
+            cache_write_1h: 0,
+        }
+    }
 }
 
 /// The engine contract both interfaces drive (FR-IFACE-03).
@@ -293,7 +339,8 @@ impl App {
             model: session.model.clone(),
             input_tokens: 0,
             output_tokens: 0,
-            cache_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             steps,
             execution_time_ms: 0,
             session_id: session.id.clone(),
@@ -311,12 +358,11 @@ impl App {
         reason: LlmFinishReason,
         truncated: bool,
         stop_cause: Option<&'static str>,
-        totals: (u64, u64, u64),
+        totals: RunUsage,
         reported_cost_usd: Option<f64>,
         started: Instant,
         peak_context_tokens: u64,
     ) {
-        let (input_tokens, output_tokens, cache_tokens) = totals;
         let window = self.context_window.lookup(&session.model);
         let elapsed_ms = started.elapsed().as_millis() as u64;
         // What the provider charged beats what the table guesses: it covers
@@ -324,17 +370,17 @@ impl App {
         // reports `n/a` while real money is being spent.
         let cost = match reported_cost_usd {
             Some(reported) => domain::Cost::from_reported_usd(reported),
-            None => {
-                self.pricing
-                    .estimate(&session.model, input_tokens, output_tokens, cache_tokens)
-            }
+            None => self
+                .pricing
+                .estimate_usage(&session.model, &totals.token_usage()),
         };
         self.telemetry.emit(TelemetryEvent {
             kind: "finish".into(),
             model: session.model.clone(),
-            input_tokens,
-            output_tokens,
-            cache_tokens,
+            input_tokens: totals.input,
+            output_tokens: totals.output,
+            cache_read_tokens: totals.cache_read,
+            cache_write_tokens: totals.cache_write,
             steps,
             execution_time_ms: elapsed_ms,
             session_id: session.id.clone(),
@@ -366,6 +412,16 @@ impl App {
                         false => ExtraField::Null,
                     },
                 ),
+                // FR-CACHE-04: the share of the prompt served from cache. The
+                // engine computes it because only it knows whether this
+                // provider counts cached tokens inside `input_tokens`.
+                (
+                    "cache_hit_ratio".into(),
+                    match totals.cache_hit_ratio(self.pricing.cache_within_input(&session.model)) {
+                        Some(r) => ExtraField::Number(r),
+                        None => ExtraField::Null,
+                    },
+                ),
                 // FR-BUDGET-04 / PRD M7: how full the context got.
                 (
                     "peak_context_tokens".into(),
@@ -382,9 +438,10 @@ impl App {
         });
         let totals = TelemetryTotals {
             model: session.model.clone(),
-            input_tokens,
-            output_tokens,
-            cache_tokens,
+            input_tokens: totals.input,
+            output_tokens: totals.output,
+            cache_read_tokens: totals.cache_read,
+            cache_write_tokens: totals.cache_write,
             steps,
             execution_time_ms: elapsed_ms,
             session_id: session.id.clone(),
@@ -407,6 +464,8 @@ impl AgentLoop for App {
     ) -> Result<ExecutionResult, AppError> {
         let started = Instant::now();
         let mut session = self.open_session(&req, ctx)?;
+        // FR-CACHE-03: cache routing is per session.
+        self.llm.set_session(&session.id);
         let mut history: Vec<LlmMessage> =
             std::mem::replace(&mut session.messages, Box::new([])).into_vec();
 
@@ -421,9 +480,7 @@ impl AgentLoop for App {
 
         let specs = self.tool_specs_for(req.mode);
         let mut steps: u64 = 0;
-        let mut input_tokens: u64 = 0;
-        let mut output_tokens: u64 = 0;
-        let mut cache_tokens: u64 = 0;
+        let mut usage = RunUsage::default();
         // Summed across the turn's calls, when the provider reports it. `None`
         // means no call reported one, so the local price table is the only
         // estimate available.
@@ -455,7 +512,7 @@ impl AgentLoop for App {
                     LlmFinishReason::Stop,
                     true,
                     Some("cancelled"),
-                    (input_tokens, output_tokens, cache_tokens),
+                    usage,
                     reported_cost_usd,
                     started,
                     peak_context_tokens,
@@ -471,7 +528,7 @@ impl AgentLoop for App {
                         LlmFinishReason::Length,
                         true,
                         Some("timeout"),
-                        (input_tokens, output_tokens, cache_tokens),
+                        usage,
                         reported_cost_usd,
                         started,
                         peak_context_tokens,
@@ -641,13 +698,14 @@ impl AgentLoop for App {
                 },
                 input_tokens: 0,
                 output_tokens: 0,
-                cache_tokens: 0,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
                 cost_usd: None,
             });
 
             // Provider-reported usage is authoritative; the heuristic is only
             // a fallback for providers that omit it (DQ2).
-            input_tokens += if finish.input_tokens > 0 {
+            usage.input += if finish.input_tokens > 0 {
                 finish.input_tokens
             } else {
                 estimated_prompt_tokens
@@ -656,12 +714,13 @@ impl AgentLoop for App {
                 domain::prompt_size(&finish, cache_within_input),
                 &history[..sent_len.min(history.len())],
             );
-            output_tokens += if finish.output_tokens > 0 {
+            usage.output += if finish.output_tokens > 0 {
                 finish.output_tokens
             } else {
                 domain::tokens::estimate_tokens(&assistant.content)
             };
-            cache_tokens += finish.cache_tokens;
+            usage.cache_read += finish.cache_read_tokens;
+            usage.cache_write += finish.cache_write_tokens;
             if let Some(step_cost) = finish.cost_usd {
                 reported_cost_usd = Some(reported_cost_usd.unwrap_or(0.0) + step_cost);
             }
@@ -673,9 +732,10 @@ impl AgentLoop for App {
             // already incurring.
             self.emitter.emit(UiEvent::Usage(LlmFinish {
                 reason: finish.reason,
-                input_tokens,
-                output_tokens,
-                cache_tokens,
+                input_tokens: usage.input,
+                output_tokens: usage.output,
+                cache_read_tokens: usage.cache_read,
+                cache_write_tokens: usage.cache_write,
                 cost_usd: reported_cost_usd,
             }));
 
@@ -730,7 +790,7 @@ impl AgentLoop for App {
                         LlmFinishReason::Stop,
                         false,
                         None,
-                        (input_tokens, output_tokens, cache_tokens),
+                        usage,
                         reported_cost_usd,
                         started,
                         peak_context_tokens,
@@ -836,7 +896,7 @@ impl AgentLoop for App {
             finish_reason,
             truncated,
             stop_cause,
-            (input_tokens, output_tokens, cache_tokens),
+            usage,
             reported_cost_usd,
             started,
             peak_context_tokens,
@@ -844,10 +904,9 @@ impl AgentLoop for App {
 
         let cost = match reported_cost_usd {
             Some(reported) => domain::Cost::from_reported_usd(reported),
-            None => {
-                self.pricing
-                    .estimate(&session.model, input_tokens, output_tokens, cache_tokens)
-            }
+            None => self
+                .pricing
+                .estimate_usage(&session.model, &usage.token_usage()),
         };
         Ok(ExecutionResult {
             session_id: session.id,
@@ -855,9 +914,10 @@ impl AgentLoop for App {
             steps,
             finish_reason,
             truncated,
-            input_tokens,
-            output_tokens,
-            cache_tokens,
+            input_tokens: usage.input,
+            output_tokens: usage.output,
+            cache_read_tokens: usage.cache_read,
+            cache_write_tokens: usage.cache_write,
             cost,
             peak_context_tokens,
         })
@@ -981,7 +1041,8 @@ mod tests {
             reason,
             input_tokens: 10,
             output_tokens: 5,
-            cache_tokens: 1,
+            cache_read_tokens: 1,
+            cache_write_tokens: 0,
             cost_usd: None,
         }
     }
@@ -1572,7 +1633,7 @@ mod tests {
         // Two turns, provider-reported 10/5/1 each (DQ2).
         assert_eq!(result.input_tokens, 20);
         assert_eq!(result.output_tokens, 10);
-        assert_eq!(result.cache_tokens, 2);
+        assert_eq!(result.cache_tokens(), 2);
     }
 
     /// The number an extra field carries on the last event of `kind`.
@@ -1685,6 +1746,63 @@ mod tests {
         );
     }
 
+    /// FR-CACHE-06: the hit ratio needs the provider's convention for
+    /// `input_tokens`; Anthropic reports cached tokens outside it.
+    #[test]
+    fn cache_hit_ratio_respects_the_providers_input_convention() {
+        let anthropic = RunUsage {
+            input: 1_000,
+            output: 0,
+            cache_read: 9_000,
+            cache_write: 0,
+        };
+        assert_eq!(anthropic.cache_hit_ratio(false), Some(0.9));
+        let openai = RunUsage {
+            input: 10_000,
+            output: 0,
+            cache_read: 9_000,
+            cache_write: 0,
+        };
+        assert_eq!(openai.cache_hit_ratio(true), Some(0.9));
+        assert_eq!(RunUsage::default().cache_hit_ratio(true), None);
+    }
+
+    #[test]
+    fn the_llm_client_is_told_the_session_before_the_first_request() {
+        struct SessionAware(Arc<Mutex<Vec<String>>>, FakeLlm);
+        impl LlmPort for SessionAware {
+            fn set_session(&mut self, id: &str) {
+                self.0.lock().unwrap().push(format!("session:{id}"));
+            }
+            fn send(&mut self, req: &LlmRequest) -> Result<LlmResponse, BoxError> {
+                self.1.send(req)
+            }
+            fn stream(
+                &mut self,
+                req: &LlmRequest,
+            ) -> Box<dyn Iterator<Item = Result<LlmEvent, BoxError>> + Send> {
+                self.0.lock().unwrap().push("request".into());
+                self.1.stream(req)
+            }
+        }
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut app = App::new(
+            Box::new(SessionAware(log.clone(), FakeLlm::new(vec![]))),
+            Box::new(FakeTools {
+                calls: RecordedCalls::default(),
+                response: String::new(),
+                subject: None,
+            }),
+            Box::new(FakeSessions::default()),
+            Box::new(FakeTelemetry::default()),
+            Box::new(NullLogger),
+        );
+        app.execute(&ctx(), ExecutionRequest::new("go")).unwrap();
+        let log = log.lock().unwrap();
+        assert!(log[0].starts_with("session:session-"), "{log:?}");
+        assert_eq!(log[1], "request");
+    }
+
     #[test]
     fn falls_back_to_the_token_heuristic_when_usage_is_absent() {
         let mut h = harness(
@@ -1694,7 +1812,8 @@ mod tests {
                     reason: LlmFinishReason::Stop,
                     input_tokens: 0,
                     output_tokens: 0,
-                    cache_tokens: 0,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
                     cost_usd: None,
                 }),
             ]],

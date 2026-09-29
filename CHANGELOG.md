@@ -7,6 +7,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — the whole conversation is now prompt-cached, not just the system prompt (FR-CACHE-01..06)
+
+On Anthropic routes v0.6 placed `cache_control` on the system prompt and the
+last tool only, so every step re-billed the *entire* transcript at the full
+input rate — the part of the request that grows. Requests now carry four
+breakpoints: tools, system, the end of this request, and exactly where the
+previous request ended. A breakpoint on a position already written is a
+guaranteed read, so the API's 20-block lookback can never miss however many
+blocks a step appended (technical plan CE-DQ6). A golden test builds a
+growing session through every request builder and asserts that, markers
+aside, each request is a byte prefix of the next — the property caching
+depends on and the one a later change is most likely to break silently.
+
+OpenAI-shaped routes now decide whether to send markers from the model id
+(`claude`/`anthropic/`/`gemini` need them; OpenAI and DeepSeek cache
+automatically) instead of a flag hardwired on for OpenRouter. Markers now sit
+on content parts, where OpenRouter documents them — v0.6 attached them to the
+message object. On a marked route every message is rendered as a part array
+from the start: converting only the marked one made the same message change
+shape as the breakpoint moved on, which is itself a cache miss (caught by the
+prefix test). OpenAI requests carry `prompt_cache_key` set to the session id.
+MCP tools are listed sorted by name, so a server's discovery order cannot
+change the cached prefix.
+
+### Changed — cache reads and writes are reported separately (FR-CACHE-04/05)
+
+`LlmFinish`, telemetry events and the run report split `cache_tokens` into
+`cache_read_tokens` and `cache_write_tokens`. Reads bill at the model's cache
+rate, writes at 1.25× the input rate (2× for the one-hour cache); the single
+v0.6 figure made both the cost estimate and the hit rate unknowable. The
+JSONL keeps a `cache_tokens` field (their sum) for one release; it is
+deprecated. The `opencode` translation now fills `tokens.cache.write`
+instead of hardcoding 0. DeepSeek's `prompt_cache_hit_tokens` is read.
+
+### Fixed — Anthropic cache usage was double-counted
+
+Anthropic's `message_delta` usage is cumulative and, on current API
+versions, repeats the input-side fields `message_start` already reported.
+v0.6 *added* the two, doubling every cache token (and adding one to the
+output count). Each field is now the maximum of the two reports. The decoder
+no longer reads `cache_creation_output_tokens`, which is not a documented
+field.
+
+### Added — a token ledger (FR-BUDGET-01..04)
+
+Every `tool_result` event carries `tokens_est`, `chars`, `category` (which
+stage of discover → locate → inspect → change → verify it belongs to) and
+`spilled`. The run report gains `ledger` (tokens by tool and by category),
+`context` (peak live context and its share of the window) and `cache` (reads,
+writes, hit ratio) sections; every existing key is unchanged.
+
+### Fixed — tool results were invisible to the context-window estimate
+
+The prompt-size estimate summed each message's `content` — but tool results
+live in `tool_result.content` and tool-call arguments in `tool_calls`, so the
+one kind of message most likely to be large counted as zero. The window
+clamp could therefore reserve output room the prompt had already used. The
+estimate now covers all three, and is anchored on the provider's own report
+of the last prompt's size with only newer messages estimated. The estimator
+itself changed from `words × 4` to a character heuristic calibrated per
+session against provider reports (MAPE ~15% against cl100k on the committed
+fixtures, down from an undercount on code).
+
+### Added — `zcode-evals`, a token-efficiency evaluation harness (FR-BUDGET-07)
+
+`evals/` runs the built binary over a 24-task corpus (four repositories × six
+task categories), grades each run, and compares result files against the
+milestone's targets and guardrails; `make eval-tokens` is a hermetic replay
+self-test. `ZCODE_LLM_RECORD=<dir>` / `ZCODE_LLM_REPLAY=<dir>` record and
+replay provider traffic by call sequence. See `evals/README.md`.
+
 ## [0.6.0] - 2026-09-11
 
 ### Added — `meridian` provider: bridge a Claude Max/Team/Enterprise subscription

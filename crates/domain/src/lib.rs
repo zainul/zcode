@@ -37,7 +37,7 @@ pub use ports::{
     SessionStorePort, ShellPort, SpillPort, Subject, TelemetryEvent, TelemetryPort,
     TelemetryTotals, Tool, ToolRegistryPort, ToolResult, ToolSpec, UiEvent,
 };
-pub use pricing::{Cost, PriceEntry, PriceTable};
+pub use pricing::{Cost, PriceEntry, PriceTable, TokenUsage};
 pub use tokens::{estimate_messages, estimate_tokens, prompt_size, TokenCalibrator};
 
 /// Shorthand for the canonical domain error box: `Send + Sync` so it crosses

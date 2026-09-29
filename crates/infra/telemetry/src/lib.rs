@@ -31,6 +31,9 @@ pub struct JsonTelemetry {
     ledger: Ledger,
     /// Peak live context and the model window it was measured against.
     context: Option<ContextReport>,
+    /// Computed by the engine, which knows whether the provider counts
+    /// cached tokens inside `input_tokens`.
+    cache_hit_ratio: Option<f64>,
 }
 
 /// Aggregate cost of one tool's (or one category's) results.
@@ -90,6 +93,17 @@ fn add(into: &mut Agg, from: &Agg) {
     into.errors += from.errors;
 }
 
+/// The report's `cache` section (FR-CACHE-04).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct CacheReport {
+    pub read: u64,
+    pub write: u64,
+    /// Share of the run's prompt tokens served from cache, as computed by
+    /// the engine. Absent when nothing about caching was reported.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub hit_ratio: Option<f64>,
+}
+
 /// The report's `context` section (PRD M7).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ContextReport {
@@ -112,7 +126,8 @@ impl JsonTelemetry {
                 model: String::new(),
                 input_tokens: 0,
                 output_tokens: 0,
-                cache_tokens: 0,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
                 steps: 0,
                 execution_time_ms: 0,
                 session_id: String::new(),
@@ -123,6 +138,7 @@ impl JsonTelemetry {
             start: Instant::now(),
             ledger: Ledger::default(),
             context: None,
+            cache_hit_ratio: None,
         }
     }
 
@@ -173,7 +189,8 @@ impl TelemetryPort for JsonTelemetry {
         // engine-supplied counts; see DQ2 — provider-reported usage wins).
         self.totals.input_tokens = self.totals.input_tokens.max(ev.input_tokens);
         self.totals.output_tokens = self.totals.output_tokens.max(ev.output_tokens);
-        self.totals.cache_tokens = self.totals.cache_tokens.max(ev.cache_tokens);
+        self.totals.cache_read_tokens = self.totals.cache_read_tokens.max(ev.cache_read_tokens);
+        self.totals.cache_write_tokens = self.totals.cache_write_tokens.max(ev.cache_write_tokens);
         self.totals.steps = self.totals.steps.max(ev.steps);
         self.totals.execution_time_ms = self.totals.execution_time_ms.max(elapsed_ms);
         if !ev.model.is_empty() {
@@ -200,6 +217,9 @@ impl TelemetryPort for JsonTelemetry {
                             _ => None,
                         })
                 };
+                if let Some(ratio) = number("cache_hit_ratio") {
+                    self.cache_hit_ratio = Some(ratio);
+                }
                 if let Some(peak) = number("peak_context_tokens") {
                     let peak = peak as u64;
                     self.context = Some(ContextReport {
@@ -219,7 +239,11 @@ impl TelemetryPort for JsonTelemetry {
             "model": ev.model,
             "input_tokens": ev.input_tokens,
             "output_tokens": ev.output_tokens,
-            "cache_tokens": ev.cache_tokens,
+            "cache_read_tokens": ev.cache_read_tokens,
+            "cache_write_tokens": ev.cache_write_tokens,
+            // Deprecated (v0.7): reads + writes, kept one release for
+            // consumers of the v0.6 stream.
+            "cache_tokens": ev.cache_read_tokens + ev.cache_write_tokens,
             "steps": ev.steps,
             "execution_time_ms": elapsed_ms,
             "session_id": ev.session_id,
@@ -246,7 +270,8 @@ impl TelemetryPort for JsonTelemetry {
             },
             input_tokens: self.totals.input_tokens.max(total.input_tokens),
             output_tokens: self.totals.output_tokens.max(total.output_tokens),
-            cache_tokens: self.totals.cache_tokens.max(total.cache_tokens),
+            cache_read_tokens: self.totals.cache_read_tokens.max(total.cache_read_tokens),
+            cache_write_tokens: self.totals.cache_write_tokens.max(total.cache_write_tokens),
             steps: self.totals.steps.max(total.steps),
             execution_time_ms: self.totals.execution_time_ms.max(total.execution_time_ms),
             session_id: session_id.to_string(),
@@ -267,7 +292,12 @@ impl TelemetryPort for JsonTelemetry {
             model: merged.model,
             input_tokens: merged.input_tokens,
             output_tokens: merged.output_tokens,
-            cache_tokens: merged.cache_tokens,
+            cache_tokens: merged.cache_read_tokens + merged.cache_write_tokens,
+            cache: CacheReport {
+                read: merged.cache_read_tokens,
+                write: merged.cache_write_tokens,
+                hit_ratio: self.cache_hit_ratio,
+            },
             steps: merged.steps,
             execution_time_ms: merged.execution_time_ms,
             finish_reason: merged.finish_reason,
@@ -305,7 +335,11 @@ struct ReportFile {
     model: String,
     input_tokens: u64,
     output_tokens: u64,
+    /// Deprecated (v0.7): reads + writes; see `cache`.
     cache_tokens: u64,
+    /// Cache reads and writes kept apart (FR-CACHE-04).
+    #[serde(default)]
+    cache: CacheReport,
     steps: u64,
     execution_time_ms: u64,
     finish_reason: String,
@@ -395,7 +429,8 @@ mod tests {
             model: model.to_string(),
             input_tokens: 0,
             output_tokens: 0,
-            cache_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             steps: 0,
             execution_time_ms: 0,
             session_id: String::new(),
@@ -415,7 +450,8 @@ mod tests {
             model: "openai/gpt-4o-mini".into(),
             input_tokens: 0,
             output_tokens: 3,
-            cache_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             steps: 1,
             execution_time_ms: 42,
             session_id: "s".into(),
@@ -426,7 +462,8 @@ mod tests {
             model: "openai/gpt-4o-mini".into(),
             input_tokens: 0,
             output_tokens: 2,
-            cache_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             steps: 1,
             execution_time_ms: 50,
             session_id: "s".into(),
@@ -437,7 +474,8 @@ mod tests {
             model: "openai/gpt-4o-mini".into(),
             input_tokens: 128,
             output_tokens: 64,
-            cache_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             steps: 3,
             execution_time_ms: 1200,
             session_id: "s".into(),
@@ -468,7 +506,8 @@ mod tests {
             model: "m".into(),
             input_tokens: 0,
             output_tokens: 0,
-            cache_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             steps: 1,
             execution_time_ms: 1,
             session_id: "s".into(),
@@ -521,6 +560,26 @@ mod tests {
         assert_eq!(json["ledger"]["by_category"]["locate"]["tokens_est"], 40);
         assert_eq!(json["context"]["peak_tokens"], 50_000);
         assert_eq!(json["context"]["peak_pct"], 0.25);
+    }
+
+    #[test]
+    fn report_splits_cache_reads_and_writes_and_carries_the_hit_ratio() {
+        let dir = tempfile::tempdir().unwrap();
+        let out: Box<dyn Write + Send> = Box::new(CapturingWriter::default());
+        let mut tel = JsonTelemetry::new(out, dir.path().to_path_buf());
+        let mut finish = event("finish", vec![("cache_hit_ratio", ExtraField::Number(0.9))]);
+        finish.input_tokens = 1_000;
+        finish.cache_read_tokens = 9_000;
+        finish.cache_write_tokens = 200;
+        tel.emit(finish);
+        let path = tel.flush_report("s", te("m")).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(json["cache"]["read"], 9_000);
+        assert_eq!(json["cache"]["write"], 200);
+        assert_eq!(json["cache"]["hit_ratio"], 0.9);
+        // The v0.6 field survives one release, as the sum.
+        assert_eq!(json["cache_tokens"], 9_200);
     }
 
     #[test]
@@ -614,7 +673,8 @@ mod tests {
             model: "m".into(),
             input_tokens: 0,
             output_tokens: 0,
-            cache_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             steps: 0,
             execution_time_ms: 0,
             session_id: "s".into(),
@@ -644,7 +704,8 @@ mod tests {
             model: "openai/gpt-4o-mini".into(),
             input_tokens: 0,
             output_tokens: 3,
-            cache_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             steps: 1,
             execution_time_ms: 42,
             session_id: "s".into(),
@@ -655,7 +716,8 @@ mod tests {
             model: "openai/gpt-4o-mini".into(),
             input_tokens: 128,
             output_tokens: 64,
-            cache_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             steps: 3,
             execution_time_ms: 1200,
             session_id: "s".into(),

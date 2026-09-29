@@ -121,7 +121,7 @@ pub fn prompt_size(finish: &LlmFinish, cache_within_input: bool) -> u64 {
     if cache_within_input {
         finish.input_tokens
     } else {
-        finish.input_tokens + finish.cache_tokens
+        finish.input_tokens + finish.cache_tokens()
     }
 }
 
@@ -243,7 +243,8 @@ mod tests {
             reason: LlmFinishReason::Stop,
             input_tokens: input,
             output_tokens: 0,
-            cache_tokens: cache,
+            cache_read_tokens: cache,
+            cache_write_tokens: 0,
             cost_usd: None,
         }
     }

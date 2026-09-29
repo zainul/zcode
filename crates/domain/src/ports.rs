@@ -171,7 +171,14 @@ pub struct LlmFinish {
     pub reason: LlmFinishReason,
     pub input_tokens: u64,
     pub output_tokens: u64,
-    pub cache_tokens: u64,
+    /// Prompt tokens served from the provider's cache (Anthropic
+    /// `cache_read_input_tokens`, OpenAI `cached_tokens`, DeepSeek
+    /// `prompt_cache_hit_tokens`). Billed at a fraction of the input rate.
+    pub cache_read_tokens: u64,
+    /// Prompt tokens written to the cache (Anthropic
+    /// `cache_creation_input_tokens`). Billed at a premium; OpenAI-shaped
+    /// providers do not report writes.
+    pub cache_write_tokens: u64,
     /// What the provider says the call cost, in USD, when it says so.
     ///
     /// Authoritative where present: it is the number that will appear on the
@@ -179,6 +186,13 @@ pub struct LlmFinish {
     /// local price table is an estimate for providers that report nothing, and
     /// cannot know about a model it has never heard of.
     pub cost_usd: Option<f64>,
+}
+
+impl LlmFinish {
+    /// Reads and writes together — the single figure v0.6 reported.
+    pub fn cache_tokens(&self) -> u64 {
+        self.cache_read_tokens + self.cache_write_tokens
+    }
 }
 
 /// A transient provider failure that was retried rather than surfaced as an
@@ -252,6 +266,11 @@ pub struct LlmResponse {
 
 /// The LLM port: the application's only dependency on a model provider.
 pub trait LlmPort {
+    /// Tell the client which session its next requests belong to, before the
+    /// first one is sent. Used for cache routing (`prompt_cache_key`,
+    /// FR-CACHE-03); a client with no use for it ignores it.
+    fn set_session(&mut self, _session_id: &str) {}
+
     fn send(&mut self, req: &LlmRequest) -> Result<LlmResponse, crate::BoxError>;
     fn stream(
         &mut self,
@@ -426,7 +445,8 @@ pub struct TelemetryEvent {
     pub model: String,
     pub input_tokens: u64,
     pub output_tokens: u64,
-    pub cache_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
     pub steps: u64,
     pub execution_time_ms: u64,
     pub session_id: String,
@@ -439,7 +459,8 @@ pub struct TelemetryTotals {
     pub model: String,
     pub input_tokens: u64,
     pub output_tokens: u64,
-    pub cache_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
     pub steps: u64,
     pub execution_time_ms: u64,
     pub session_id: String,
