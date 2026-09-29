@@ -22,7 +22,8 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use domain::{
-    BoxError, LspLocation, LspPort, LspPosition, LspRange, LspTextEdit, LspWorkspaceEdit,
+    BoxError, LspDiagnostic, LspLocation, LspPort, LspPosition, LspRange, LspReadiness,
+    LspSymbolInfo, LspTextEdit, LspWorkspaceEdit,
 };
 use lsp_types::notification::{
     DidChangeTextDocument, DidOpenTextDocument, Initialized, Notification,
@@ -76,12 +77,28 @@ impl From<std::io::Error> for LspError {
 pub struct LspClient {
     child: Child,
     stdin: ChildStdin,
-    rx: Receiver<Value>,
+    /// Frames from the server, stamped with when they *arrived* — a report
+    /// read late must not look newer than an edit that superseded it.
+    rx: Receiver<(Value, Instant)>,
     next_id: u64,
     /// uri -> (text, version); the version is bumped on every `didChange`
     /// so the server's view stays in sync with our edits (FR-LSP-04).
     docs: HashMap<String, (String, i32)>,
     timeout: Duration,
+    /// What the server said it can do, from `initialize` (CE-DQ19).
+    capabilities: Value,
+    /// Latest `publishDiagnostics` per document, with when it arrived.
+    diagnostics: HashMap<String, (Vec<LspDiagnostic>, Instant)>,
+    /// When each document was last changed, so a diagnostics read can wait
+    /// for a report newer than the edit instead of returning a stale one.
+    changed_at: HashMap<String, Instant>,
+    /// When any diagnostics last arrived (the settle clock).
+    last_push: Option<Instant>,
+    /// `$/progress` tokens: `Some(pct)` while running, removed when done.
+    progress: HashMap<String, Option<u8>>,
+    /// Push-diagnostics settle window and cap (FR-LSP-07).
+    settle: Duration,
+    settle_cap: Duration,
 }
 
 impl LspClient {
@@ -126,7 +143,7 @@ impl LspClient {
         std::thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
             while let Ok(value) = read_frame(&mut reader) {
-                if tx.send(value).is_err() {
+                if tx.send((value, Instant::now())).is_err() {
                     break;
                 }
             }
@@ -139,6 +156,13 @@ impl LspClient {
             next_id: 0,
             docs: HashMap::new(),
             timeout: Duration::from_millis(timeout_ms),
+            capabilities: Value::Null,
+            diagnostics: HashMap::new(),
+            changed_at: HashMap::new(),
+            last_push: None,
+            progress: HashMap::new(),
+            settle: Duration::from_millis(1_500),
+            settle_cap: Duration::from_secs(10),
         };
         client.handshake(root_dir)?;
         Ok(client)
@@ -155,12 +179,17 @@ impl LspClient {
                     "references": {},
                     "hover": { "contentFormat": ["plaintext", "markdown"] },
                     "rename": {},
-                    "synchronization": { "didSave": false }
-                }
+                    "synchronization": { "didSave": false },
+                    "publishDiagnostics": { "relatedInformation": false },
+                    "diagnostic": { "dynamicRegistration": false }
+                },
+                "workspace": { "symbol": {}, "configuration": true },
+                "window": { "workDoneProgress": true }
             },
             "clientInfo": { "name": "zcode", "version": env!("CARGO_PKG_VERSION") },
         });
-        self.send_request(Initialize::METHOD, params)?;
+        let result = self.send_request(Initialize::METHOD, params)?;
+        self.capabilities = result.get("capabilities").cloned().unwrap_or(Value::Null);
         self.send_notification(Initialized::METHOD, json!({}))
     }
 
@@ -190,7 +219,7 @@ impl LspClient {
 
         let deadline = Instant::now() + self.timeout;
         loop {
-            let value = self.read_message(deadline)?;
+            let (value, arrived) = self.read_message(deadline)?;
             match value.get("id").and_then(|v| v.as_u64()) {
                 Some(got) if got == id => {
                     if let Some(err) = value.get("error") {
@@ -202,14 +231,139 @@ impl LspClient {
                     }
                     return Ok(value.get("result").cloned().unwrap_or(Value::Null));
                 }
-                // Diagnostics, progress notifications, and server->client
-                // requests all arrive on the same stream: skip them.
-                _ => continue,
+                // Diagnostics, progress and server->client requests share
+                // the stream. They used to be skipped — including requests a
+                // server waits on (`workspace/configuration`), which could
+                // stall it. Now each is handled (CE-DQ19).
+                _ => self.route(&value, arrived)?,
             }
         }
     }
 
-    fn read_message(&mut self, deadline: Instant) -> Result<Value, LspError> {
+    /// Handle one message that is not the response being awaited.
+    fn route(&mut self, v: &Value, arrived: Instant) -> Result<(), LspError> {
+        let method = v.get("method").and_then(Value::as_str);
+        match (v.get("id"), method) {
+            (Some(id), Some(method)) => {
+                self.answer_server_request(id.clone(), method, v.get("params"))
+            }
+            (None, Some("textDocument/publishDiagnostics")) => {
+                if let Some(params) = v.get("params") {
+                    let uri = params["uri"].as_str().unwrap_or_default().to_string();
+                    let items = parse_diagnostics(&uri, &params["diagnostics"]);
+                    self.diagnostics.insert(uri, (items, arrived));
+                    self.last_push = Some(arrived);
+                }
+                Ok(())
+            }
+            (None, Some("$/progress")) => {
+                if let Some(params) = v.get("params") {
+                    let token = params["token"].to_string();
+                    let value = &params["value"];
+                    let pct = value["percentage"].as_u64().map(|p| p.min(100) as u8);
+                    match value["kind"].as_str() {
+                        Some("end") => {
+                            self.progress.remove(&token);
+                        }
+                        Some(_) => {
+                            let entry = self.progress.entry(token).or_insert(None);
+                            if pct.is_some() {
+                                *entry = pct;
+                            }
+                        }
+                        None => {}
+                    }
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Reply to a server→client request. zcode applies edits itself, so it
+    /// declines `workspace/applyEdit`; anything unknown gets the JSON-RPC
+    /// "method not found" error rather than silence.
+    fn answer_server_request(
+        &mut self,
+        id: Value,
+        method: &str,
+        params: Option<&Value>,
+    ) -> Result<(), LspError> {
+        let result = match method {
+            "workspace/configuration" => {
+                let n = params
+                    .and_then(|p| p["items"].as_array())
+                    .map_or(0, Vec::len);
+                Value::Array(vec![Value::Null; n])
+            }
+            "window/workDoneProgress/create"
+            | "client/registerCapability"
+            | "client/unregisterCapability"
+            | "window/showMessageRequest" => Value::Null,
+            "workspace/applyEdit" => json!({ "applied": false }),
+            _ => {
+                return self.write_message(&json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "error": { "code": -32601, "message": "method not supported by zcode" }
+                }))
+            }
+        };
+        self.write_message(&json!({ "jsonrpc": "2.0", "id": id, "result": result }))
+    }
+
+    /// Route whatever arrives until `until`.
+    fn pump(&mut self, until: Instant) -> Result<(), LspError> {
+        while Instant::now() < until {
+            match self
+                .rx
+                .recv_timeout(until.saturating_duration_since(Instant::now()))
+            {
+                Ok((v, arrived)) => {
+                    // A response nobody is waiting for is dropped.
+                    if v.get("method").is_some() {
+                        self.route(&v, arrived)?;
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => break,
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(LspError::Protocol("server closed stdout".into()))
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Tune the push-diagnostics wait (tests use short windows).
+    pub fn set_diagnostics_settle(&mut self, settle: Duration, cap: Duration) {
+        self.settle = settle;
+        self.settle_cap = cap;
+    }
+
+    fn stored(&self, uri: Option<&str>) -> Box<[LspDiagnostic]> {
+        let mut out: Vec<LspDiagnostic> = match uri {
+            Some(u) => self
+                .diagnostics
+                .get(u)
+                .map(|(items, _)| items.clone())
+                .unwrap_or_default(),
+            None => self
+                .diagnostics
+                .iter()
+                .filter(|(u, _)| self.docs.contains_key(*u))
+                .flat_map(|(_, (items, _))| items.clone())
+                .collect(),
+        };
+        out.sort_by(|a, b| {
+            (a.uri.as_str(), a.range.start.line, a.range.start.character).cmp(&(
+                b.uri.as_str(),
+                b.range.start.line,
+                b.range.start.character,
+            ))
+        });
+        out.into_boxed_slice()
+    }
+
+    fn read_message(&mut self, deadline: Instant) -> Result<(Value, Instant), LspError> {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(LspError::Timeout(self.timeout.as_millis() as u64));
@@ -292,6 +446,7 @@ impl LspPort for LspClient {
     /// `didOpen`; later calls send `didChange` with the full new text so the
     /// server's index tracks our edits (FR-LSP-04).
     fn open_document(&mut self, uri: &str, text: &str) -> Result<(), BoxError> {
+        self.changed_at.insert(uri.to_string(), Instant::now());
         match self.docs.get_mut(uri) {
             Some(entry) => {
                 entry.0 = text.to_string();
@@ -322,6 +477,116 @@ impl LspPort for LspClient {
         }
         Ok(())
     }
+
+    /// Pull diagnostics when the server supports `textDocument/diagnostic`
+    /// (LSP 3.17); otherwise wait for pushes to settle — a report newer than
+    /// the document's last change, then `settle` of quiet, at most
+    /// `settle_cap` — and return what was published (FR-LSP-07).
+    fn diagnostics(&mut self, uri: Option<&str>) -> Result<Box<[LspDiagnostic]>, BoxError> {
+        if let (Some(u), false) = (uri, self.capabilities["diagnosticProvider"].is_null()) {
+            let result = self.send_request(
+                "textDocument/diagnostic",
+                json!({ "textDocument": { "uri": u } }),
+            )?;
+            if result["kind"] == "full" {
+                let items = parse_diagnostics(u, &result["items"]);
+                self.diagnostics
+                    .insert(u.to_string(), (items, Instant::now()));
+            }
+            return Ok(self.stored(uri));
+        }
+        let started = Instant::now();
+        let cap = started + self.settle_cap;
+        loop {
+            let fresh = match uri {
+                Some(u) => match (self.diagnostics.get(u), self.changed_at.get(u)) {
+                    (Some((_, got)), Some(changed)) => got >= changed,
+                    (Some(_), None) => true,
+                    (None, _) => false,
+                },
+                None => true,
+            };
+            let quiet_since = self.last_push.unwrap_or(started).max(started);
+            let quiet = quiet_since.elapsed() >= self.settle;
+            if (fresh && quiet) || Instant::now() >= cap {
+                break;
+            }
+            self.pump((Instant::now() + Duration::from_millis(50)).min(cap))?;
+        }
+        Ok(self.stored(uri))
+    }
+
+    fn stored_diagnostics(&self, uri: &str) -> Box<[LspDiagnostic]> {
+        self.stored(Some(uri))
+    }
+
+    fn workspace_symbols(&mut self, query: &str) -> Result<Box<[LspSymbolInfo]>, BoxError> {
+        let result = self.send_request("workspace/symbol", json!({ "query": query }))?;
+        Ok(parse_symbols(&result))
+    }
+
+    fn readiness(&self) -> LspReadiness {
+        match self.progress.values().next() {
+            None => LspReadiness::Ready,
+            Some(_) => LspReadiness::Indexing(self.progress.values().flatten().copied().min()),
+        }
+    }
+}
+
+/// `Diagnostic[]` → domain diagnostics. `code` may be a number or a string.
+pub fn parse_diagnostics(uri: &str, items: &Value) -> Vec<LspDiagnostic> {
+    items
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|d| {
+                    Some(LspDiagnostic {
+                        uri: uri.to_string(),
+                        range: parse_range(&d["range"])?,
+                        severity: d["severity"].as_u64().map_or(1, |s| s.clamp(1, 4) as u8),
+                        code: match &d["code"] {
+                            Value::String(c) => Some(c.clone()),
+                            Value::Number(n) => Some(n.to_string()),
+                            _ => None,
+                        },
+                        message: d["message"].as_str().unwrap_or_default().to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `SymbolInformation[]` or `WorkspaceSymbol[]` → domain symbols. A
+/// `WorkspaceSymbol` may carry a location with no range; it becomes 0:0.
+pub fn parse_symbols(result: &Value) -> Box<[LspSymbolInfo]> {
+    result
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|s| {
+                    let loc = &s["location"];
+                    let uri = loc["uri"].as_str()?.to_string();
+                    let range = parse_range(&loc["range"]).unwrap_or(LspRange {
+                        start: LspPosition {
+                            line: 0,
+                            character: 0,
+                        },
+                        end: LspPosition {
+                            line: 0,
+                            character: 0,
+                        },
+                    });
+                    Some(LspSymbolInfo {
+                        name: s["name"].as_str()?.to_string(),
+                        kind: s["kind"].as_u64().unwrap_or(0) as u32,
+                        container: s["containerName"].as_str().map(str::to_string),
+                        location: LspLocation { uri, range },
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -774,5 +1039,143 @@ mod tests {
         client.open_document(&uri, &text).unwrap();
         let hover = client.hover(&uri, 6, 12).expect("hover");
         assert!(!hover.is_empty());
+    }
+
+    // ---- CE-DQ19: routing, diagnostics, symbols, readiness ----------------
+
+    fn frame(v: serde_json::Value) -> Vec<u8> {
+        let body = v.to_string();
+        format!("Content-Length: {}\r\n\r\n{body}", body.len()).into_bytes()
+    }
+
+    /// A "server" that plays back `before` at once, then `later` after
+    /// `delay_ms`, then stays alive. It never reads stdin, so it is fully
+    /// deterministic; the client's replies are simply buffered.
+    fn scripted(
+        before: Vec<serde_json::Value>,
+        later: Vec<serde_json::Value>,
+        delay_ms: u64,
+    ) -> (tempfile::TempDir, LspClient) {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, frames: &[serde_json::Value]| {
+            let bytes: Vec<u8> = frames.iter().cloned().flat_map(frame).collect();
+            std::fs::write(dir.path().join(name), bytes).unwrap();
+        };
+        write("before", &before);
+        write("later", &later);
+        let script = format!(
+            "cat '{b}'; sleep {d}; cat '{l}'; sleep 30",
+            b = dir.path().join("before").display(),
+            l = dir.path().join("later").display(),
+            d = delay_ms as f64 / 1000.0
+        );
+        let client = LspClient::start_with_timeout(
+            "sh",
+            &["-c".to_string(), script],
+            &[],
+            dir.path(),
+            5_000,
+        )
+        .expect("scripted server starts");
+        (dir, client)
+    }
+
+    fn init(capabilities: serde_json::Value) -> serde_json::Value {
+        json!({ "jsonrpc": "2.0", "id": 1, "result": { "capabilities": capabilities } })
+    }
+
+    fn diag(uri: &str, line: u32, message: &str) -> serde_json::Value {
+        json!({ "jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": {
+            "uri": uri,
+            "diagnostics": [{
+                "range": { "start": { "line": line, "character": 4 },
+                           "end": { "line": line, "character": 9 } },
+                "severity": 1, "code": "E0308", "message": message
+            }]
+        }})
+    }
+
+    #[test]
+    fn server_requests_are_answered_and_notifications_kept() {
+        let (_dir, mut client) = scripted(
+            vec![
+                init(json!({})),
+                json!({ "jsonrpc": "2.0", "id": "srv-1", "method": "workspace/configuration",
+                        "params": { "items": [{}, {}] } }),
+                diag("file:///a.rs", 3, "mismatched types"),
+                json!({ "jsonrpc": "2.0", "method": "$/progress", "params": {
+                    "token": "idx", "value": { "kind": "begin", "percentage": 40 } } }),
+                json!({ "jsonrpc": "2.0", "id": 2, "result": {
+                    "uri": "file:///b.rs",
+                    "range": { "start": { "line": 1, "character": 2 },
+                               "end": { "line": 1, "character": 5 } } } }),
+            ],
+            vec![],
+            0,
+        );
+        // The configuration request arrives *before* the definition reply; a
+        // client that ignored it (as v0.6 did) could stall a real server.
+        let loc = client.goto_definition("file:///a.rs", 0, 0).unwrap();
+        assert_eq!(loc.uri, "file:///b.rs");
+        let stored = client.stored_diagnostics("file:///a.rs");
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].code.as_deref(), Some("E0308"));
+        assert_eq!(client.readiness(), LspReadiness::Indexing(Some(40)));
+    }
+
+    #[test]
+    fn push_diagnostics_wait_for_a_report_newer_than_the_change() {
+        let (_dir, mut client) = scripted(
+            vec![init(json!({})), diag("file:///a.rs", 0, "stale")],
+            vec![diag("file:///a.rs", 7, "fresh after the edit")],
+            400,
+        );
+        client.set_diagnostics_settle(Duration::from_millis(100), Duration::from_secs(4));
+        client
+            .open_document("file:///a.rs", "fn main() {}")
+            .unwrap();
+        let started = Instant::now();
+        let found = client.diagnostics(Some("file:///a.rs")).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].message, "fresh after the edit");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "settled, did not hit the cap"
+        );
+    }
+
+    #[test]
+    fn pull_diagnostics_are_used_when_the_server_supports_them() {
+        let (_dir, mut client) = scripted(
+            vec![
+                init(json!({ "diagnosticProvider": { "interFileDependencies": false } })),
+                json!({ "jsonrpc": "2.0", "id": 2, "result": { "kind": "full", "items": [{
+                    "range": { "start": { "line": 2, "character": 0 },
+                               "end": { "line": 2, "character": 1 } },
+                    "severity": 2, "code": 12, "message": "unused variable" }] } }),
+            ],
+            vec![],
+            0,
+        );
+        let found = client.diagnostics(Some("file:///c.rs")).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].severity, 2);
+        assert_eq!(found[0].code.as_deref(), Some("12"));
+    }
+
+    #[test]
+    fn workspace_symbols_parse_both_result_shapes() {
+        let result = json!([
+            { "name": "execute", "kind": 6, "containerName": "AgentLoop",
+              "location": { "uri": "file:///app.rs",
+                            "range": { "start": { "line": 385, "character": 7 },
+                                       "end": { "line": 385, "character": 14 } } } },
+            { "name": "App", "kind": 23, "location": { "uri": "file:///lib.rs" } }
+        ]);
+        let symbols = parse_symbols(&result);
+        assert_eq!(symbols.len(), 2);
+        assert_eq!(symbols[0].container.as_deref(), Some("AgentLoop"));
+        assert_eq!(symbols[0].location.range.start.line, 385);
+        assert_eq!(symbols[1].location.range.start.line, 0);
     }
 }

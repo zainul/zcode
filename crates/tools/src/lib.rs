@@ -15,6 +15,7 @@
 
 pub mod edit;
 pub mod guard;
+pub mod lsp_tools;
 pub mod native;
 pub mod patch;
 pub mod render;

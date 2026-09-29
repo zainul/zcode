@@ -403,6 +403,33 @@ pub trait LspPort {
     ) -> Result<crate::LspWorkspaceEdit, crate::BoxError>;
 
     fn open_document(&mut self, uri: &str, text: &str) -> Result<(), crate::BoxError>;
+
+    /// Diagnostics for one document, or for every document open when
+    /// `None` (FR-LSP-07). Waits for the server to settle after a change.
+    fn diagnostics(
+        &mut self,
+        _uri: Option<&str>,
+    ) -> Result<Box<[crate::LspDiagnostic]>, crate::BoxError> {
+        Ok(Box::new([]))
+    }
+
+    /// Diagnostics already received, without waiting (FR-LSP-08 baseline).
+    fn stored_diagnostics(&self, _uri: &str) -> Box<[crate::LspDiagnostic]> {
+        Box::new([])
+    }
+
+    /// Symbols matching `query` across the workspace (FR-LSP-05).
+    fn workspace_symbols(
+        &mut self,
+        _query: &str,
+    ) -> Result<Box<[crate::LspSymbolInfo]>, crate::BoxError> {
+        Ok(Box::new([]))
+    }
+
+    /// Whether the server has finished indexing (FR-LSP-11).
+    fn readiness(&self) -> crate::LspReadiness {
+        crate::LspReadiness::Ready
+    }
 }
 
 /// A persisted agent session transcript.

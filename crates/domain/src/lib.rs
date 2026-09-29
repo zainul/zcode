@@ -26,8 +26,9 @@ pub mod tokens;
 pub use context_window::{parse_window_from_error, WindowEntry, WindowTable};
 pub use error::DomainError;
 pub use model::{
-    AgentContext, AgentMode, CancelFlag, FileEdit, ImageRef, LspLocation, LspPosition, LspRange,
-    LspTextEdit, LspWorkspaceEdit, Plugin, ShellCommand, Task, TaskStatus,
+    AgentContext, AgentMode, CancelFlag, FileEdit, ImageRef, LspDiagnostic, LspLocation,
+    LspPosition, LspRange, LspReadiness, LspSymbolInfo, LspTextEdit, LspWorkspaceEdit, Plugin,
+    ShellCommand, Task, TaskStatus,
 };
 pub use naming::{canonical_tool_name, tool_category, tool_category_for_call};
 #[allow(deprecated)]

@@ -961,6 +961,7 @@ dependencies = [
  "domain",
  "lsp-types",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
