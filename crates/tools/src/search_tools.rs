@@ -801,4 +801,30 @@ mod tests {
         assert!(res.content.contains("gen/  (55 files)"), "{}", res.content);
         assert!(!res.content.contains("f000.txt"));
     }
+
+    /// FR-READ-03: one line-number convention across tools — a line `grep`
+    /// reports is the line `read` returns at that offset.
+    #[test]
+    fn a_grep_line_number_addresses_the_same_line_in_read() {
+        let dir = project();
+        let (mut grep, _) = grep_tool(dir.path());
+        let hit = run(
+            &mut grep,
+            serde_json::json!({ "pattern": "needle three", "output": "content" }),
+        );
+        let line: u32 = hit
+            .content
+            .lines()
+            .find_map(|l| l.split('│').next()?.trim().parse().ok())
+            .expect("a gutter line number");
+        let mut read = crate::native::ReadTool::new(dir.path().to_path_buf());
+        let got = read
+            .call(
+                "read",
+                &serde_json::json!({ "path": "src/main.rs", "offset": line, "limit": 1 })
+                    .to_string(),
+            )
+            .unwrap();
+        assert!(got.content.contains("// needle three"), "{}", got.content);
+    }
 }

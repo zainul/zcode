@@ -937,6 +937,7 @@ name = "infra-filesystem"
 version = "0.6.0"
 dependencies = [
  "domain",
+ "log",
  "tempfile",
  "thiserror 1.0.69",
 ]

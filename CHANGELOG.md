@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — `read` returns line ranges with line numbers (FR-READ-01..04)
+
+`read` takes `offset` (1-based) and `limit`, and every line it returns
+carries its number (`  42│…`) — the same numbers `grep` reports, so a hit can
+be read with `offset` and no counting. A file longer than `read.default_limit`
+(400 lines) read without a range returns its first 400 lines and a footer
+saying how to get the rest, instead of all of it; a range that stops short of
+the end names the next offset. Binary files are refused with their size, lines
+over 2 000 characters are clipped, and `str_replace_editor view` accepts
+`view_range: [start, end]` (`-1` = end of file) through the same reader.
+
+### Changed — long tool output keeps its end, and is kept in full on disk (FR-READ-05/07)
+
+Output over `max_tool_output_chars` used to keep only its head — but compiler
+errors and test summaries come *last*, so the part the model needed was the
+part cut, and it re-ran the command to see it. Now the first 40% and last 60%
+of the budget are kept, cut at line breaks, with a marker counting what was
+omitted. The full output is written to `.zcode/spill/<session>/<call>.txt`
+and the marker names that path, so the model can `grep` or `read` the rest;
+spill directories are pruned after `context.spill_ttl_days` (7). A failed
+spill never fails the run.
+
 ### Added — `grep` and `glob` tools on ripgrep's engine, in every mode (FR-SEARCH, FR-GLOB)
 
 Until now the only way to search was `shell` — refused in `planning` and

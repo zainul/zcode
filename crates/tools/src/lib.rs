@@ -275,7 +275,9 @@ impl ToolRegistry {
         // §8): discover/inspect tools first, then the ones that change things.
         #[allow(unused_mut)]
         let mut registry = Self::new(root.clone())
-            .with_native(Box::new(ReadTool::new(root.clone())))
+            .with_native(Box::new(
+                ReadTool::new(root.clone()).with_default_limit(cfg.read.default_limit),
+            ))
             .with_search(
                 search.clone(),
                 cfg.search.max_file_bytes,
@@ -772,7 +774,7 @@ mod tests {
         );
 
         let native = registry.call(TOOL_READ, r#"{"path":"a.txt"}"#).unwrap();
-        assert_eq!(native.content, "body");
+        assert_eq!(native.content, "1│body");
 
         let mcp = registry
             .call("mcp__everything__search", r#"{"q":"x"}"#)

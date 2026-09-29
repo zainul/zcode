@@ -11,8 +11,8 @@ use std::time::Instant;
 use domain::{
     modes, AgentContext, AgentMode, CancelFlag, Emitter, ExtraField, ImageRef, LlmEvent, LlmFinish,
     LlmFinishReason, LlmMessage, LlmPort, LlmRequest, LlmRole, LlmToolCall, LlmToolResult,
-    LogLevel, LoggerPort, MessageMeta, Session, SessionStorePort, TelemetryEvent, TelemetryPort,
-    TelemetryTotals, ToolRegistryPort, ToolSpec, UiEvent,
+    LogLevel, LoggerPort, MessageMeta, Session, SessionStorePort, SpillPort, TelemetryEvent,
+    TelemetryPort, TelemetryTotals, ToolRegistryPort, ToolSpec, UiEvent,
 };
 
 #[derive(thiserror::Error, Debug)]
@@ -182,6 +182,9 @@ pub struct App {
     logger: Box<dyn LoggerPort + Send>,
     emitter: Box<dyn Emitter + Send>,
     cancel: CancelFlag,
+    /// Where over-budget tool output is kept in full (FR-READ-07). Optional:
+    /// without it, a cut result says to re-run the call instead.
+    spill: Option<Box<dyn SpillPort + Send>>,
 }
 
 impl App {
@@ -202,7 +205,13 @@ impl App {
             logger,
             emitter: Box::new(NullEmitter),
             cancel: CancelFlag::default(),
+            spill: None,
         }
+    }
+
+    /// Keep the full text of over-budget tool output (FR-READ-07).
+    pub fn set_spill(&mut self, spill: Box<dyn SpillPort + Send>) {
+        self.spill = Some(spill);
     }
 
     /// Point the loop at a different provider client.
@@ -825,8 +834,23 @@ impl AgentLoop for App {
                 };
                 // FR-LOOP-04: cap the result *before* it enters the history so
                 // the transcript can never balloon past the configured budget.
+                // What is cut is spilled first, so it stays reachable
+                // (FR-READ-07); a spill failure costs only that pointer.
+                let over_budget = req.max_tool_output_chars > 0
+                    && payload.chars().count() > req.max_tool_output_chars;
+                let spill_path = match (&mut self.spill, over_budget) {
+                    (Some(store), true) => match store.spill(&session.id, &call.id, &payload) {
+                        Ok(path) => Some(path),
+                        Err(e) => {
+                            self.logger
+                                .log(LogLevel::Warn, &format!("could not spill tool output: {e}"));
+                            None
+                        }
+                    },
+                    _ => None,
+                };
                 let (payload, was_truncated) =
-                    truncate_tool_output(payload, req.max_tool_output_chars);
+                    shape_tool_output(payload, req.max_tool_output_chars, spill_path.as_deref());
                 let payload_tokens = domain::estimate_tokens(&payload);
                 let category = domain::tool_category_for_call(&call.name, &call.arguments);
 
@@ -860,7 +884,7 @@ impl AgentLoop for App {
                         ),
                         ("chars".into(), ExtraField::Number(payload.len() as f64)),
                         ("category".into(), ExtraField::Text(category.into())),
-                        ("spilled".into(), ExtraField::Bool(false)),
+                        ("spilled".into(), ExtraField::Bool(spill_path.is_some())),
                         ("output".into(), ExtraField::Text(payload.clone())),
                     ],
                 );
@@ -873,6 +897,7 @@ impl AgentLoop for App {
                     step: u32::try_from(steps).unwrap_or(u32::MAX),
                     subject,
                     tokens_est: u32::try_from(payload_tokens).unwrap_or(u32::MAX),
+                    spill: spill_path,
                     ..MessageMeta::default()
                 };
                 history.push(message);
@@ -973,14 +998,67 @@ fn reason_str(reason: LlmFinishReason) -> &'static str {
     }
 }
 
-/// Trim a tool result to `max_chars`, respecting UTF-8 boundaries, and say
-/// whether anything was dropped (FR-LOOP-04).
+/// Cap a tool result at `max_chars` characters, keeping the head **and** the
+/// tail (FR-READ-05), and say whether anything was dropped (FR-LOOP-04).
 pub fn truncate_tool_output(content: String, max_chars: usize) -> (String, bool) {
-    if max_chars == 0 || content.chars().count() <= max_chars {
+    shape_tool_output(content, max_chars, None)
+}
+
+/// Byte offset of the `n`th character (or the end).
+fn char_offset(s: &str, n: usize) -> usize {
+    s.char_indices().nth(n).map_or(s.len(), |(i, _)| i)
+}
+
+/// Cap `content` at `max_chars` characters: the first 40% and the last 60%
+/// of the budget, joined by a marker saying what was omitted and — when the
+/// full text was spilled — where it is (FR-READ-05/07).
+///
+/// v0.6 kept only the head. Compiler errors and test summaries come at the
+/// *end* of long output, so the part the model needed was the part cut, and
+/// it re-ran the command to see it. Cuts snap to a nearby line break so no
+/// line is split mid-way.
+pub fn shape_tool_output(
+    content: String,
+    max_chars: usize,
+    spill_path: Option<&str>,
+) -> (String, bool) {
+    let total = content.chars().count();
+    if max_chars == 0 || total <= max_chars {
         return (content, false);
     }
-    let mut out: String = content.chars().take(max_chars).collect();
-    out.push_str("\n...[truncated]");
+    const SNAP: usize = 200;
+    let head_chars = max_chars * 2 / 5;
+    let tail_chars = max_chars - head_chars;
+    let mut head_end = char_offset(&content, head_chars);
+    if let Some(nl) = content[..head_end].rfind('\n') {
+        if head_end - nl <= SNAP {
+            head_end = nl + 1;
+        }
+    }
+    let mut tail_start = char_offset(&content, total - tail_chars);
+    if let Some(nl) = content[tail_start..].find('\n') {
+        if nl < SNAP {
+            tail_start += nl + 1;
+        }
+    }
+    let tail_start = tail_start.max(head_end);
+    let omitted = &content[head_end..tail_start];
+    let where_ = match spill_path {
+        Some(p) => format!("; full output: {p} — grep or read it for the rest"),
+        None => "; re-run the call to see it".to_string(),
+    };
+    let marker = format!(
+        "…[omitted {} lines / {} chars{where_}]…\n",
+        omitted.matches('\n').count(),
+        omitted.chars().count()
+    );
+    let mut out = String::with_capacity(head_end + marker.len() + content.len() - tail_start + 1);
+    out.push_str(&content[..head_end]);
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&marker);
+    out.push_str(&content[tail_start..]);
     (out, true)
 }
 
@@ -1404,15 +1482,137 @@ mod tests {
             .find(|m| m.role == LlmRole::Tool)
             .expect("tool message");
         let content = &tool_msg.tool_result.as_ref().unwrap().content;
-        assert!(content.ends_with("...[truncated]"));
-        assert!(content.chars().count() < 16_100, "cap not applied");
+        assert!(content.contains("…[omitted "), "{}", &content[..200]);
+        assert!(content.chars().count() < 16_200, "cap not applied");
+    }
+
+    #[test]
+    fn shaping_keeps_the_head_and_the_tail_with_a_marker() {
+        let body: String = (1..=5_000).map(|i| format!("line {i}\n")).collect();
+        let (out, cut) = shape_tool_output(body, 2_000, None);
+        assert!(cut);
+        assert!(out.starts_with("line 1\n"));
+        assert!(out.ends_with("line 5000\n"));
+        let marker = out.lines().find(|l| l.starts_with("…[omitted ")).unwrap();
+        assert!(marker.contains(" lines / "), "{marker}");
+        assert!(marker.contains("re-run the call"), "{marker}");
+        // Cuts land on line breaks: every kept line is whole.
+        for l in out.lines().filter(|l| !l.starts_with('…')) {
+            assert!(l.starts_with("line "), "split line: {l:?}");
+        }
+    }
+
+    /// The case that motivated head+tail: the error is at the end.
+    #[test]
+    fn a_compiler_error_at_the_end_of_long_output_survives() {
+        let mut cargo: String = "   Compiling crate-x v0.1.0\n".repeat(3_000);
+        cargo.push_str("error[E0308]: mismatched types\n --> src/lib.rs:4:18\n");
+        let (out, cut) = shape_tool_output(cargo, 32_000, Some(".zcode/spill/s/c.txt"));
+        assert!(cut);
+        assert!(out.contains("error[E0308]: mismatched types"));
+        assert!(out.contains("full output: .zcode/spill/s/c.txt"));
+    }
+
+    #[test]
+    fn shaping_never_splits_a_character() {
+        let s = "日本語のテキスト".repeat(500);
+        for max in [7, 100, 333, 1_001] {
+            let (out, _) = shape_tool_output(s.clone(), max, None);
+            assert!(out.is_char_boundary(out.len()));
+        }
+        assert_eq!(
+            shape_tool_output("short".into(), 100, None),
+            ("short".into(), false)
+        );
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingSpill(Arc<Mutex<Vec<(String, String, usize)>>>, bool);
+    impl SpillPort for RecordingSpill {
+        fn spill(
+            &mut self,
+            session: &str,
+            call_id: &str,
+            content: &str,
+        ) -> Result<String, BoxError> {
+            if self.1 {
+                return Err("disk full".into());
+            }
+            self.0
+                .lock()
+                .unwrap()
+                .push((session.into(), call_id.into(), content.len()));
+            Ok(format!(".zcode/spill/{session}/{call_id}.txt"))
+        }
+    }
+
+    #[test]
+    fn over_budget_output_is_spilled_and_the_marker_names_the_file() {
+        let big = "x\n".repeat(20_000);
+        let mut h = harness(
+            vec![
+                tool_use_turn("c1", "shell", "{}"),
+                vec![LlmEvent::Finish(finish(LlmFinishReason::Stop))],
+            ],
+            &big,
+        );
+        let spill = RecordingSpill::default();
+        h.app.set_spill(Box::new(spill.clone()));
+        let mut req = ExecutionRequest::new("go");
+        req.max_tool_output_chars = 1_000;
+        let result = h.app.execute(&ctx(), req).unwrap();
+        let recorded = spill.0.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].2, big.len(), "the *full* text is spilled");
+        let session = h.sessions.load(&result.session_id).unwrap();
+        let msg = session
+            .messages
+            .iter()
+            .find(|m| m.role == LlmRole::Tool)
+            .unwrap();
+        let content = &msg.tool_result.as_ref().unwrap().content;
+        assert!(content.contains("full output: .zcode/spill/"), "{content}");
+        assert_eq!(
+            msg.meta.spill.as_deref(),
+            Some(&*format!(".zcode/spill/{}/c1.txt", result.session_id))
+        );
+    }
+
+    #[test]
+    fn a_spill_failure_does_not_fail_the_run() {
+        let mut h = harness(
+            vec![
+                tool_use_turn("c1", "shell", "{}"),
+                vec![LlmEvent::Finish(finish(LlmFinishReason::Stop))],
+            ],
+            &"y".repeat(5_000),
+        );
+        h.app
+            .set_spill(Box::new(RecordingSpill(Default::default(), true)));
+        let mut req = ExecutionRequest::new("go");
+        req.max_tool_output_chars = 500;
+        let result = h.app.execute(&ctx(), req).unwrap();
+        let session = h.sessions.load(&result.session_id).unwrap();
+        let msg = session
+            .messages
+            .iter()
+            .find(|m| m.role == LlmRole::Tool)
+            .unwrap();
+        assert!(msg
+            .tool_result
+            .as_ref()
+            .unwrap()
+            .content
+            .contains("re-run the call"));
+        assert_eq!(msg.meta.spill, None);
     }
 
     #[test]
     fn truncate_helper_respects_char_boundaries() {
         let (out, cut) = truncate_tool_output("héllo wörld".into(), 5);
         assert!(cut);
-        assert!(out.starts_with("héllo"));
+        assert!(out.starts_with("hé"), "{out}");
+        assert!(out.ends_with("rld"), "{out}");
         let (out, cut) = truncate_tool_output("short".into(), 100);
         assert!(!cut);
         assert_eq!(out, "short");

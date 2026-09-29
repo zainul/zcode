@@ -508,7 +508,7 @@ pub fn wire_with_format(
         }),
     };
 
-    Ok(App::new(
+    let mut app = App::new(
         llm,
         Box::new(registry),
         Box::new(sessions),
@@ -516,7 +516,13 @@ pub fn wire_with_format(
         Box::new(StdLogger::new()),
     )
     .with_pricing(cfg.price_table())
-    .with_context_window(resolve_context_window(cfg).0))
+    .with_context_window(resolve_context_window(cfg).0);
+    // FR-READ-07: over-budget tool output is kept in full under .zcode/spill.
+    app.set_spill(Box::new(infra_filesystem::SpillStore::new(
+        &cfg.working_dir,
+        cfg.context.spill_ttl_days,
+    )));
+    Ok(app)
 }
 
 /// Sends every event to two ports. Only `report` writes the report file, so

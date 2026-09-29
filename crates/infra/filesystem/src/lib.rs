@@ -1,5 +1,8 @@
 //! Filesystem adapter backed by `std::fs`.
 
+pub mod spill;
+pub use spill::SpillStore;
+
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::{fs, io};
