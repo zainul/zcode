@@ -16,7 +16,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use domain::{
-    AgentMode, LlmMessage, LlmRole, LlmToolCall, LlmToolResult, Session, SessionStorePort,
+    AgentMode, LlmMessage, LlmRole, LlmToolCall, LlmToolResult, MessageKind, MessageMeta, Session,
+    SessionStorePort, Subject,
 };
 use serde::{Deserialize, Serialize};
 
@@ -148,6 +149,151 @@ struct SerializableMessage {
     tool_calls: Vec<SerializableToolCall>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_result: Option<SerializableToolResult>,
+    /// Engine metadata (CE-DQ3). Optional on disk: files written before it
+    /// existed load with the default, and a default is not written at all.
+    #[serde(default, skip_serializing_if = "MetaFile::is_default")]
+    meta: MetaFile,
+}
+
+/// Mirror of `domain::MessageMeta`.
+#[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
+struct MetaFile {
+    #[serde(default, skip_serializing_if = "is_zero")]
+    step: u32,
+    #[serde(default, skip_serializing_if = "KindFile::is_normal")]
+    kind: KindFile,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    subject: Option<SubjectFile>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    tokens_est: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    spill: Option<String>,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+impl MetaFile {
+    fn is_default(&self) -> bool {
+        *self == MetaFile::default()
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum KindFile {
+    #[default]
+    Normal,
+    Summary,
+    Elided,
+}
+
+impl KindFile {
+    fn is_normal(&self) -> bool {
+        *self == KindFile::Normal
+    }
+}
+
+/// Mirror of `domain::Subject`, internally tagged so it reads naturally.
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum SubjectFile {
+    FileRange {
+        path: String,
+        start: u32,
+        end: u32,
+        hash: u64,
+    },
+    FileWrite {
+        path: String,
+    },
+    Diagnostics {
+        #[serde(default)]
+        path: Option<String>,
+    },
+    Listing {
+        path: String,
+    },
+    Search {
+        key: u64,
+    },
+}
+
+impl From<&MessageMeta> for MetaFile {
+    fn from(m: &MessageMeta) -> Self {
+        Self {
+            step: m.step,
+            kind: match m.kind {
+                MessageKind::Normal => KindFile::Normal,
+                MessageKind::Summary => KindFile::Summary,
+                MessageKind::Elided => KindFile::Elided,
+            },
+            subject: m.subject.as_ref().map(SubjectFile::from),
+            tokens_est: m.tokens_est,
+            spill: m.spill.clone(),
+        }
+    }
+}
+
+impl From<MetaFile> for MessageMeta {
+    fn from(m: MetaFile) -> Self {
+        Self {
+            step: m.step,
+            kind: match m.kind {
+                KindFile::Normal => MessageKind::Normal,
+                KindFile::Summary => MessageKind::Summary,
+                KindFile::Elided => MessageKind::Elided,
+            },
+            subject: m.subject.map(Into::into),
+            tokens_est: m.tokens_est,
+            spill: m.spill,
+        }
+    }
+}
+
+impl From<&Subject> for SubjectFile {
+    fn from(s: &Subject) -> Self {
+        match s.clone() {
+            Subject::FileRange {
+                path,
+                start,
+                end,
+                hash,
+            } => Self::FileRange {
+                path,
+                start,
+                end,
+                hash,
+            },
+            Subject::FileWrite { path } => Self::FileWrite { path },
+            Subject::Diagnostics { path } => Self::Diagnostics { path },
+            Subject::Listing { path } => Self::Listing { path },
+            Subject::Search { key } => Self::Search { key },
+        }
+    }
+}
+
+impl From<SubjectFile> for Subject {
+    fn from(s: SubjectFile) -> Self {
+        match s {
+            SubjectFile::FileRange {
+                path,
+                start,
+                end,
+                hash,
+            } => Self::FileRange {
+                path,
+                start,
+                end,
+                hash,
+            },
+            SubjectFile::FileWrite { path } => Self::FileWrite { path },
+            SubjectFile::Diagnostics { path } => Self::Diagnostics { path },
+            SubjectFile::Listing { path } => Self::Listing { path },
+            SubjectFile::Search { key } => Self::Search { key },
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -243,6 +389,7 @@ impl SerializableMessage {
                 .map(SerializableToolCall::from)
                 .collect(),
             tool_result: m.tool_result.as_ref().map(SerializableToolResult::from),
+            meta: MetaFile::from(&m.meta),
         }
     }
 
@@ -257,6 +404,7 @@ impl SerializableMessage {
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
             tool_result: self.tool_result.map(Into::into),
+            meta: self.meta.into(),
         }
     }
 }
@@ -568,6 +716,26 @@ mod tests {
                         arguments: r#"{"command":"echo hi"}"#.into(),
                     }]),
                     tool_result: None,
+                    meta: MessageMeta::default(),
+                },
+                {
+                    let mut read = LlmMessage::tool_result_message(LlmToolResult {
+                        tool_call_id: "call_1".into(),
+                        content: "hi".into(),
+                    });
+                    read.meta = MessageMeta {
+                        step: 3,
+                        kind: MessageKind::Normal,
+                        subject: Some(Subject::FileRange {
+                            path: "src/lib.rs".into(),
+                            start: 1,
+                            end: 40,
+                            hash: 0xfeed_beef,
+                        }),
+                        tokens_est: 12,
+                        spill: Some(".zcode/spill/s/call_1.txt".into()),
+                    };
+                    read
                 },
             ]),
         }
@@ -701,7 +869,7 @@ mod tests {
         let back: SessionFile = serde_json::from_str(&json).unwrap();
         let restored = back.into_session();
         assert_eq!(restored.step_count, 3);
-        assert_eq!(restored.messages.len(), 2);
+        assert_eq!(restored.messages.len(), session.messages.len());
     }
 
     /// A plain name is a legitimate id (see `is_safe_id`) — asking for one
@@ -763,5 +931,33 @@ mod tests {
         let s = now_iso();
         assert!(s.ends_with('Z'));
         assert_eq!(s.len(), 20);
+    }
+
+    #[test]
+    fn message_meta_round_trips_through_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = UuidSessionStore::new(dir.path().join("sessions"));
+        let id = store.create().unwrap();
+        store.checkpoint(&id, &with_two_messages(&id, 3)).unwrap();
+        let loaded = store.load(&id).unwrap();
+        let original = with_two_messages(&id, 3);
+        for (a, b) in loaded.messages.iter().zip(original.messages.iter()) {
+            assert_eq!(a.meta, b.meta);
+        }
+    }
+
+    #[test]
+    fn default_meta_is_not_written_and_v1_files_without_it_load() {
+        let file = SessionFile::from_session(&with_two_messages("x", 1));
+        let json = serde_json::to_string(&file).unwrap();
+        // Only the one message that carries metadata writes a `meta` key.
+        assert_eq!(json.matches("\"meta\"").count(), 1, "{json}");
+
+        let v1 = r#"{"version":1,"id":"x","created_at":"t","model":"m","mode":"auto",
+            "last_message_at":"t","step_count":1,
+            "messages":[{"role":"user","content":"hi"}]}"#;
+        let parsed: SessionFile = serde_json::from_str(v1).unwrap();
+        let session = parsed.into_session();
+        assert_eq!(session.messages[0].meta, MessageMeta::default());
     }
 }

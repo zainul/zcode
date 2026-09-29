@@ -175,6 +175,15 @@ impl PriceTable {
 
     /// Estimate the cost of one run. Unknown models yield `priced: false`
     /// rather than a misleading zero.
+    /// Whether `model`'s provider counts cached tokens inside `input_tokens`
+    /// (see [`PriceEntry::cache_within_input`]). An unknown model answers
+    /// `false`, the Anthropic convention: adding the cache figure to the
+    /// prompt size can over-count, never under-count, which is the safe
+    /// direction for anything guarding a context window.
+    pub fn cache_within_input(&self, model: &str) -> bool {
+        self.lookup(model).is_some_and(|e| e.cache_within_input)
+    }
+
     pub fn estimate(&self, model: &str, input: u64, output: u64, cache: u64) -> Cost {
         let entry = match self.lookup(model) {
             Some(entry) => entry,

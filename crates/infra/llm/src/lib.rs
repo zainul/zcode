@@ -925,10 +925,7 @@ impl OpenAiShapeLlm {
 /// (e.g. right after `/provider` in the TUI) has not been through `app`'s own
 /// pre-flight clamp yet on its very first call.
 fn estimate_prompt_tokens(req: &LlmRequest) -> u64 {
-    req.messages
-        .iter()
-        .map(|m| domain::tokens::estimate_tokens(&m.content))
-        .sum()
+    domain::tokens::estimate_messages(&req.messages)
 }
 
 /// A payload with `max_tokens` overridden — cloned rather than rebuilt so a
@@ -2696,6 +2693,39 @@ mod tests {
     /// OpenRouter (and any cache-aware OpenAI-shaped server) must get a
     /// `cache_control` breakpoint on the request prefix, or every turn re-pays
     /// for the full system prompt + tools.
+    /// CE-DQ3: `MessageMeta` is engine bookkeeping. If it ever reached a
+    /// request body, two transcripts differing only in metadata would render
+    /// different bytes and silently defeat the prompt cache (FR-CACHE-02).
+    #[test]
+    fn request_payload_ignores_message_meta() {
+        let plain = req();
+        let mut tagged = req();
+        let messages: Vec<LlmMessage> = tagged
+            .messages
+            .iter()
+            .cloned()
+            .map(|mut m| {
+                m.meta = domain::MessageMeta {
+                    step: 9,
+                    kind: domain::MessageKind::Summary,
+                    subject: Some(domain::Subject::FileWrite { path: "x".into() }),
+                    tokens_est: 42,
+                    spill: Some("s".into()),
+                };
+                m
+            })
+            .collect();
+        tagged.messages = messages.into_boxed_slice();
+        assert_eq!(
+            build_openai_request(&plain, "gpt-4o", true),
+            build_openai_request(&tagged, "gpt-4o", true)
+        );
+        assert_eq!(
+            build_anthropic_request(&plain, "claude-sonnet-4-5"),
+            build_anthropic_request(&tagged, "claude-sonnet-4-5")
+        );
+    }
+
     #[test]
     fn openai_cache_control_marks_the_last_message() {
         let payload = build_openai_request(&req(), "gpt-4o-mini", true);

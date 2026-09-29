@@ -34,6 +34,7 @@ pub(crate) fn tool_error(message: impl Into<String>) -> ToolResult {
         tool_call_id: String::new(),
         content: String::new(),
         error: Some(message.into()),
+        subject: None,
     }
 }
 

@@ -27,17 +27,18 @@ pub use model::{
     AgentContext, AgentMode, CancelFlag, FileEdit, ImageRef, LspLocation, LspPosition, LspRange,
     LspTextEdit, LspWorkspaceEdit, Plugin, ShellCommand, Task, TaskStatus,
 };
-pub use naming::canonical_tool_name;
+pub use naming::{canonical_tool_name, tool_category, tool_category_for_call};
 #[allow(deprecated)]
 pub use ports::CompletionChunk;
 pub use ports::{
     Emitter, ExtraField, FileSystemPort, LlmEvent, LlmFinish, LlmFinishReason, LlmMessage, LlmPort,
     LlmRequest, LlmResponse, LlmRole, LlmToolCall, LlmToolResult, LogLevel, LoggerPort, LspPort,
-    McpPort, McpToolDef, PluginRegistryPort, RetryNotice, Session, SessionStorePort, ShellPort,
-    TelemetryEvent, TelemetryPort, TelemetryTotals, Tool, ToolRegistryPort, ToolResult, ToolSpec,
-    UiEvent,
+    McpPort, McpToolDef, MessageKind, MessageMeta, PluginRegistryPort, RetryNotice, Session,
+    SessionStorePort, ShellPort, SpillPort, Subject, TelemetryEvent, TelemetryPort,
+    TelemetryTotals, Tool, ToolRegistryPort, ToolResult, ToolSpec, UiEvent,
 };
 pub use pricing::{Cost, PriceEntry, PriceTable};
+pub use tokens::{estimate_messages, estimate_tokens, prompt_size, TokenCalibrator};
 
 /// Shorthand for the canonical domain error box: `Send + Sync` so it crosses
 /// thread boundaries (the engine runs on a worker thread in the TUI).

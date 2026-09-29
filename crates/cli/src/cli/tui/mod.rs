@@ -2473,6 +2473,7 @@ mod tests {
             input_tokens: 7,
             output_tokens: 3,
             cache_tokens: 0,
+            peak_context_tokens: 0,
             cost: Cost {
                 output_usd: 0.5,
                 priced: true,

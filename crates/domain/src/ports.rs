@@ -40,6 +40,59 @@ pub struct LlmMessage {
     pub content: String,
     pub tool_calls: Box<[LlmToolCall]>,
     pub tool_result: Option<LlmToolResult>,
+    /// Engine bookkeeping about this message (CE-DQ3). Request builders never
+    /// serialise it, so it can never change the bytes a provider sees.
+    pub meta: MessageMeta,
+}
+
+/// What kind of message this is, beyond its role. Compaction (FR-CTX-*) uses
+/// it to tell original content from content it has already rewritten.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MessageKind {
+    #[default]
+    Normal,
+    /// A Tier 3 session summary standing in for compacted steps.
+    Summary,
+    /// A tool result or call whose content was replaced by a stub.
+    Elided,
+}
+
+/// What a tool result is *about*, as declared by the tool that produced it.
+///
+/// Only the tool knows that `read` returned lines 1-400 of `src/lib.rs`
+/// without re-parsing its JSON arguments — and `domain` cannot parse JSON
+/// (FR-DI-01). Supersession (FR-CTX-05) is decided from these.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Subject {
+    /// A range of a file's lines (1-based, inclusive) and the content hash of
+    /// the whole file at the time it was read.
+    FileRange {
+        path: String,
+        start: u32,
+        end: u32,
+        hash: u64,
+    },
+    /// The file was created, overwritten or edited.
+    FileWrite { path: String },
+    /// Diagnostics for one file, or for everything open when `None`.
+    Diagnostics { path: Option<String> },
+    /// A directory listing or glob rooted at `path`.
+    Listing { path: String },
+    /// A search, keyed by a hash of its normalised arguments.
+    Search { key: u64 },
+}
+
+/// Per-message metadata carried alongside the transcript (CE-DQ3).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MessageMeta {
+    /// The engine step that produced the message (1-based; 0 = before any step).
+    pub step: u32,
+    pub kind: MessageKind,
+    pub subject: Option<Subject>,
+    /// Estimated tokens of the content when it entered the transcript.
+    pub tokens_est: u32,
+    /// Working-dir-relative path of the full output, when it was spilled.
+    pub spill: Option<String>,
 }
 
 impl LlmMessage {
@@ -49,6 +102,7 @@ impl LlmMessage {
             content: text.into(),
             tool_calls: Box::new([]),
             tool_result: None,
+            meta: MessageMeta::default(),
         }
     }
 
@@ -58,6 +112,7 @@ impl LlmMessage {
             content: text.into(),
             tool_calls: Box::new([]),
             tool_result: None,
+            meta: MessageMeta::default(),
         }
     }
 
@@ -67,6 +122,7 @@ impl LlmMessage {
             content: text.into(),
             tool_calls: Box::new([]),
             tool_result: None,
+            meta: MessageMeta::default(),
         }
     }
 
@@ -76,6 +132,7 @@ impl LlmMessage {
             content: String::new(),
             tool_calls: Box::new([]),
             tool_result: Some(result),
+            meta: MessageMeta::default(),
         }
     }
 
@@ -217,6 +274,9 @@ pub struct ToolResult {
     pub tool_call_id: String,
     pub content: String,
     pub error: Option<String>,
+    /// What the result is about (CE-DQ3); the engine copies it into the
+    /// transcript message's `meta.subject`.
+    pub subject: Option<Subject>,
 }
 
 impl ToolResult {
@@ -225,7 +285,14 @@ impl ToolResult {
             tool_call_id: String::new(),
             content: content.into(),
             error: None,
+            subject: None,
         }
+    }
+
+    /// Attach the subject this result is about.
+    pub fn with_subject(mut self, subject: Subject) -> Self {
+        self.subject = Some(subject);
+        self
     }
 
     pub fn from_tool_call_id(id: &str, content: String) -> Self {
@@ -233,6 +300,7 @@ impl ToolResult {
             tool_call_id: id.into(),
             content,
             error: None,
+            subject: None,
         }
     }
 
@@ -241,6 +309,7 @@ impl ToolResult {
             tool_call_id: tool_call_id.into(),
             content: String::new(),
             error: Some(message.into()),
+            subject: None,
         }
     }
 }
@@ -314,6 +383,18 @@ pub struct Session {
     pub last_message_at: String,
     pub step_count: u64,
     pub messages: Box<[LlmMessage]>,
+}
+
+/// Where the full text of an over-budget tool output is kept (FR-READ-07,
+/// CE-DQ12), so truncation never loses anything the model may need later.
+pub trait SpillPort {
+    /// Store `content` and return the working-dir-relative path it lives at.
+    fn spill(
+        &mut self,
+        session: &str,
+        call_id: &str,
+        content: &str,
+    ) -> Result<String, crate::BoxError>;
 }
 
 /// Session store port (FR-SESSION-01..07, DQ9 UUIDv7).

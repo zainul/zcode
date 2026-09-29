@@ -11,7 +11,7 @@ use std::time::Instant;
 use domain::{
     modes, AgentContext, AgentMode, CancelFlag, Emitter, ExtraField, ImageRef, LlmEvent, LlmFinish,
     LlmFinishReason, LlmMessage, LlmPort, LlmRequest, LlmRole, LlmToolCall, LlmToolResult,
-    LogLevel, LoggerPort, Session, SessionStorePort, TelemetryEvent, TelemetryPort,
+    LogLevel, LoggerPort, MessageMeta, Session, SessionStorePort, TelemetryEvent, TelemetryPort,
     TelemetryTotals, ToolRegistryPort, ToolSpec, UiEvent,
 };
 
@@ -85,6 +85,9 @@ pub struct ExecutionResult {
     /// Estimated spend for this run. `priced` is false when the model is not
     /// in the price table, so the UI can say "n/a" rather than "$0.00".
     pub cost: domain::Cost,
+    /// The largest live context seen before any request in this run
+    /// (FR-BUDGET-04, PRD M7), in calibrated tokens.
+    pub peak_context_tokens: u64,
 }
 
 /// The engine contract both interfaces drive (FR-IFACE-03).
@@ -311,8 +314,10 @@ impl App {
         totals: (u64, u64, u64),
         reported_cost_usd: Option<f64>,
         started: Instant,
+        peak_context_tokens: u64,
     ) {
         let (input_tokens, output_tokens, cache_tokens) = totals;
+        let window = self.context_window.lookup(&session.model);
         let elapsed_ms = started.elapsed().as_millis() as u64;
         // What the provider charged beats what the table guesses: it covers
         // models the table has never seen, which is the case that otherwise
@@ -359,6 +364,18 @@ impl App {
                     match cost.priced {
                         true => ExtraField::Number(cost.total_usd()),
                         false => ExtraField::Null,
+                    },
+                ),
+                // FR-BUDGET-04 / PRD M7: how full the context got.
+                (
+                    "peak_context_tokens".into(),
+                    ExtraField::Number(peak_context_tokens as f64),
+                ),
+                (
+                    "context_window".into(),
+                    match window {
+                        Some(w) => ExtraField::Number(w as f64),
+                        None => ExtraField::Null,
                     },
                 ),
             ]),
@@ -411,6 +428,13 @@ impl AgentLoop for App {
         // means no call reported one, so the local price table is the only
         // estimate available.
         let mut reported_cost_usd: Option<f64> = None;
+        // Live-context accounting (FR-BUDGET-02/03, CE-DQ10): anchored on the
+        // provider's last reported prompt size, with only the messages added
+        // since then estimated — and that estimate corrected by what the
+        // provider's reports have taught the calibrator.
+        let cache_within_input = self.pricing.cache_within_input(&session.model);
+        let mut budget = ContextBudget::default();
+        let mut peak_context_tokens: u64 = 0;
         let mut final_text = String::new();
         let finish_reason;
         let mut truncated = false;
@@ -434,6 +458,7 @@ impl AgentLoop for App {
                     (input_tokens, output_tokens, cache_tokens),
                     reported_cost_usd,
                     started,
+                    peak_context_tokens,
                 );
                 return Err(AppError::Interrupted);
             }
@@ -449,6 +474,7 @@ impl AgentLoop for App {
                         (input_tokens, output_tokens, cache_tokens),
                         reported_cost_usd,
                         started,
+                        peak_context_tokens,
                     );
                     return Err(AppError::Timeout(limit));
                 }
@@ -481,13 +507,12 @@ impl AgentLoop for App {
             // ordinary tool result into a 400. Known models get their request
             // clamped to what is actually left; an unknown model is sent
             // exactly what was configured, as before.
-            let estimated_prompt_tokens: u64 = history
-                .iter()
-                .map(|m| domain::tokens::estimate_tokens(&m.content))
-                .sum();
+            let estimated_prompt_tokens = budget.live_tokens(&history);
+            peak_context_tokens = peak_context_tokens.max(estimated_prompt_tokens);
             let max_tokens =
                 self.context_window
                     .clamp(&session.model, req.max_tokens, estimated_prompt_tokens);
+            let sent_len = history.len();
 
             let llm_request = LlmRequest {
                 messages: history.clone().into_boxed_slice(),
@@ -625,11 +650,12 @@ impl AgentLoop for App {
             input_tokens += if finish.input_tokens > 0 {
                 finish.input_tokens
             } else {
-                history
-                    .iter()
-                    .map(|m| domain::tokens::estimate_tokens(&m.content))
-                    .sum()
+                estimated_prompt_tokens
             };
+            budget.observe(
+                domain::prompt_size(&finish, cache_within_input),
+                &history[..sent_len.min(history.len())],
+            );
             output_tokens += if finish.output_tokens > 0 {
                 finish.output_tokens
             } else {
@@ -707,6 +733,7 @@ impl AgentLoop for App {
                         (input_tokens, output_tokens, cache_tokens),
                         reported_cost_usd,
                         started,
+                        peak_context_tokens,
                     );
                     return Err(AppError::Tool(message));
                 }
@@ -725,11 +752,11 @@ impl AgentLoop for App {
                 let call_started = std::time::Instant::now();
                 let outcome = self.tools.call(&call.name, &call.arguments);
                 let elapsed_ms = call_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
-                let (content, error) = match outcome {
-                    Ok(result) => (result.content, result.error),
+                let (content, error, subject) = match outcome {
+                    Ok(result) => (result.content, result.error, result.subject),
                     // A registry-level failure is reported to the model as a
                     // tool error so the loop can continue (NFR-REL-01).
-                    Err(e) => (String::new(), Some(e.to_string())),
+                    Err(e) => (String::new(), Some(e.to_string()), None),
                 };
                 let payload = match &error {
                     Some(message) => format!("error: {message}"),
@@ -739,6 +766,8 @@ impl AgentLoop for App {
                 // the transcript can never balloon past the configured budget.
                 let (payload, was_truncated) =
                     truncate_tool_output(payload, req.max_tool_output_chars);
+                let payload_tokens = domain::estimate_tokens(&payload);
+                let category = domain::tool_category_for_call(&call.name, &call.arguments);
 
                 self.emitter.emit(UiEvent::ToolResult {
                     tool_call_id: call.id.clone(),
@@ -763,14 +792,29 @@ impl AgentLoop for App {
                         ),
                         ("truncated".into(), ExtraField::Bool(was_truncated)),
                         ("duration_ms".into(), ExtraField::Number(elapsed_ms as f64)),
+                        // FR-BUDGET-01: what this result costs in context.
+                        (
+                            "tokens_est".into(),
+                            ExtraField::Number(payload_tokens as f64),
+                        ),
+                        ("chars".into(), ExtraField::Number(payload.len() as f64)),
+                        ("category".into(), ExtraField::Text(category.into())),
+                        ("spilled".into(), ExtraField::Bool(false)),
                         ("output".into(), ExtraField::Text(payload.clone())),
                     ],
                 );
 
-                history.push(LlmMessage::tool_result_message(LlmToolResult {
+                let mut message = LlmMessage::tool_result_message(LlmToolResult {
                     tool_call_id: call.id.clone(),
                     content: payload,
-                }));
+                });
+                message.meta = MessageMeta {
+                    step: u32::try_from(steps).unwrap_or(u32::MAX),
+                    subject,
+                    tokens_est: u32::try_from(payload_tokens).unwrap_or(u32::MAX),
+                    ..MessageMeta::default()
+                };
+                history.push(message);
             }
 
             // FR-SESSION-06: a crash after this point resumes from here.
@@ -795,6 +839,7 @@ impl AgentLoop for App {
             (input_tokens, output_tokens, cache_tokens),
             reported_cost_usd,
             started,
+            peak_context_tokens,
         );
 
         let cost = match reported_cost_usd {
@@ -814,7 +859,48 @@ impl AgentLoop for App {
             output_tokens,
             cache_tokens,
             cost,
+            peak_context_tokens,
         })
+    }
+}
+
+/// Live-context accounting for one run (FR-BUDGET-02/03, CE-DQ10).
+///
+/// The provider's own report of how big the last prompt was is the anchor;
+/// only what has been appended since is estimated, and that estimate is
+/// corrected by a calibrator that learns from each report. Summing a
+/// heuristic over the whole transcript — the v0.2 approach — drifts further
+/// from reality with every step.
+#[derive(Default)]
+struct ContextBudget {
+    calibrator: domain::TokenCalibrator,
+    /// (reported prompt tokens, transcript length that prompt covered).
+    last_prompt: Option<(u64, usize)>,
+}
+
+impl ContextBudget {
+    fn live_tokens(&self, history: &[LlmMessage]) -> u64 {
+        match self.last_prompt {
+            Some((reported, covered)) if covered <= history.len() => {
+                reported
+                    + self
+                        .calibrator
+                        .apply(domain::tokens::estimate_messages(&history[covered..]))
+            }
+            _ => self
+                .calibrator
+                .apply(domain::tokens::estimate_messages(history)),
+        }
+    }
+
+    /// `sent` is exactly the transcript the reported prompt was built from.
+    fn observe(&mut self, reported: u64, sent: &[LlmMessage]) {
+        if reported == 0 {
+            return;
+        }
+        self.calibrator
+            .observe(reported, domain::tokens::estimate_messages(sent));
+        self.last_prompt = Some((reported, sent.len()));
     }
 }
 
@@ -920,6 +1006,7 @@ mod tests {
     struct FakeTools {
         calls: RecordedCalls,
         response: String,
+        subject: Option<domain::Subject>,
     }
 
     impl ToolRegistryPort for FakeTools {
@@ -939,7 +1026,9 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((name.to_string(), args_json.to_string()));
-            Ok(ToolResult::ok(&self.response))
+            let mut result = ToolResult::ok(&self.response);
+            result.subject = self.subject.clone();
+            Ok(result)
         }
         fn is_native(&self, name: &str) -> bool {
             !name.starts_with("mcp__") && !name.starts_with("lsp__")
@@ -1040,6 +1129,7 @@ mod tests {
             Box::new(FakeTools {
                 calls: tool_calls.clone(),
                 response: tool_response.to_string(),
+                subject: None,
             }),
             Box::new(sessions.clone()),
             Box::new(telemetry.clone()),
@@ -1395,6 +1485,7 @@ mod tests {
             Box::new(FakeTools {
                 calls: RecordedCalls::default(),
                 response: String::new(),
+                subject: None,
             }),
             Box::new(FakeSessions::default()),
             Box::new(FakeTelemetry::default()),
@@ -1482,6 +1573,116 @@ mod tests {
         assert_eq!(result.input_tokens, 20);
         assert_eq!(result.output_tokens, 10);
         assert_eq!(result.cache_tokens, 2);
+    }
+
+    /// The number an extra field carries on the last event of `kind`.
+    fn last_extra_number(telemetry: &FakeTelemetry, kind: &str, key: &str) -> Option<f64> {
+        telemetry
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|e| e.kind == kind)
+            .and_then(|e| {
+                e.extra
+                    .iter()
+                    .find_map(|(k, v)| match (k.as_str() == key, v) {
+                        (true, ExtraField::Number(n)) => Some(*n),
+                        _ => None,
+                    })
+            })
+    }
+
+    #[test]
+    fn tool_result_telemetry_carries_budget_fields() {
+        let mut h = harness(
+            vec![
+                tool_use_turn("c1", "read", r#"{"path":"a.rs"}"#),
+                vec![LlmEvent::Finish(finish(LlmFinishReason::Stop))],
+            ],
+            &"fn a() {}\n".repeat(50),
+        );
+        h.app.execute(&ctx(), ExecutionRequest::new("go")).unwrap();
+        let tokens = last_extra_number(&h.telemetry, "tool_result", "tokens_est").unwrap();
+        assert!(tokens > 50.0, "{tokens}");
+        assert_eq!(
+            last_extra_number(&h.telemetry, "tool_result", "chars"),
+            Some(500.0)
+        );
+        assert_eq!(
+            last_extra_text(&h.telemetry, "tool_result", "category").as_deref(),
+            Some("inspect")
+        );
+    }
+
+    #[test]
+    fn tool_result_message_carries_subject_step_and_size() {
+        let llm = FakeLlm::new(vec![
+            tool_use_turn("c1", "read", r#"{"path":"a.rs"}"#),
+            vec![LlmEvent::Finish(finish(LlmFinishReason::Stop))],
+        ]);
+        let sessions = FakeSessions::default();
+        let subject = domain::Subject::FileRange {
+            path: "a.rs".into(),
+            start: 1,
+            end: 2,
+            hash: 7,
+        };
+        let mut app = App::new(
+            Box::new(llm),
+            Box::new(FakeTools {
+                calls: RecordedCalls::default(),
+                response: "line one\nline two".into(),
+                subject: Some(subject.clone()),
+            }),
+            Box::new(sessions.clone()),
+            Box::new(FakeTelemetry::default()),
+            Box::new(NullLogger),
+        );
+        let result = app.execute(&ctx(), ExecutionRequest::new("go")).unwrap();
+        let session = sessions.load(&result.session_id).unwrap();
+        let tool_msg = session
+            .messages
+            .iter()
+            .find(|m| m.role == LlmRole::Tool)
+            .unwrap();
+        assert_eq!(tool_msg.meta.subject, Some(subject));
+        assert_eq!(tool_msg.meta.step, 1);
+        assert!(tool_msg.meta.tokens_est > 0);
+    }
+
+    #[test]
+    fn live_context_anchors_on_the_reported_prompt_size() {
+        let mut budget = ContextBudget::default();
+        let sent = vec![LlmMessage::user(&"word ".repeat(100))];
+        // Before any report: a pure (uncalibrated) estimate.
+        assert_eq!(budget.live_tokens(&sent), domain::estimate_messages(&sent));
+        // The provider says that prompt was 10,000 tokens (a big system prompt
+        // and tool schemas the transcript alone does not show).
+        budget.observe(10_000, &sent);
+        let mut grown = sent.clone();
+        grown.push(LlmMessage::assistant("ok"));
+        let live = budget.live_tokens(&grown);
+        assert!(live >= 10_000, "{live}");
+        assert!(live < 10_100, "only the new message is estimated: {live}");
+    }
+
+    #[test]
+    fn peak_context_is_reported_on_finish_and_in_the_result() {
+        let mut h = harness(
+            vec![
+                tool_use_turn("c1", "read", "{}"),
+                vec![LlmEvent::Finish(finish(LlmFinishReason::Stop))],
+            ],
+            "ok",
+        );
+        let result = h.app.execute(&ctx(), ExecutionRequest::new("go")).unwrap();
+        assert!(result.peak_context_tokens > 0);
+        assert_eq!(
+            last_extra_number(&h.telemetry, "finish", "peak_context_tokens"),
+            Some(result.peak_context_tokens as f64)
+        );
     }
 
     #[test]
