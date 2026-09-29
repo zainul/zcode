@@ -1,0 +1,20 @@
+[package]
+name = "zcode-evals"
+description = "Token-efficiency evaluation harness for zcode (FR-BUDGET-07, PRD-CTX-EFF-003 §10)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "zcode-evals"
+path = "src/main.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.10"

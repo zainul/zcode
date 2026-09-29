@@ -1,0 +1,12 @@
+{
+  "name": "shop",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test"
+  },
+  "dependencies": {
+    "next": "15.0.0",
+    "react": "19.0.0"
+  }
+}

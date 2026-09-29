@@ -17,6 +17,9 @@
 //!
 //! Direct deps: domain, serde, serde_json, reqwest, thiserror (L3).
 
+pub mod record;
+pub use record::{RecordingLlm, ReplayLlm};
+
 use std::collections::{HashSet, VecDeque};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};

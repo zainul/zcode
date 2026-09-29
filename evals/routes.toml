@@ -1,0 +1,15 @@
+# Live evaluation routes (PRD-CTX-EFF-003 §10.2). One Anthropic-native model
+# and one OpenAI-shaped route with prompt caching. Pin the model ids for a
+# comparison: a baseline and a candidate must use the same routes.
+
+[[route]]
+name = "anthropic-sonnet"
+model = "anthropic/claude-sonnet-4-5"
+key_env = "ZCODE_ANTHROPIC_API_KEY"
+family = "anthropic"
+
+[[route]]
+name = "openai-mini"
+model = "openai/gpt-4.1-mini"
+key_env = "ZCODE_OPENAI_API_KEY"
+family = "openai"

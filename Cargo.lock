@@ -2367,6 +2367,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "zcode-evals"
+version = "0.6.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
 name = "zerocopy"
 version = "0.8.56"
 source = "registry+https://github.com/rust-lang/crates.io-index"

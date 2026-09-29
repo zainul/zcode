@@ -1,0 +1,4 @@
+# Per-run scratch working trees.
+/.work/
+__pycache__/
+*.pyc

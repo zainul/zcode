@@ -334,7 +334,28 @@ pub(crate) fn resolve_context_window(cfg: &Config) -> (domain::WindowTable, Path
     (domain::WindowTable::with_overrides(entries), cache_path)
 }
 
+/// `ZCODE_LLM_REPLAY=<dir>` serves a recorded session instead of calling a
+/// provider; `ZCODE_LLM_RECORD=<dir>` records every call made through the
+/// real client (FR-BUDGET-07, CE-DQ23). Testing aids for the evaluation
+/// harness: replay needs no network and no API key.
+pub const ENV_LLM_REPLAY: &str = "ZCODE_LLM_REPLAY";
+pub const ENV_LLM_RECORD: &str = "ZCODE_LLM_RECORD";
+
 pub(crate) fn build_llm(cfg: &Config) -> Result<Box<dyn domain::LlmPort + Send>, AppError> {
+    if let Some(dir) = std::env::var_os(ENV_LLM_REPLAY).filter(|d| !d.is_empty()) {
+        return Ok(Box::new(infra_llm::ReplayLlm::new(PathBuf::from(dir))));
+    }
+    let client = build_provider_llm(cfg)?;
+    match std::env::var_os(ENV_LLM_RECORD).filter(|d| !d.is_empty()) {
+        Some(dir) => Ok(Box::new(
+            infra_llm::RecordingLlm::new(client, PathBuf::from(dir))
+                .map_err(|e| AppError::Config(format!("{ENV_LLM_RECORD}: {e}")))?,
+        )),
+        None => Ok(client),
+    }
+}
+
+fn build_provider_llm(cfg: &Config) -> Result<Box<dyn domain::LlmPort + Send>, AppError> {
     // Local/self-hosted providers are keyless; hosted ones fail fast so the
     // user learns about a missing key before a request is attempted.
     let api_key = if cfg.provider.requires_api_key() {
