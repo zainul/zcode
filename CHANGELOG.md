@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — `grep` and `glob` tools on ripgrep's engine, in every mode (FR-SEARCH, FR-GLOB)
+
+Until now the only way to search was `shell` — refused in `planning` and
+`editing` mode, so two of the three modes could only find code by reading
+files whole. `grep` and `glob` are native, read-only tools built on
+ripgrep's own crates (`ignore`, `grep-searcher`, `grep-regex`, `globset`),
+embedded rather than shelled out to: no install, not subject to the shell
+allowlist, and deterministic output. `grep` starts cheap (`output: files` —
+paths and counts) and pages (`offset`), shows matches with a 1-based line
+gutter that `read` can address, windows minified lines around the match,
+skips binary and oversized files and says so, and is interrupted by Ctrl-C.
+On a 20 000-file tree it runs at 1.04× the `rg` binary's time.
+
+### Changed — discovery never shows `node_modules`, build output or secrets (FR-FILTER)
+
+`grep`, `glob`, `list_dir` and (later) the code index share one discovery
+filter: built-in excludes (dependency trees, VCS metadata, build output,
+caches, lockfiles, binaries), `.gitignore`/`.ignore`/global excludes — even
+outside a git repository — `.zcodeignore`, and new `[context] exclude` /
+`include` config (both accumulate across config layers). Secret-shaped files
+(`.env`, `*.pem`, `id_rsa*`, …) are excluded from discovery; `.env.example`
+is not. Filters shape discovery, never explicit access: naming a path inside
+`node_modules` still works. A `glob` argument narrows a search and cannot
+re-admit a gitignored file.
+
+`list_dir` now renders a filtered tree (`depth` 1–4), shows excluded
+directories collapsed as `node_modules/  (excluded)` so the model knows they
+exist, summarises directories with more than 50 entries, and caps output at
+200 lines. `str_replace_editor`'s `list_dir` command shares it.
+
+### Added — configuration for the context-efficiency milestone
+
+New `[context]`, `[search]`, `[index]`, `[read]`, `[edit]` and `[cache]`
+sections and `[lsp] max_servers / idle_shutdown_s / diagnostics_on_edit`,
+with `ZCODE_*` overrides and validation that names the offending key. `zcode
+config` prints the effective values.
+
+### Fixed — config tests raced on the process environment
+
+Twenty-six `infra-config` tests read the `ZCODE_*` layer through `load()`
+without taking the environment lock, and failed intermittently when a
+concurrent test had set `ZCODE_PROVIDER`.
+
 ### Added — the whole conversation is now prompt-cached, not just the system prompt (FR-CACHE-01..06)
 
 On Anthropic routes v0.6 placed `cache_control` on the system prompt and the

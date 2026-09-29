@@ -7,9 +7,14 @@ publish = false
 [dependencies]
 domain = { path = "../crates/domain", version = "0.6.0" }
 criterion = "0.5"
+infra-search = { path = "../crates/infra/search", version = "0.6.0" }
 
 [[bench]]
 name = "smoke"
+harness = false
+
+[[bench]]
+name = "search"
 harness = false
 
 [lib]

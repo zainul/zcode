@@ -16,10 +16,13 @@
 pub mod guard;
 pub mod native;
 pub mod patch;
+pub mod render;
 pub mod rtk;
+pub mod search_tools;
 pub mod skills;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use domain::{
     canonical_tool_name, BoxError, LspLocation, LspPort, LspWorkspaceEdit, McpPort, Tool,
@@ -28,12 +31,15 @@ use domain::{
 
 pub use guard::{allowlist_is_unrestricted, builtin_deny_rule_count, GuardedShell, ShellToolError};
 pub use native::{
-    ApplyPatchTool, ListDirTool, ReadTool, ShellTool, SkillTool, StrReplaceTool, WriteTool,
-    TOOL_APPLY_PATCH, TOOL_LIST_DIR, TOOL_READ, TOOL_SHELL, TOOL_SKILL, TOOL_STR_REPLACE,
-    TOOL_WRITE,
+    ApplyPatchTool, ReadTool, ShellTool, SkillTool, StrReplaceTool, WriteTool, TOOL_APPLY_PATCH,
+    TOOL_LIST_DIR, TOOL_READ, TOOL_SHELL, TOOL_SKILL, TOOL_STR_REPLACE, TOOL_WRITE,
 };
 pub use patch::{apply_patch, parse_unified_diff, PatchError};
 pub use rtk::Rtk;
+pub use search_tools::{
+    default_search, list_tree, GlobTool, GrepTool, ListDirTool, Search, SharedCancel, TOOL_GLOB,
+    TOOL_GREP,
+};
 pub use skills::{SkillEntry, SkillIndex};
 
 /// Find rtk, installing it first if that is allowed and it is missing.
@@ -132,6 +138,11 @@ pub struct ToolRegistry {
     /// Non-fatal setup problems (e.g. an MCP server that would not start).
     /// The CLI logs these; the agent runs with whatever did come up (FR-MCP-05).
     warnings: Vec<String>,
+    /// The engine's cancel flag, shared with tools that run long (a search
+    /// walk) so Ctrl-C interrupts them too.
+    cancel: SharedCancel,
+    /// The discovery service every search/listing tool shares (CE-DQ2).
+    search: Option<Search>,
 }
 
 impl ToolRegistry {
@@ -143,7 +154,32 @@ impl ToolRegistry {
             lsp: None,
             root,
             warnings: Vec::new(),
+            cancel: SharedCancel::default(),
+            search: None,
         }
+    }
+
+    /// The cancel flag tools read at call time.
+    pub fn shared_cancel(&self) -> SharedCancel {
+        self.cancel.clone()
+    }
+
+    /// Register the discovery tools — `list_dir`, `glob`, `grep` — on one
+    /// shared search service.
+    pub fn with_search(mut self, search: Search, max_file_bytes: u64, timeout_ms: u64) -> Self {
+        let root = self.root.clone();
+        let cancel = self.cancel.clone();
+        self.search = Some(search.clone());
+        self.with_native(Box::new(ListDirTool::new(root.clone(), search.clone())))
+            .with_native(Box::new(GlobTool::new(root.clone(), search.clone())))
+            .with_native(Box::new(
+                GrepTool::new(root, search, cancel).with_limits(max_file_bytes, timeout_ms),
+            ))
+    }
+
+    /// The shared search service, once `with_search` has run.
+    pub fn search(&self) -> Option<&Search> {
+        self.search.as_ref()
     }
 
     pub fn with_native(mut self, tool: Box<dyn Tool + Send>) -> Self {
@@ -220,14 +256,36 @@ impl ToolRegistry {
         )?
         .with_rtk(resolve_rtk(&cfg.rtk, &mut rtk_notes));
 
-        // `mut` is only used by the feature-gated MCP/LSP blocks below.
+        let search: Search = Arc::new(
+            infra_search::RipgrepSearch::new(
+                &root,
+                &infra_search::FilterConfig {
+                    exclude: cfg.context.exclude.clone(),
+                    include: cfg.context.include.clone(),
+                },
+            )
+            .map_err(|e| ShellToolError::BadPattern {
+                pattern: "context.exclude / context.include".into(),
+                reason: e.to_string(),
+            })?,
+        );
+
+        // Registration order is wire order, and wire order is part of the
+        // cached prompt prefix (FR-CACHE-02) — keep it fixed (technical plan
+        // §8): discover/inspect tools first, then the ones that change things.
         #[allow(unused_mut)]
         let mut registry = Self::new(root.clone())
             .with_native(Box::new(ReadTool::new(root.clone())))
+            .with_search(
+                search.clone(),
+                cfg.search.max_file_bytes,
+                cfg.search.timeout_ms,
+            )
             .with_native(Box::new(WriteTool::new(root.clone())))
-            .with_native(Box::new(StrReplaceTool::new(root.clone())))
+            .with_native(Box::new(
+                StrReplaceTool::new(root.clone()).with_search(search),
+            ))
             .with_native(Box::new(ApplyPatchTool::new(root.clone())))
-            .with_native(Box::new(ListDirTool::new(root.clone())))
             .with_native(Box::new(ShellTool::new(
                 root.clone(),
                 shell,
@@ -393,6 +451,12 @@ impl ToolRegistryPort for ToolRegistry {
             specs.extend(lsp_tool_specs());
         }
         specs.into_boxed_slice()
+    }
+
+    fn set_cancel(&mut self, cancel: domain::CancelFlag) {
+        if let Ok(mut slot) = self.cancel.lock() {
+            *slot = Some(cancel);
+        }
     }
 
     fn call(&mut self, name: &str, args_json: &str) -> Result<ToolResult, BoxError> {
@@ -876,6 +940,54 @@ mod tests {
             .unwrap();
         assert!(res.error.is_some());
         assert!(opened.0.lock().unwrap().is_empty());
+    }
+
+    /// FR-CACHE-02: registration order is wire order, and tool specs head
+    /// every request — a reshuffle would silently defeat the prompt cache.
+    #[test]
+    fn native_tool_order_is_fixed() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = infra_config::Config {
+            working_dir: dir.path().to_path_buf(),
+            lsp_defaults: false,
+            ..Default::default()
+        };
+        let registry = ToolRegistry::from_config(&cfg).expect("registry");
+        let names: Vec<String> = registry.list().iter().map(|s| s.name.clone()).collect();
+        let natives: Vec<&str> = names
+            .iter()
+            .map(String::as_str)
+            .filter(|n| !n.starts_with("lsp__") && !n.starts_with("mcp__") && *n != TOOL_SKILL)
+            .collect();
+        assert_eq!(
+            natives,
+            [
+                TOOL_READ,
+                TOOL_LIST_DIR,
+                TOOL_GLOB,
+                TOOL_GREP,
+                TOOL_WRITE,
+                TOOL_STR_REPLACE,
+                TOOL_APPLY_PATCH,
+                TOOL_SHELL
+            ]
+        );
+    }
+
+    #[test]
+    fn a_bad_discovery_glob_in_config_is_a_named_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = infra_config::Config {
+            working_dir: dir.path().to_path_buf(),
+            lsp_defaults: false,
+            ..Default::default()
+        };
+        cfg.context.exclude = vec!["src/[".into()];
+        let err = ToolRegistry::from_config(&cfg)
+            .err()
+            .expect("error")
+            .to_string();
+        assert!(err.contains("context.exclude"), "{err}");
     }
 
     #[test]

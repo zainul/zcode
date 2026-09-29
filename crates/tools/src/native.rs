@@ -180,73 +180,6 @@ impl Tool for WriteTool {
 }
 
 // ---------------------------------------------------------------------------
-// list_dir
-// ---------------------------------------------------------------------------
-
-pub struct ListDirTool {
-    root: PathBuf,
-    fs: StdFs,
-}
-
-impl ListDirTool {
-    pub fn new(root: PathBuf) -> Self {
-        Self {
-            root,
-            fs: StdFs::new(),
-        }
-    }
-}
-
-fn format_listing(fs: &StdFs, dir: &Path) -> Result<String, BoxError> {
-    let mut entries = domain::FileSystemPort::list(fs, dir)?;
-    entries.sort();
-    let mut out = String::with_capacity(entries.len() * 24);
-    for entry in entries {
-        let name = entry
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        if entry.is_dir() {
-            out.push_str(&format!("{name}/\n"));
-        } else {
-            out.push_str(&format!("{name}\n"));
-        }
-    }
-    Ok(out)
-}
-
-impl Tool for ListDirTool {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec {
-            name: TOOL_LIST_DIR.into(),
-            description: "List the entries of a directory (directories end with `/`).".into(),
-            params_json:
-                r#"{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}"#
-                    .into(),
-        }
-    }
-
-    fn call(&mut self, _name: &str, args_json: &str) -> Result<ToolResult, BoxError> {
-        let args = match parse_args(args_json) {
-            Ok(a) => a,
-            Err(e) => return Ok(e),
-        };
-        let path = match str_arg(&args, "path") {
-            Ok(p) => p,
-            Err(e) => return Ok(e),
-        };
-        let full = resolve(&self.root, &path);
-        match format_listing(&self.fs, &full) {
-            Ok(listing) => Ok(ToolResult::ok(&listing)),
-            Err(e) => Ok(tool_error(format!(
-                "cannot list {}: {e}",
-                display_path(&self.root, &full)
-            ))),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // str_replace_editor
 // ---------------------------------------------------------------------------
 
@@ -255,14 +188,24 @@ impl Tool for ListDirTool {
 pub struct StrReplaceTool {
     root: PathBuf,
     fs: StdFs,
+    /// For the `list_dir` command, which shares `list_dir`'s filtered tree.
+    search: crate::search_tools::Search,
 }
 
 impl StrReplaceTool {
     pub fn new(root: PathBuf) -> Self {
+        let search = crate::search_tools::default_search(&root);
         Self {
             root,
             fs: StdFs::new(),
+            search,
         }
+    }
+
+    /// Share the registry's search service (and so its configured filter).
+    pub fn with_search(mut self, search: crate::search_tools::Search) -> Self {
+        self.search = search;
+        self
     }
 
     /// Replace the first occurrence of `old` with `new` in `path`.
@@ -356,13 +299,15 @@ impl Tool for StrReplaceTool {
                     .unwrap_or_default();
                 self.str_replace(&full, &old, new)
             }
-            "list_dir" => match format_listing(&self.fs, &full) {
-                Ok(listing) => ToolResult::ok(&listing),
-                Err(e) => tool_error(format!(
-                    "cannot list {}: {e}",
-                    display_path(&self.root, &full)
-                )),
-            },
+            "list_dir" => {
+                match crate::search_tools::list_tree(self.search.as_ref(), &self.root, &full, 1) {
+                    Ok(listing) => ToolResult::ok(&listing),
+                    Err(e) => tool_error(format!(
+                        "cannot list {}: {e}",
+                        display_path(&self.root, &full)
+                    )),
+                }
+            }
             other => tool_error(format!(
                 "unknown command `{other}`; expected view|create|str_replace|list_dir"
             )),
@@ -744,7 +689,11 @@ mod tests {
         let dir = tempdir();
         std::fs::create_dir(dir.path().join("sub")).unwrap();
         std::fs::write(dir.path().join("f.txt"), "").unwrap();
-        let mut tool = ListDirTool::new(dir.path().to_path_buf());
+        let root = dir.path().to_path_buf();
+        let mut tool = crate::search_tools::ListDirTool::new(
+            root.clone(),
+            crate::search_tools::default_search(&root),
+        );
         let res = tool.call(TOOL_LIST_DIR, r#"{"path":"."}"#).unwrap();
         assert!(res.content.contains("sub/"));
         assert!(res.content.contains("f.txt"));

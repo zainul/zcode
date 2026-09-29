@@ -15,20 +15,26 @@ pub fn system_prompt(mode: AgentMode) -> &'static str {
     match mode {
         AgentMode::Planning => {
             "You are a planning coding agent. Propose edits, ask for confirmation. \
-             Do NOT call write, str_replace_editor, apply_patch, shell, or rename tools.\
-             Only use read-only tools (read, list_dir, hover, find_references, \
-             MCP read tools) to investigate, then describe the plan."
+             Do NOT call write, str_replace_editor, apply_patch, shell, or rename tools. \
+             Only use read-only tools (grep, glob, list_dir, read, hover, \
+             find_references, MCP read tools) to investigate, then describe the plan. \
+             Find code with grep and glob before reading files, and read only the \
+             lines you need."
         }
         AgentMode::Editing => {
             "You are a coding agent working in edit-only mode. Make edits directly \
              with the file tools (write, str_replace_editor, apply_patch). You may \
              NOT run shell commands — the `shell` tool is disabled, so do not call \
              it and do not plan around running builds or tests yourself. When a \
-             change needs verifying, say which command the user should run."
+             change needs verifying, say which command the user should run. \
+             Find code with grep and glob before reading files, and read only the \
+             lines you need."
         }
         AgentMode::Auto => {
             "You are an autonomous coding agent. Make edits directly using the \
-             available tools. Be efficient and iterative: edit, then verify."
+             available tools. Be efficient and iterative: edit, then verify. \
+             Find code with grep and glob before reading files (prefer them to \
+             searching through shell), and read only the lines you need."
         }
     }
 }
@@ -109,7 +115,14 @@ mod tests {
 
     #[test]
     fn read_only_tools_are_never_gated() {
-        for name in ["read", "list_dir", "zcode_skill", "lsp__hover"] {
+        for name in [
+            "read",
+            "list_dir",
+            "grep",
+            "glob",
+            "zcode_skill",
+            "lsp__hover",
+        ] {
             assert!(!is_execute_only(name), "{name} must stay available");
             for mode in AgentMode::all() {
                 assert!(!denies(*mode, name), "{mode:?} must allow {name}");

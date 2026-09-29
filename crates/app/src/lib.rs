@@ -253,6 +253,7 @@ impl App {
 
     /// Share the flag the CLI's SIGINT handler flips (FR-IFACE-05).
     pub fn set_cancel(&mut self, cancel: CancelFlag) {
+        self.tools.set_cancel(cancel.clone());
         self.cancel = cancel;
     }
 

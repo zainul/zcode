@@ -342,6 +342,10 @@ pub trait Tool {
 /// Registry of all callable tools (native + MCP + LSP), presented as a single
 /// namespace to the engine.
 pub trait ToolRegistryPort {
+    /// Share the engine's cancel flag, so tools that run long (a search walk)
+    /// stop on Ctrl-C too. Called once the flag is known.
+    fn set_cancel(&mut self, _cancel: crate::CancelFlag) {}
+
     fn list(&self) -> Box<[ToolSpec]>;
     fn call(&mut self, name: &str, args_json: &str) -> Result<ToolResult, crate::BoxError>;
     fn is_native(&self, name: &str) -> bool;
