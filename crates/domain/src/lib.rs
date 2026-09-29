@@ -11,6 +11,7 @@
 //!  * **Pure helpers** (`tokens::estimate_tokens`, `modes::system_prompt`,
 //!    `pricing::PriceTable`, `context_window::WindowTable`).
 
+pub mod context;
 pub mod context_window;
 pub mod error;
 pub mod model;
@@ -29,6 +30,7 @@ pub use model::{
     LspTextEdit, LspWorkspaceEdit, Plugin, ShellCommand, Task, TaskStatus,
 };
 pub use naming::{canonical_tool_name, tool_category, tool_category_for_call};
+pub use ports::describe_compaction;
 #[allow(deprecated)]
 pub use ports::CompletionChunk;
 pub use ports::{

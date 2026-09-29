@@ -537,6 +537,19 @@ impl TuiState {
                 };
             }
             UiEvent::Notice(message) => self.push_note(&sanitize(&message), NoteLevel::Info),
+            UiEvent::Compacted {
+                tier,
+                tokens_before,
+                tokens_after,
+            } => self.push_note(
+                &domain::describe_compaction(tier, tokens_before, tokens_after),
+                NoteLevel::Info,
+            ),
+            UiEvent::CacheReset { reason } if reason != "compaction" => self.push_note(
+                &format!("prompt cache reset: {reason} — the next request re-writes it"),
+                NoteLevel::Info,
+            ),
+            UiEvent::CacheReset { .. } => {}
             UiEvent::LoopStart { step, max_turns } => {
                 self.phase = Phase::Working {
                     since: match &self.phase {
@@ -2475,6 +2488,7 @@ mod tests {
             cache_read_tokens: 0,
             cache_write_tokens: 0,
             peak_context_tokens: 0,
+            compactions: 0,
             cost: Cost {
                 output_usd: 0.5,
                 priced: true,

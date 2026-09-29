@@ -465,6 +465,44 @@ impl ToolRegistryPort for ToolRegistry {
         specs.into_boxed_slice()
     }
 
+    /// FR-CTX-06: replace the file content an old edit call carried with a
+    /// line count, keeping the arguments valid JSON (some providers
+    /// re-validate `tool_use` input) and every short field — the path above
+    /// all — as it was.
+    fn elide_args(&self, name: &str, args_json: &str) -> Option<String> {
+        const CONTENT_KEYS: &[&str] = &[
+            "content",
+            "file_text",
+            "patch",
+            "diff",
+            "new_str",
+            "old_str",
+            "body",
+        ];
+        let canonical = canonical_tool_name(name);
+        if !domain::context::EDIT_TOOLS.contains(&canonical.as_str()) {
+            return None;
+        }
+        let mut value: serde_json::Value = serde_json::from_str(args_json).ok()?;
+        let object = value.as_object_mut()?;
+        let mut changed = false;
+        for key in CONTENT_KEYS {
+            if let Some(serde_json::Value::String(text)) = object.get(*key) {
+                if text.len() > 200 {
+                    let lines = text.lines().count();
+                    object.insert(
+                        (*key).to_string(),
+                        serde_json::Value::String(format!(
+                            "[{lines} lines elided by compaction — already applied]"
+                        )),
+                    );
+                    changed = true;
+                }
+            }
+        }
+        changed.then(|| value.to_string())
+    }
+
     fn set_cancel(&mut self, cancel: domain::CancelFlag) {
         if let Ok(mut slot) = self.cancel.lock() {
             *slot = Some(cancel);
@@ -1070,5 +1108,28 @@ mod tests {
             ToolRegistry::from_config(&cfg),
             Err(ShellToolError::BadPattern { .. })
         ));
+    }
+
+    #[test]
+    fn elide_args_keeps_valid_json_and_the_path() {
+        let registry = ToolRegistry::new(PathBuf::from("."));
+        let big = "fn x() {}\n".repeat(100);
+        let args = serde_json::json!({ "path": "src/a.rs", "content": big }).to_string();
+        let shrunk = registry.elide_args("write", &args).expect("elided");
+        let v: serde_json::Value = serde_json::from_str(&shrunk).unwrap();
+        assert_eq!(v["path"], "src/a.rs");
+        assert_eq!(
+            v["content"],
+            "[100 lines elided by compaction — already applied]"
+        );
+        assert!(
+            registry.elide_args("read", &args).is_none(),
+            "only edit tools"
+        );
+        let small = serde_json::json!({ "path": "a", "content": "x" }).to_string();
+        assert!(
+            registry.elide_args("write", &small).is_none(),
+            "nothing worth eliding"
+        );
     }
 }

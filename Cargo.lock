@@ -2484,6 +2484,7 @@ dependencies = [
 name = "zcode-benches"
 version = "0.6.0"
 dependencies = [
+ "app",
  "criterion",
  "domain",
  "infra-search",

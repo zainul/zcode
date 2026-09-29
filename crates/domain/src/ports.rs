@@ -351,6 +351,13 @@ pub trait ToolRegistryPort {
     fn list(&self) -> Box<[ToolSpec]>;
     fn call(&mut self, name: &str, args_json: &str) -> Result<ToolResult, crate::BoxError>;
     fn is_native(&self, name: &str) -> bool;
+
+    /// Shrink an edit call's arguments to a still-valid JSON value with the
+    /// file content elided, for compaction (FR-CTX-06). `None` leaves them
+    /// as they are — `domain` and `app` cannot parse JSON themselves.
+    fn elide_args(&self, _name: &str, _args_json: &str) -> Option<String> {
+        None
+    }
 }
 
 /// A tool exposed by an MCP server.
@@ -430,6 +437,12 @@ pub trait SessionStorePort {
     fn fork(&mut self, id: &str, new_id: &str) -> Result<(), crate::BoxError>;
     fn import_from(&mut self, path: &Path) -> Result<String, crate::BoxError>;
     fn export_to(&self, id: &str, path: &Path) -> Result<(), crate::BoxError>;
+
+    /// Keep messages replaced by compaction (FR-CTX-11), before the
+    /// checkpoint that drops them from the live transcript.
+    fn archive(&mut self, _id: &str, _messages: &[LlmMessage]) -> Result<(), crate::BoxError> {
+        Ok(())
+    }
 }
 
 /// A single serialization-bridge field carried by `TelemetryEvent.extra` so that
@@ -534,6 +547,42 @@ pub enum UiEvent {
         truncated: bool,
     },
     Error(String),
+    /// The transcript was compacted (FR-CTX-13). `tier`: 1 stale results
+    /// removed, 2 old output elided, 3 summarised.
+    Compacted {
+        tier: u8,
+        tokens_before: u64,
+        tokens_after: u64,
+    },
+    /// Something invalidated the provider's prompt cache (FR-CACHE-08):
+    /// the next request re-writes it.
+    CacheReset {
+        reason: String,
+    },
+}
+
+/// `142.0k`, `980` — compact token counts for one-line notes.
+fn short_tokens(n: u64) -> String {
+    if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+/// One line describing a compaction, shared by every renderer (FR-CTX-13).
+pub fn describe_compaction(tier: u8, tokens_before: u64, tokens_after: u64) -> String {
+    let how = match tier {
+        1 => "stale results removed",
+        2 => "old tool output elided",
+        _ => "older steps summarised",
+    };
+    format!(
+        "context compacted {} → {} tokens ({how}); the prompt cache is rebuilt on the next \
+         request",
+        short_tokens(tokens_before),
+        short_tokens(tokens_after)
+    )
 }
 
 /// Rendering sink for engine events. Implemented by the JSONL writer, the pretty

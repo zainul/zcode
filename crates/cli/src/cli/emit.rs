@@ -80,6 +80,22 @@ impl<W: Write> Emitter for PrettyEmitter<W> {
                 self.break_line();
                 let _ = writeln!(self.out, "· {}", sanitize(&message));
             }
+            UiEvent::Compacted {
+                tier,
+                tokens_before,
+                tokens_after,
+            } => {
+                self.break_line();
+                let _ = writeln!(
+                    self.out,
+                    "· {}",
+                    domain::describe_compaction(tier, tokens_before, tokens_after)
+                );
+            }
+            // The compaction line already says the cache is rebuilt; other
+            // resets (a mode switch) are shown by the TUI, which has the
+            // context for them.
+            UiEvent::CacheReset { .. } => {}
             // Headless output is a transcript, not a live display: the totals
             // are printed once at the end, so per-step usage has no reader.
             UiEvent::ToolCallArgs { .. }

@@ -517,6 +517,17 @@ pub fn wire_with_format(
     )
     .with_pricing(cfg.price_table())
     .with_context_window(resolve_context_window(cfg).0);
+    // FR-CTX-*: the context manager's settings.
+    app.set_context_config(app::ContextConfig {
+        enabled: cfg.context.compaction,
+        reactive: true,
+        compact_at: cfg.context.compact_at,
+        compact_target: cfg.context.compact_target,
+        compact_at_tokens: cfg.context.compact_at_tokens,
+        keep_recent_steps: cfg.context.keep_recent_steps,
+        summary_max_tokens: cfg.context.summary_max_tokens,
+        ..app::ContextConfig::default()
+    });
     // FR-READ-07: over-budget tool output is kept in full under .zcode/spill.
     app.set_spill(Box::new(infra_filesystem::SpillStore::new(
         &cfg.working_dir,

@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — the conversation is compacted before it outgrows the window (FR-CTX-01..06, 09, 10)
+
+A transcript used to grow until the turn cap or a context-length error: every
+file ever read stayed in it, re-sent on every step. A context manager now
+runs before each provider call. When the live context reaches 75% of the
+model's window (`context.compact_at`; 96k tokens when the window is unknown)
+it compacts down to 45% (`compact_target`) — hysteresis, so compactions are
+rare and the prompt-cache reset each one causes is paid for over many steps.
+It works cheapest-first:
+
+1. **Supersession** — a file read that was later read again (the same or a
+   wider range), or later modified; a search or listing repeated verbatim;
+   diagnostics followed by newer ones. The newer copy is already in context,
+   so nothing is lost.
+2. **Elision** — large old tool output becomes a one-line stub saying what it
+   was, how big, how it began, and where its full text is (it is spilled to
+   `.zcode/spill/` first); the file content of old `write`/`patch` calls
+   becomes a line count, the arguments staying valid JSON.
+
+The system prompt, the task, the latest message and the last
+`keep_recent_steps` (6) steps are never touched, and every rewritten
+transcript is validated — each tool call answered exactly once, in order —
+before it is sent; a compaction that would break it is undone. When the
+window is nearly full anyway, an emergency pass reaches into the recent steps,
+sparing only the latest.
+
+When a provider still refuses a prompt as too long, the engine learns the
+window it named, compacts, and retries that step once instead of ending the
+run. Compactions are reported (`context_compacted` and `cache_reset`
+telemetry; a note in the TUI and headless output) and archived (the session
+store's new `archive` hook; persisted in the next release step). On a
+161k-token transcript tiers 1–2 take under a millisecond.
+
+Step numbers now continue across runs of one session instead of restarting
+at 1, so a stub that cites a step is unambiguous.
+
 ### Changed — `str_replace` refuses an ambiguous match instead of editing the first (FR-EDIT-06)
 
 **Behaviour change.** When `old_str` matched several places, v0.6 edited the
