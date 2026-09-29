@@ -1,0 +1,20 @@
+[package]
+name = "infra-search"
+description = "ripgrep-engine search, glob and the discovery filter (PRD-CTX-EFF-003)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+domain = { path = "../../domain", version = "0.6.0" }
+ignore = { workspace = true }
+globset = { workspace = true }
+grep-searcher = { workspace = true }
+grep-regex = { workspace = true }
+grep-matcher = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.10"

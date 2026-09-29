@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+infra-search = { path = "../infra/search", version = "0.6.0" }
 domain = { path = "../domain", version = "0.6.0" }
 infra-shell = { path = "../infra/shell", version = "0.6.0" }
 infra-filesystem = { path = "../infra/filesystem", version = "0.6.0" }

@@ -19,6 +19,7 @@ pub mod modes;
 pub mod naming;
 pub mod ports;
 pub mod pricing;
+pub mod search;
 pub mod tokens;
 
 pub use context_window::{parse_window_from_error, WindowEntry, WindowTable};
@@ -38,6 +39,10 @@ pub use ports::{
     TelemetryTotals, Tool, ToolRegistryPort, ToolResult, ToolSpec, UiEvent,
 };
 pub use pricing::{Cost, PriceEntry, PriceTable, TokenUsage};
+pub use search::{
+    CaseMode, EntryKind, Exclusion, GlobQuery, GrepFileHit, GrepLine, GrepOutcome, GrepQuery,
+    SearchPort, WalkEntry,
+};
 pub use tokens::{estimate_messages, estimate_tokens, prompt_size, TokenCalibrator};
 
 /// Shorthand for the canonical domain error box: `Send + Sync` so it crosses

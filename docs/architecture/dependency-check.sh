@@ -6,8 +6,9 @@
 #
 # The expected graph is:
 #   cli ──► app ──► domain
-#   cli ──► tools ──► infra/{filesystem,shell,config,mcp,lsp} ──► domain
-#   cli ──► infra/{llm,mcp,lsp,session,telemetry,config} ──► domain
+#   cli ──► tools ──► infra/{filesystem,shell,config,mcp,lsp,search} ──► domain
+#   cli ──► infra/{llm,mcp,lsp,session,telemetry,config,search} ──► domain
+#   (infra → infra edges are allowed; only upward edges to app/cli are not)
 #
 # Violations:
 #   - domain depends on any third-party crate
@@ -22,7 +23,7 @@ STATUS=0
 
 INFRA_CRATES=(
     infra-llm infra-filesystem infra-shell infra-config
-    infra-mcp infra-lsp infra-session infra-telemetry
+    infra-mcp infra-lsp infra-session infra-telemetry infra-search
 )
 
 echo "=== Checking domain purity (FR-DI-01) ==="

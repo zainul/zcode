@@ -826,6 +826,68 @@ fn cmd_session(command: SessionCmd) -> CliResult {
 
 /// `zcode config` — which files were consulted, and what they add up to.
 /// Secrets are never printed: only whether the named variable resolves.
+/// The PRD-CTX-EFF-003 settings, grouped the way `zcode.toml` spells them.
+fn print_efficiency(cfg: &Config) {
+    let c = &cfg.context;
+    let on_off = |b: bool| if b { "on" } else { "off" };
+    outln!(
+        "  {:<22} {}  (at {:.0}% of the window → {:.0}%; {} tokens when the window is unknown; keeps the last {} steps)",
+        "context.compaction",
+        on_off(c.compaction),
+        c.compact_at * 100.0,
+        c.compact_target * 100.0,
+        c.compact_at_tokens,
+        c.keep_recent_steps
+    );
+    outln!(
+        "  {:<22} {}",
+        "context.summariser",
+        if c.compaction_model.is_empty() {
+            "(the session's model)".to_string()
+        } else {
+            c.compaction_model.clone()
+        }
+    );
+    let list = |v: &[String]| {
+        if v.is_empty() {
+            "(none)".to_string()
+        } else {
+            v.join(", ")
+        }
+    };
+    outln!(
+        "  {:<22} {}  (added to the built-in excludes)",
+        "context.exclude",
+        list(&c.exclude)
+    );
+    outln!("  {:<22} {}", "context.include", list(&c.include));
+    if !c.tool_budgets.is_empty() {
+        let budgets: Vec<String> = c
+            .tool_budgets
+            .iter()
+            .map(|(t, n)| format!("{t}={n}"))
+            .collect();
+        outln!("  {:<22} {}", "context.tool_budgets", budgets.join(", "));
+    }
+    outln!(
+        "  {:<22} {}  (repo map {} tokens)",
+        "index",
+        on_off(cfg.index.enabled),
+        cfg.index.repo_map_tokens
+    );
+    outln!(
+        "  {:<22} {} lines",
+        "read.default_limit",
+        cfg.read.default_limit
+    );
+    outln!(
+        "  {:<22} ttl {:?}, markers {:?}",
+        "cache",
+        cfg.cache.ttl,
+        cfg.cache.markers
+    );
+}
+
 fn cmd_config(args: ConfigArgs) -> CliResult {
     let loader = Loader::with_default();
     let cfg = loader.load_with_override(args.config.as_deref())?;
@@ -970,6 +1032,7 @@ fn cmd_config(args: ConfigArgs) -> CliResult {
     // Whether shell output is being shrunk before it reaches the model is a
     // fact about every future token bill, so it is stated rather than implied.
     outln!("  {:<22} {}", "rtk", describe_rtk(&cfg.rtk));
+    print_efficiency(&cfg);
     outln!("  {:<22} {}", "mcp servers", cfg.mcp_servers.len());
 
     // LSP is on by default, so say which servers that actually resolved to —

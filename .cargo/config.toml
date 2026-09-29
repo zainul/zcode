@@ -3,3 +3,8 @@ target-dir = "target"
 
 [net]
 git-fetch-with-cli = true
+
+# CE-DQ1: prefer dependency releases whose declared rust-version fits the
+# pinned toolchain (rust-toolchain.toml) instead of failing to build.
+[resolver]
+incompatible-rust-versions = "fallback"

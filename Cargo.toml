@@ -12,6 +12,7 @@ members = [
     "crates/infra/lsp",
     "crates/infra/session",
     "crates/infra/telemetry",
+    "crates/infra/search",
     "crates/cli",
     "benches",
     "evals",
@@ -46,6 +47,15 @@ crossterm = "0.28"
 regex = "1.10"
 signal-hook = "0.3"
 tempfile = "3.10"
+# ripgrep's own engine, embedded (PRD-CTX-EFF-003 D-1, technical plan CE-DQ1).
+# `ignore` 0.4.30 uses let-chains (E0658 on the pinned 1.85 toolchain) without
+# declaring a rust-version, so the MSRV-aware resolver cannot skip it; 0.4.31+
+# declare 1.88. Revisit when rust-toolchain.toml moves to >= 1.88.
+ignore = "=0.4.29"
+globset = "0.4"
+grep-searcher = "0.1"
+grep-regex = "0.1"
+grep-matcher = "0.1"
 
 [profile.release]
 lto = "thin"
