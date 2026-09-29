@@ -208,6 +208,9 @@ enum SubjectFile {
     FileWrite {
         path: String,
     },
+    FileWrites {
+        paths: Vec<String>,
+    },
     Diagnostics {
         #[serde(default)]
         path: Option<String>,
@@ -267,6 +270,7 @@ impl From<&Subject> for SubjectFile {
                 hash,
             },
             Subject::FileWrite { path } => Self::FileWrite { path },
+            Subject::FileWrites { paths } => Self::FileWrites { paths },
             Subject::Diagnostics { path } => Self::Diagnostics { path },
             Subject::Listing { path } => Self::Listing { path },
             Subject::Search { key } => Self::Search { key },
@@ -289,6 +293,7 @@ impl From<SubjectFile> for Subject {
                 hash,
             },
             SubjectFile::FileWrite { path } => Self::FileWrite { path },
+            SubjectFile::FileWrites { paths } => Self::FileWrites { paths },
             SubjectFile::Diagnostics { path } => Self::Diagnostics { path },
             SubjectFile::Listing { path } => Self::Listing { path },
             SubjectFile::Search { key } => Self::Search { key },

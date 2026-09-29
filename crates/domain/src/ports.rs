@@ -74,6 +74,8 @@ pub enum Subject {
     },
     /// The file was created, overwritten or edited.
     FileWrite { path: String },
+    /// Several files were written by one call (`apply_patch`).
+    FileWrites { paths: Vec<String> },
     /// Diagnostics for one file, or for everything open when `None`.
     Diagnostics { path: Option<String> },
     /// A directory listing or glob rooted at `path`.

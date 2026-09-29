@@ -250,9 +250,52 @@ impl Tool for ReadTool {
 // write
 // ---------------------------------------------------------------------------
 
+/// Past this many lines, rewriting a whole file to change a few is wasteful
+/// enough to say so (FR-EDIT-08).
+const REWRITE_HINT_LINES: usize = 200;
+
+/// Write `content` to `full` and describe the change without echoing it
+/// (FR-EDIT-08): `created x (57 lines)` or `wrote x: 412 → 430 lines (+31 −13)`.
+pub(crate) fn write_file(
+    root: &Path,
+    fs: &StdFs,
+    log: &crate::edit::WriteLog,
+    full: &Path,
+    content: &str,
+) -> ToolResult {
+    let shown = display_path(root, full);
+    let before = std::fs::read_to_string(full).ok();
+    if let Err(e) = fs.write_atomic(full, content) {
+        return tool_error(format!("cannot write {shown}: {e}"));
+    }
+    crate::edit::record_write(log, full, content);
+    let lines = content.lines().count();
+    let summary = match before {
+        None => format!("created {shown} ({lines} lines)"),
+        Some(old) => {
+            let old_lines = old.lines().count();
+            let mut s = match crate::edit::line_diffstat(&old, content) {
+                Some((added, removed)) => {
+                    format!("wrote {shown}: {old_lines} → {lines} lines (+{added} −{removed})")
+                }
+                None => format!("wrote {shown}: {old_lines} → {lines} lines"),
+            };
+            if old_lines > REWRITE_HINT_LINES {
+                s.push_str(
+                    "\ntip: for a small change use str_replace_editor — it sends only the \
+                     lines that change",
+                );
+            }
+            s
+        }
+    };
+    ToolResult::ok(&summary).with_subject(Subject::FileWrite { path: shown })
+}
+
 pub struct WriteTool {
     root: PathBuf,
     fs: StdFs,
+    log: crate::edit::WriteLog,
 }
 
 impl WriteTool {
@@ -260,7 +303,14 @@ impl WriteTool {
         Self {
             root,
             fs: StdFs::new(),
+            log: crate::edit::WriteLog::default(),
         }
+    }
+
+    /// Record writes where the registry can see them (FR-EDIT-09).
+    pub fn with_write_log(mut self, log: crate::edit::WriteLog) -> Self {
+        self.log = log;
+        self
     }
 }
 
@@ -268,7 +318,9 @@ impl Tool for WriteTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: TOOL_WRITE.into(),
-            description: "Create or overwrite a file with the given contents (atomic).".into(),
+            description: "Create a file, or overwrite one whole (atomic). To change part of an \
+                          existing file, use str_replace_editor instead."
+                .into(),
             params_json: r#"{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}"#.into(),
         }
     }
@@ -290,17 +342,7 @@ impl Tool for WriteTool {
             .unwrap_or_default()
             .to_string();
         let full = resolve(&self.root, &path);
-        match self.fs.write_atomic(&full, &content) {
-            Ok(()) => Ok(ToolResult::ok(&format!(
-                "wrote {} bytes to {}",
-                content.len(),
-                display_path(&self.root, &full)
-            ))),
-            Err(e) => Ok(tool_error(format!(
-                "cannot write {}: {e}",
-                display_path(&self.root, &full)
-            ))),
-        }
+        Ok(write_file(&self.root, &self.fs, &self.log, &full, &content))
     }
 }
 
@@ -315,6 +357,7 @@ pub struct StrReplaceTool {
     fs: StdFs,
     /// For the `list_dir` command, which shares `list_dir`'s filtered tree.
     search: crate::search_tools::Search,
+    log: crate::edit::WriteLog,
 }
 
 impl StrReplaceTool {
@@ -324,7 +367,14 @@ impl StrReplaceTool {
             root,
             fs: StdFs::new(),
             search,
+            log: crate::edit::WriteLog::default(),
         }
+    }
+
+    /// Record writes where the registry can see them (FR-EDIT-09).
+    pub fn with_write_log(mut self, log: crate::edit::WriteLog) -> Self {
+        self.log = log;
+        self
     }
 
     /// Share the registry's search service (and so its configured filter).
@@ -333,8 +383,22 @@ impl StrReplaceTool {
         self
     }
 
-    /// Replace the first occurrence of `old` with `new` in `path`.
-    fn str_replace(&self, full: &Path, old: &str, new: &str) -> ToolResult {
+    /// Replace `old` with `new` in `full` (FR-EDIT-06/07).
+    ///
+    /// Exactly one match, or every match with `replace_all`. Several matches
+    /// otherwise is an error listing their lines — v0.6 edited the first and
+    /// only mentioned the count afterwards, so an ambiguous edit could land
+    /// in the wrong place. No exact match: one retry that tolerates
+    /// indentation and trailing-whitespace drift, disclosed in the result;
+    /// failing that, the closest region, so the retry needs no re-read.
+    fn str_replace(
+        &self,
+        full: &Path,
+        old: &str,
+        new: &str,
+        replace_all: bool,
+        expected: Option<usize>,
+    ) -> ToolResult {
         let shown = display_path(&self.root, full);
         if old.is_empty() {
             return tool_error("`old_str` must not be empty");
@@ -343,23 +407,99 @@ impl StrReplaceTool {
             Ok(c) => c,
             Err(e) => return tool_error(format!("cannot read {shown}: {e}")),
         };
-        let occurrences = content.matches(old).count();
-        if occurrences == 0 {
+        // (start, end, replacement) in file order.
+        let mut edits: Vec<(usize, usize, String)> = content
+            .match_indices(old)
+            .map(|(at, m)| (at, at + m.len(), new.to_string()))
+            .collect();
+        let mut note = "";
+        if edits.is_empty() {
+            let found = crate::edit::find_normalised(&content, old);
+            if found.is_empty() {
+                return tool_error(match crate::edit::closest_region(&content, old) {
+                    Some((from, to, score, of, text)) => format!(
+                        "old_str not found in {shown}. Closest match ({score} of {of} lines \
+                         equal), lines {from}-{to}:\n{text}Copy the exact text from here, or \
+                         read a wider range."
+                    ),
+                    None => format!(
+                        "old_str not found in {shown}, and no region resembles it — read the \
+                         part of the file you mean to change first"
+                    ),
+                });
+            }
+            edits = found
+                .into_iter()
+                .map(|m| {
+                    let replacement = crate::edit::reindent(
+                        new.trim_end_matches('\n'),
+                        &m.old_indent,
+                        &m.file_indent,
+                    );
+                    (m.start, m.end, replacement)
+                })
+                .collect();
+            note = " (matched with whitespace normalisation)";
+        }
+        if edits.len() > 1 && !replace_all {
+            let lines: Vec<String> = edits
+                .iter()
+                .take(10)
+                .map(|(at, _, _)| crate::edit::line_of(&content, *at).to_string())
+                .collect();
             return tool_error(format!(
-                "`old_str` not found in {shown} — read the file first and copy the exact text"
+                "old_str matches {} places in {shown} (lines {}{}) — include surrounding lines \
+                 to make it unique, or set replace_all",
+                edits.len(),
+                lines.join(", "),
+                if edits.len() > 10 { ", …" } else { "" }
             ));
         }
-        // First occurrence wins; report ambiguity so the model can narrow it.
-        let updated = content.replacen(old, new, 1);
+        if let Some(n) = expected {
+            if n != edits.len() {
+                return tool_error(format!(
+                    "expected {n} replacement(s) in {shown}, found {}; nothing was written",
+                    edits.len()
+                ));
+            }
+        }
+        // Apply back to front so earlier offsets stay valid; record where
+        // each replacement lands in the new text for the seams.
+        let mut updated = content.clone();
+        for (start, end, replacement) in edits.iter().rev() {
+            updated.replace_range(*start..*end, replacement);
+        }
+        let mut changed = Vec::with_capacity(edits.len());
+        let mut shift: isize = 0;
+        for (start, end, replacement) in &edits {
+            let new_start = (*start as isize + shift) as usize;
+            let first = crate::edit::line_of(&updated, new_start);
+            let last = first + replacement.matches('\n').count() as u32;
+            changed.push((first, last));
+            shift += replacement.len() as isize - (*end - *start) as isize;
+        }
         if let Err(e) = self.fs.write_atomic(full, &updated) {
             return tool_error(format!("cannot write {shown}: {e}"));
         }
-        let note = if occurrences > 1 {
-            format!(" (first of {occurrences} occurrences)")
+        crate::edit::record_write(&self.log, full, &updated);
+        let (first, last) = (changed[0].0, changed[changed.len() - 1].1);
+        let head = if edits.len() == 1 {
+            format!(
+                "edited {shown}: 1 replacement at line {first}{}{note}",
+                if last > first {
+                    format!("-{last}")
+                } else {
+                    String::new()
+                }
+            )
         } else {
-            String::new()
+            format!("edited {shown}: {} replacements{note}", edits.len())
         };
-        ToolResult::ok(&format!("edited {shown}{note}"))
+        ToolResult::ok(&format!(
+            "{head}\n{}",
+            crate::edit::seams(&updated, &changed, 2)
+        ))
+        .with_subject(Subject::FileWrite { path: shown })
     }
 }
 
@@ -367,10 +507,11 @@ impl Tool for StrReplaceTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: TOOL_STR_REPLACE.into(),
-            description: "Edit files in place. `view` shows a file, `create` writes one, \
-                          `str_replace` swaps an exact string, `list_dir` lists a directory."
+            description: "Edit files in place. `view` shows lines (view_range), `create` writes \
+                          a file, `str_replace` swaps old_str for new_str — old_str must match \
+                          one place unless replace_all is set — `list_dir` lists a directory."
                 .into(),
-            params_json: r#"{"type":"object","properties":{"command":{"type":"string","enum":["view","create","str_replace","list_dir"]},"path":{"type":"string"},"view_range":{"type":"array","items":{"type":"integer"},"description":"[start, end] lines, 1-based; end -1 = EOF"},"old_str":{"type":"string"},"new_str":{"type":"string"},"file_text":{"type":"string"}},"required":["command","path"]}"#.into(),
+            params_json: r#"{"type":"object","properties":{"command":{"type":"string","enum":["view","create","str_replace","list_dir"]},"path":{"type":"string"},"view_range":{"type":"array","items":{"type":"integer"},"description":"[start, end] lines, 1-based; end -1 = EOF"},"old_str":{"type":"string"},"new_str":{"type":"string"},"replace_all":{"type":"boolean","description":"Replace every match; otherwise several matches is an error"},"expected_replacements":{"type":"integer"},"file_text":{"type":"string"}},"required":["command","path"]}"#.into(),
         }
     }
 
@@ -418,15 +559,7 @@ impl Tool for StrReplaceTool {
                     .or_else(|| args.get("content"))
                     .and_then(|v| v.as_str())
                     .unwrap_or_default();
-                match self.fs.write_atomic(&full, text) {
-                    Ok(()) => {
-                        ToolResult::ok(&format!("created {}", display_path(&self.root, &full)))
-                    }
-                    Err(e) => tool_error(format!(
-                        "cannot write {}: {e}",
-                        display_path(&self.root, &full)
-                    )),
-                }
+                write_file(&self.root, &self.fs, &self.log, &full, text)
             }
             "str_replace" => {
                 let old = match str_arg(&args, "old_str") {
@@ -437,7 +570,15 @@ impl Tool for StrReplaceTool {
                     .get("new_str")
                     .and_then(|v| v.as_str())
                     .unwrap_or_default();
-                self.str_replace(&full, &old, new)
+                let replace_all = args
+                    .get("replace_all")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let expected = args
+                    .get("expected_replacements")
+                    .and_then(Value::as_u64)
+                    .map(|n| n as usize);
+                self.str_replace(&full, &old, new, replace_all, expected)
             }
             "list_dir" => {
                 match crate::search_tools::list_tree(self.search.as_ref(), &self.root, &full, 1) {
@@ -465,11 +606,21 @@ impl Tool for StrReplaceTool {
 /// that can create and delete files in one shot.
 pub struct ApplyPatchTool {
     root: PathBuf,
+    log: crate::edit::WriteLog,
 }
 
 impl ApplyPatchTool {
     pub fn new(root: PathBuf) -> Self {
-        Self { root }
+        Self {
+            root,
+            log: crate::edit::WriteLog::default(),
+        }
+    }
+
+    /// Record writes where the registry can see them (FR-EDIT-09).
+    pub fn with_write_log(mut self, log: crate::edit::WriteLog) -> Self {
+        self.log = log;
+        self
     }
 }
 
@@ -503,20 +654,26 @@ impl Tool for ApplyPatchTool {
 
         match crate::patch::apply_patch(&self.root, patch) {
             Ok(applied) => {
-                let mut summary = String::with_capacity(applied.len() * 48);
+                // FR-EDIT-08: a per-file diffstat, never the patched content.
+                let mut summary = format!("patched {} file(s):\n", applied.len());
+                let mut paths = Vec::with_capacity(applied.len());
                 for file in &applied {
-                    let verb = match file.action {
-                        crate::patch::PatchAction::Create => "created",
-                        crate::patch::PatchAction::Delete => "deleted",
-                        crate::patch::PatchAction::Modify => "patched",
+                    let shown = display_path(&self.root, &file.path);
+                    let line = match file.action {
+                        crate::patch::PatchAction::Create => format!("A {shown} +{}", file.added),
+                        crate::patch::PatchAction::Delete => format!("D {shown}"),
+                        crate::patch::PatchAction::Modify => {
+                            format!("M {shown} +{} −{}", file.added, file.removed)
+                        }
                     };
-                    summary.push_str(&format!(
-                        "{verb} {} ({} hunk(s))\n",
-                        display_path(&self.root, &file.path),
-                        file.hunks
-                    ));
+                    summary.push_str(&line);
+                    summary.push('\n');
+                    if let Some(text) = &file.content {
+                        crate::edit::record_write(&self.log, &file.path, text);
+                    }
+                    paths.push(shown);
                 }
-                Ok(ToolResult::ok(&summary))
+                Ok(ToolResult::ok(summary.trim_end()).with_subject(Subject::FileWrites { paths }))
             }
             // Patch failures are the model's to fix, so they come back as a
             // tool error carrying the reason rather than aborting the run.
@@ -710,7 +867,7 @@ mod tests {
         let res = tool
             .call(TOOL_WRITE, r#"{"path":"src/main.rs","content":"x"}"#)
             .unwrap();
-        assert!(res.content.ends_with("src/main.rs"), "{res:?}");
+        assert!(res.content.starts_with("created src/main.rs"), "{res:?}");
         assert!(!res.content.contains(dir.path().to_str().unwrap()));
 
         let mut editor = StrReplaceTool::new(dir.path().to_path_buf());
@@ -720,7 +877,11 @@ mod tests {
                 r#"{"command":"str_replace","path":"src/main.rs","old_str":"x","new_str":"y"}"#,
             )
             .unwrap();
-        assert_eq!(res.content, "edited src/main.rs");
+        assert!(
+            res.content
+                .starts_with("edited src/main.rs: 1 replacement at line 1\n"),
+            "{res:?}"
+        );
     }
 
     #[test]
@@ -780,7 +941,7 @@ mod tests {
     }
 
     #[test]
-    fn str_replace_flags_ambiguous_matches() {
+    fn str_replace_refuses_ambiguous_matches_and_writes_nothing() {
         let dir = tempdir();
         std::fs::write(dir.path().join("a.rs"), "x\nx\n").unwrap();
         let mut tool = StrReplaceTool::new(dir.path().to_path_buf());
@@ -790,7 +951,18 @@ mod tests {
                 r#"{"command":"str_replace","path":"a.rs","old_str":"x","new_str":"y"}"#,
             )
             .unwrap();
-        assert!(res.content.contains("first of 2"), "{res:?}");
+        // FR-EDIT-06: v0.6 edited the first and mentioned the count after.
+        assert_eq!(
+            res.error.as_deref(),
+            Some(
+                "old_str matches 2 places in a.rs (lines 1, 2) — include surrounding lines to \
+                 make it unique, or set replace_all"
+            )
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.rs")).unwrap(),
+            "x\nx\n"
+        );
     }
 
     #[test]
@@ -1085,5 +1257,183 @@ mod tests {
         assert_eq!(thousands(7), "7");
         assert_eq!(thousands(1_000), "1,000");
         assert_eq!(thousands(1_234_567), "1,234,567");
+    }
+
+    // ---- edit safety (FR-EDIT-06..08) -------------------------------------
+
+    fn edit(dir: &tempfile::TempDir, args: serde_json::Value) -> ToolResult {
+        let mut args = args;
+        args["command"] = "str_replace".into();
+        args["path"] = "f.rs".into();
+        StrReplaceTool::new(dir.path().to_path_buf())
+            .call(TOOL_STR_REPLACE, &args.to_string())
+            .unwrap()
+    }
+
+    fn file(dir: &tempfile::TempDir) -> String {
+        std::fs::read_to_string(dir.path().join("f.rs")).unwrap()
+    }
+
+    #[test]
+    fn replace_all_and_expected_replacements_are_explicit_opt_ins() {
+        let dir = tempdir();
+        std::fs::write(dir.path().join("f.rs"), "a();\nb();\na();\n").unwrap();
+        let res = edit(
+            &dir,
+            serde_json::json!({ "old_str": "a();", "new_str": "z();", "replace_all": true }),
+        );
+        assert!(
+            res.content.starts_with("edited f.rs: 2 replacements\n"),
+            "{res:?}"
+        );
+        assert_eq!(file(&dir), "z();\nb();\nz();\n");
+        let mismatch = edit(
+            &dir,
+            serde_json::json!({ "old_str": "z();", "new_str": "q();", "replace_all": true,
+                                "expected_replacements": 3 }),
+        );
+        assert_eq!(
+            mismatch.error.as_deref(),
+            Some("expected 3 replacement(s) in f.rs, found 2; nothing was written")
+        );
+        assert_eq!(file(&dir), "z();\nb();\nz();\n");
+    }
+
+    #[test]
+    fn indentation_drift_is_matched_and_disclosed() {
+        let dir = tempdir();
+        std::fs::write(
+            dir.path().join("f.rs"),
+            "fn a() {\n    if ok {\n        run();\n    }\n}\n",
+        )
+        .unwrap();
+        // The model copied the block without its indentation.
+        let res = edit(
+            &dir,
+            serde_json::json!({ "old_str": "if ok {\n    run();\n}",
+                                "new_str": "if ok {\n    run();\n    log();\n}" }),
+        );
+        assert!(
+            res.content
+                .contains("(matched with whitespace normalisation)"),
+            "{res:?}"
+        );
+        assert_eq!(
+            file(&dir),
+            "fn a() {\n    if ok {\n        run();\n        log();\n    }\n}\n"
+        );
+    }
+
+    #[test]
+    fn trailing_whitespace_drift_is_matched() {
+        let dir = tempdir();
+        std::fs::write(dir.path().join("f.rs"), "let x = 1;   \nlet y = 2;\n").unwrap();
+        let res = edit(
+            &dir,
+            serde_json::json!({ "old_str": "let x = 1;", "new_str": "let x = 9;" }),
+        );
+        assert!(res.error.is_none(), "{res:?}");
+        assert!(file(&dir).starts_with("let x = 9;"), "{}", file(&dir));
+    }
+
+    #[test]
+    fn a_miss_shows_the_closest_region_so_no_reread_is_needed() {
+        let dir = tempdir();
+        let body: String = (1..=40).map(|i| format!("line {i};\n")).collect();
+        let body = body.replace("line 20;", "let total = compute(a, b);");
+        std::fs::write(dir.path().join("f.rs"), &body).unwrap();
+        let res = edit(
+            &dir,
+            serde_json::json!({ "old_str": "line 19;\nlet total = compute(a, c);\nline 21;",
+                                "new_str": "x" }),
+        );
+        let err = res.error.unwrap();
+        assert!(
+            err.contains("Closest match (2 of 3 lines equal), lines 19-21:"),
+            "{err}"
+        );
+        assert!(err.contains("20│let total = compute(a, b);"), "{err}");
+        assert_eq!(file(&dir), body, "nothing written");
+    }
+
+    #[test]
+    fn write_reports_a_diffstat_and_suggests_edits_for_big_rewrites() {
+        let dir = tempdir();
+        let mut tool = WriteTool::new(dir.path().to_path_buf());
+        let big: String = (1..=250).map(|i| format!("l{i}\n")).collect();
+        let created = tool
+            .call(
+                TOOL_WRITE,
+                &serde_json::json!({ "path": "f.rs", "content": big }).to_string(),
+            )
+            .unwrap();
+        assert_eq!(created.content, "created f.rs (250 lines)");
+        let changed = big.replace("l7\n", "seven\n");
+        let res = tool
+            .call(
+                TOOL_WRITE,
+                &serde_json::json!({ "path": "f.rs", "content": changed }).to_string(),
+            )
+            .unwrap();
+        assert!(
+            res.content
+                .starts_with("wrote f.rs: 250 → 250 lines (+1 −1)"),
+            "{}",
+            res.content
+        );
+        assert!(res
+            .content
+            .contains("tip: for a small change use str_replace_editor"));
+        assert_eq!(
+            res.subject,
+            Some(Subject::FileWrite {
+                path: "f.rs".into()
+            })
+        );
+    }
+
+    #[test]
+    fn apply_patch_reports_a_per_file_diffstat_without_content() {
+        let dir = tempdir();
+        std::fs::write(dir.path().join("f.rs"), "fn a() {}\nfn b() {}\n").unwrap();
+        let mut tool = ApplyPatchTool::new(dir.path().to_path_buf());
+        let patch = "--- a/f.rs\n+++ b/f.rs\n@@ -1,2 +1,3 @@\n fn a() {}\n-fn b() {}\n+fn c() {}\n+fn d() {}\n\
+                     --- /dev/null\n+++ b/new.rs\n@@ -0,0 +1,2 @@\n+x\n+y\n";
+        let res = tool
+            .call(
+                TOOL_APPLY_PATCH,
+                &serde_json::json!({ "patch": patch }).to_string(),
+            )
+            .unwrap();
+        assert_eq!(res.content, "patched 2 file(s):\nM f.rs +2 −1\nA new.rs +2");
+        assert_eq!(
+            res.subject,
+            Some(Subject::FileWrites {
+                paths: vec!["f.rs".into(), "new.rs".into()]
+            })
+        );
+    }
+
+    /// FR-EDIT-02/08: an edit result is proportional to the edit, never the
+    /// file — for random single-line edits of a 300-line file.
+    #[test]
+    fn edit_results_never_echo_the_file() {
+        let dir = tempdir();
+        let body: String = (1..=300).map(|i| format!("statement_{i}();\n")).collect();
+        for target in [1, 57, 150, 299, 300] {
+            std::fs::write(dir.path().join("f.rs"), &body).unwrap();
+            let res = edit(
+                &dir,
+                serde_json::json!({ "old_str": format!("statement_{target}();"),
+                                    "new_str": "changed();" }),
+            );
+            assert!(res.error.is_none(), "{res:?}");
+            assert!(
+                res.content.len() < body.len() / 20,
+                "{} bytes",
+                res.content.len()
+            );
+            assert!(res.content.contains("changed();"));
+        }
     }
 }

@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — `str_replace` refuses an ambiguous match instead of editing the first (FR-EDIT-06)
+
+**Behaviour change.** When `old_str` matched several places, v0.6 edited the
+first and mentioned the count afterwards — so an ambiguous edit could land in
+the wrong place, and the model learned so only after the fact. It is now an
+error listing the matching lines, and nothing is written. Pass
+`replace_all: true` to replace every match, and `expected_replacements: N` to
+refuse the edit unless exactly N matches were found.
+
+### Added — forgiving matching, with disclosure, and a closest-region hint (FR-EDIT-07)
+
+When `old_str` is not found exactly, one retry tolerates indentation and
+trailing-whitespace drift (the same block, uniformly re-indented); the
+replacement is re-indented to the file's and the result says
+`(matched with whitespace normalisation)`. When nothing matches, the error
+shows the most similar region of the file with line numbers, so the model
+can retry without reading the whole file again.
+
+### Changed — edit results never echo files (FR-EDIT-02/08)
+
+`str_replace` returns the lines around each change (at most three seams),
+`write` a line diffstat (`wrote f.rs: 412 → 430 lines (+31 −13)`, with a
+nudge towards `str_replace_editor` when an existing file of more than 200
+lines was rewritten whole), and `apply_patch` a per-file diffstat
+(`M src/a.rs +12 −3`).
+
+### Fixed — `apply_patch` edits were never synced to the language server
+
+Only `write` and `str_replace` pushed new text to the language server, so
+after an `apply_patch` it answered from stale contents. Every write path now
+records what it wrote and the registry syncs each file, every file of a
+multi-file patch included (FR-LSP-09).
+
 ### Changed — `read` returns line ranges with line numbers (FR-READ-01..04)
 
 `read` takes `offset` (1-based) and `limit`, and every line it returns

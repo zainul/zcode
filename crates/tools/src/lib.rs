@@ -13,6 +13,7 @@
 //! spellings a provider will actually emit.
 #![cfg_attr(not(test), forbid(unsafe_code))]
 
+pub mod edit;
 pub mod guard;
 pub mod native;
 pub mod patch;
@@ -143,6 +144,9 @@ pub struct ToolRegistry {
     cancel: SharedCancel,
     /// The discovery service every search/listing tool shares (CE-DQ2).
     search: Option<Search>,
+    /// Every file a native tool wrote during the current call, drained after
+    /// it to keep the language server (and index) in sync (FR-EDIT-09).
+    write_log: edit::WriteLog,
 }
 
 impl ToolRegistry {
@@ -156,6 +160,20 @@ impl ToolRegistry {
             warnings: Vec::new(),
             cancel: SharedCancel::default(),
             search: None,
+            write_log: edit::WriteLog::default(),
+        }
+    }
+
+    /// The log write tools record into; pass it to each one registered.
+    pub fn write_log(&self) -> edit::WriteLog {
+        self.write_log.clone()
+    }
+
+    /// Sync one written file everywhere that keeps a view of the tree.
+    fn after_write(&mut self, path: &Path, text: &str) {
+        if let Some(lsp) = self.lsp.as_mut() {
+            let absolute = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+            let _ = lsp.port.open_document(&file_uri(&absolute), text);
         }
     }
 
@@ -273,8 +291,10 @@ impl ToolRegistry {
         // Registration order is wire order, and wire order is part of the
         // cached prompt prefix (FR-CACHE-02) — keep it fixed (technical plan
         // §8): discover/inspect tools first, then the ones that change things.
+        let registry = Self::new(root.clone());
+        let log = registry.write_log();
         #[allow(unused_mut)]
-        let mut registry = Self::new(root.clone())
+        let mut registry = registry
             .with_native(Box::new(
                 ReadTool::new(root.clone()).with_default_limit(cfg.read.default_limit),
             ))
@@ -283,11 +303,17 @@ impl ToolRegistry {
                 cfg.search.max_file_bytes,
                 cfg.search.timeout_ms,
             )
-            .with_native(Box::new(WriteTool::new(root.clone())))
             .with_native(Box::new(
-                StrReplaceTool::new(root.clone()).with_search(search),
+                WriteTool::new(root.clone()).with_write_log(log.clone()),
             ))
-            .with_native(Box::new(ApplyPatchTool::new(root.clone())))
+            .with_native(Box::new(
+                StrReplaceTool::new(root.clone())
+                    .with_search(search)
+                    .with_write_log(log.clone()),
+            ))
+            .with_native(Box::new(
+                ApplyPatchTool::new(root.clone()).with_write_log(log),
+            ))
             .with_native(Box::new(ShellTool::new(
                 root.clone(),
                 shell,
@@ -360,22 +386,6 @@ impl ToolRegistry {
         let resolved = native::resolve(&self.root, path);
         let absolute = resolved.canonicalize().unwrap_or(resolved);
         Some(file_uri(&absolute))
-    }
-
-    /// After a successful edit, push the new text to the language server so
-    /// `find_references`/`rename` reflect our changes (FR-LSP-04).
-    fn sync_lsp_document(&mut self, args: &serde_json::Value) {
-        let Some(lsp) = self.lsp.as_mut() else {
-            return;
-        };
-        let Some(path) = args.get("path").and_then(|v| v.as_str()) else {
-            return;
-        };
-        let resolved = native::resolve(&self.root, path);
-        let absolute = resolved.canonicalize().unwrap_or(resolved);
-        if let Ok(text) = std::fs::read_to_string(&absolute) {
-            let _ = lsp.port.open_document(&file_uri(&absolute), &text);
-        }
     }
 
     fn call_lsp(&mut self, canonical: &str, args_json: &str) -> Result<ToolResult, BoxError> {
@@ -466,14 +476,14 @@ impl ToolRegistryPort for ToolRegistry {
 
         if let Some(index) = self.native_index(&canonical) {
             let result = self.native[index].tool.call(&canonical, args_json)?;
-            // Keep the language server's view of edited files current.
-            if result.error.is_none()
-                && (canonical == TOOL_WRITE || canonical == TOOL_STR_REPLACE)
-                && self.lsp.is_some()
-            {
-                if let Ok(args) = serde_json::from_str::<serde_json::Value>(args_json) {
-                    self.sync_lsp_document(&args);
-                }
+            // FR-EDIT-09 / FR-LSP-09: every file any write path touched —
+            // each file of an `apply_patch` included — is synced.
+            let written = match self.write_log.lock() {
+                Ok(mut log) => std::mem::take(&mut *log),
+                Err(_) => Vec::new(),
+            };
+            for (path, text) in written {
+                self.after_write(&path, &text);
             }
             return Ok(result);
         }
@@ -897,9 +907,17 @@ mod tests {
     fn writes_are_pushed_to_the_language_server() {
         let dir = tempfile::tempdir().unwrap();
         let opened = OpenedDocs::default();
-        let mut registry = ToolRegistry::new(dir.path().to_path_buf())
-            .with_native(Box::new(WriteTool::new(dir.path().to_path_buf())))
-            .with_native(Box::new(StrReplaceTool::new(dir.path().to_path_buf())))
+        let registry = ToolRegistry::new(dir.path().to_path_buf());
+        let log = registry.write_log();
+        let root = dir.path().to_path_buf();
+        let mut registry = registry
+            .with_native(Box::new(
+                WriteTool::new(root.clone()).with_write_log(log.clone()),
+            ))
+            .with_native(Box::new(
+                StrReplaceTool::new(root.clone()).with_write_log(log.clone()),
+            ))
+            .with_native(Box::new(ApplyPatchTool::new(root).with_write_log(log)))
             .with_lsp(Box::new(FakeLsp {
                 opened: opened.clone(),
             }));
@@ -920,9 +938,25 @@ mod tests {
                 r#"{"command":"str_replace","path":"a.rs","old_str":"main","new_str":"start"}"#,
             )
             .unwrap();
-        let docs = opened.0.lock().unwrap();
+        let docs = opened.0.lock().unwrap().clone();
         assert_eq!(docs.len(), 2, "str_replace must also sync");
         assert_eq!(docs[1].1, "fn start() {}");
+
+        // FR-LSP-09: v0.6 never synced apply_patch; every patched file is.
+        let patch = "--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-fn start() {}\n+fn go() {}\n\
+                     --- /dev/null\n+++ b/b.rs\n@@ -0,0 +1 @@\n+fn b() {}\n";
+        let res = registry
+            .call(
+                TOOL_APPLY_PATCH,
+                &serde_json::json!({ "patch": patch }).to_string(),
+            )
+            .unwrap();
+        assert!(res.error.is_none(), "{res:?}");
+        let docs = opened.0.lock().unwrap();
+        assert_eq!(docs.len(), 4, "both patched files synced: {docs:?}");
+        assert!(docs[2].0.ends_with("a.rs"), "{docs:?}");
+        assert_eq!(docs[2].1.trim_end(), "fn go() {}", "{docs:?}");
+        assert!(docs[3].0.ends_with("b.rs"));
     }
 
     #[test]
