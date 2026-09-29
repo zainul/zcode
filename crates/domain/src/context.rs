@@ -272,6 +272,107 @@ pub fn elided_stub(m: &LlmMessage, call: Option<&LlmToolCall>) -> String {
     }
 }
 
+/// Tier 3 (FR-CTX-07): the longest contiguous run of unprotected messages
+/// after the task message, aligned to step boundaries — it starts at an
+/// assistant turn (or an earlier summary) and ends just before a protected
+/// message, never between a call and its results. `None` when there is
+/// nothing worth summarising (fewer than two steps).
+pub fn summarisable_span(h: &[LlmMessage], prot: &[bool]) -> Option<std::ops::Range<usize>> {
+    let task = h.iter().position(|m| m.role == LlmRole::User)?;
+    let start = (task + 1..h.len()).find(|&i| {
+        !prot[i] && (h[i].role == LlmRole::Assistant || h[i].meta.kind == MessageKind::Summary)
+    })?;
+    let mut end = start;
+    while end < h.len() && !prot[end] {
+        end += 1;
+    }
+    // Never end between an assistant's calls and their results.
+    while end > start && h[end - 1].role == LlmRole::Assistant && !h[end - 1].tool_calls.is_empty()
+    {
+        end -= 1;
+    }
+    let steps = h[start..end]
+        .iter()
+        .filter(|m| m.role == LlmRole::Assistant)
+        .count();
+    (steps >= 2).then_some(start..end)
+}
+
+/// The engine-written part of a summary (PRD D-7): every file the span read
+/// or changed, from the tool ledger — never from the model, so it cannot be
+/// hallucinated. One line per path, operations in order.
+pub fn files_touched(span: &[LlmMessage]) -> String {
+    let mut order: Vec<String> = Vec::new();
+    let mut ops: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    let mut note = |path: &str, op: String| {
+        if !ops.contains_key(path) {
+            order.push(path.to_string());
+        }
+        ops.entry(path.to_string()).or_default().push(op);
+    };
+    for m in span {
+        let step = m.meta.step;
+        match &m.meta.subject {
+            Some(Subject::FileRange {
+                path, start, end, ..
+            }) => note(path, format!("read L{start}-{end} (s{step})")),
+            Some(Subject::FileWrite { path }) => note(path, format!("edited (s{step})")),
+            Some(Subject::FileWrites { paths }) => {
+                for p in paths {
+                    note(p, format!("patched (s{step})"));
+                }
+            }
+            _ => {}
+        }
+    }
+    if order.is_empty() {
+        return "(no files read or changed in these steps)".into();
+    }
+    order
+        .iter()
+        .map(|p| format!("- {p} — {}", ops[p].join(", ")))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The span as plain text for the summariser: roles, tool calls with their
+/// arguments, and tool output clipped to `clip` characters each.
+pub fn render_for_summary(span: &[LlmMessage], clip: usize) -> String {
+    let mut out = String::new();
+    let clipped = |text: &str| -> String {
+        if text.chars().count() <= clip {
+            text.to_string()
+        } else {
+            let head: String = text.chars().take(clip).collect();
+            format!("{head}\n…[{} more chars]", text.chars().count() - clip)
+        }
+    };
+    for m in span {
+        match m.role {
+            LlmRole::System => {}
+            LlmRole::User => {
+                out.push_str(&format!("## user\n{}\n\n", clipped(&m.content)));
+            }
+            LlmRole::Assistant => {
+                out.push_str(&format!("## step {} — assistant\n", m.meta.step));
+                if !m.content.trim().is_empty() {
+                    out.push_str(&clipped(&m.content));
+                    out.push('\n');
+                }
+                for c in m.tool_calls.iter() {
+                    out.push_str(&format!("→ {}({})\n", c.name, clipped(&c.arguments)));
+                }
+                out.push('\n');
+            }
+            LlmRole::Tool => {
+                let text = m.tool_result.as_ref().map_or("", |r| r.content.as_str());
+                out.push_str(&format!("← result\n{}\n\n", clipped(text)));
+            }
+        }
+    }
+    out
+}
+
 /// Transcript invariants every provider relies on (FR-CTX-04): each tool
 /// result answers a call made earlier, each call is answered exactly once,
 /// and results follow their call's assistant message with nothing but other
@@ -606,5 +707,77 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn the_summarisable_span_is_step_aligned_and_skips_protected_messages() {
+        let h = session(10);
+        let p = Policy {
+            keep_recent_steps: 3,
+            ..Policy::default()
+        };
+        let prot = protected(&h, &p);
+        let span = summarisable_span(&h, &prot).unwrap();
+        assert_eq!(span.start, 2, "starts at the first assistant turn");
+        assert_eq!(
+            h[span.end].meta.step, 8,
+            "ends where the recent window begins"
+        );
+        assert!(span.clone().all(|i| !prot[i]));
+        let short = session(2);
+        let prot = protected(
+            &short,
+            &Policy {
+                keep_recent_steps: 1,
+                ..Policy::default()
+            },
+        );
+        assert!(
+            summarisable_span(&short, &prot).is_none(),
+            "one step is not worth it"
+        );
+    }
+
+    #[test]
+    fn files_touched_comes_from_the_ledger_in_order() {
+        let mut h = session(0);
+        h.push(assistant(3, vec![call("a", "read", "{}")]));
+        h.push(result("a", 3, range("src/lib.rs", 1, 400), 10));
+        h.push(assistant(9, vec![call("b", "write", "{}")]));
+        h.push(result(
+            "b",
+            9,
+            Some(Subject::FileWrite {
+                path: "src/lib.rs".into(),
+            }),
+            10,
+        ));
+        h.push(assistant(11, vec![call("c", "apply_patch", "{}")]));
+        h.push(result(
+            "c",
+            11,
+            Some(Subject::FileWrites {
+                paths: vec!["a/new.rs".into()],
+            }),
+            10,
+        ));
+        assert_eq!(
+            files_touched(&h[2..]),
+            "- src/lib.rs — read L1-400 (s3), edited (s9)\n- a/new.rs — patched (s11)"
+        );
+        assert_eq!(
+            files_touched(&h[..2]),
+            "(no files read or changed in these steps)"
+        );
+    }
+
+    #[test]
+    fn the_rendered_span_clips_long_output() {
+        let mut h = session(0);
+        h.push(assistant(1, vec![call("a", "read", r#"{"path":"x"}"#)]));
+        h.push(result("a", 1, None, 400));
+        let text = render_for_summary(&h[2..], 50);
+        assert!(text.starts_with("## step 1 — assistant\n→ read({\"path\":\"x\"})\n"));
+        assert!(text.contains("more chars]"));
     }
 }

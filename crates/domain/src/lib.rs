@@ -30,9 +30,9 @@ pub use model::{
     LspTextEdit, LspWorkspaceEdit, Plugin, ShellCommand, Task, TaskStatus,
 };
 pub use naming::{canonical_tool_name, tool_category, tool_category_for_call};
-pub use ports::describe_compaction;
 #[allow(deprecated)]
 pub use ports::CompletionChunk;
+pub use ports::{describe_compaction, CompactionEntry};
 pub use ports::{
     Emitter, ExtraField, FileSystemPort, LlmEvent, LlmFinish, LlmFinishReason, LlmMessage, LlmPort,
     LlmRequest, LlmResponse, LlmRole, LlmToolCall, LlmToolResult, LogLevel, LoggerPort, LspPort,

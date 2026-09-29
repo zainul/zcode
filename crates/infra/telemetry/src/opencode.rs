@@ -838,4 +838,41 @@ mod tests {
         }
         assert!(t.calls.len() <= 64, "{} entries retained", t.calls.len());
     }
+
+    /// opencode's `session-event.ts` defines no compaction event, so the
+    /// translation carries none (translation, not emulation — CLAUDE.md).
+    #[test]
+    fn compaction_events_have_no_opencode_translation() {
+        let cap = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        struct W(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for W {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut tel = OpencodeTelemetry::new(Box::new(W(cap.clone())));
+        for kind in [
+            "context_compacted",
+            "cache_reset",
+            "context_compaction_failed",
+        ] {
+            tel.emit(TelemetryEvent {
+                kind: kind.into(),
+                model: "m".into(),
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                steps: 1,
+                execution_time_ms: 1,
+                session_id: "s".into(),
+                extra: Box::new([]),
+            });
+        }
+        assert!(cap.lock().unwrap().is_empty());
+    }
 }

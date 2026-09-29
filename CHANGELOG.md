@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — older steps are summarised when eliding is not enough (FR-CTX-07, 08)
+
+The third compaction tier: when superseding and eliding still leave the
+context above target, the oldest unprotected run of steps (at least two, cut
+only at step boundaries) is replaced by one session summary — Goal,
+constraints, decisions, work done, current state, next steps, open questions —
+written by the model from a plain-text rendering of those steps, which the
+prompt tells it to treat as data. Its **Files touched** section is written by
+the engine from the tool ledger, never by the model (a model's own version is
+discarded), so the record of what was read and changed cannot be invented.
+`context.compaction_model = "<provider>/<model>"` sends summaries to a
+cheaper model (resolved like `--model`, so a bad value fails at startup); the
+summary call is billed and reported like any other. A failed summary is a
+note, never a failed run: the other tiers still apply.
+
+### Added — compaction is durable and visible (FR-CTX-11, 13)
+
+Session files move to **schema version 2**: each compaction is recorded
+(step, tier, tokens before and after), and every message compaction replaced
+is appended to `.zcode/sessions/<id>.archive.jsonl` *before* the checkpoint
+that drops it, so a crash leaves the archive a superset. `zcode session
+export --full` inlines the archive and `session import` restores it; a fork
+keeps it. v1 files load unchanged; a file from a newer zcode is refused with
+a message saying to upgrade rather than misread. The TUI status bar shows
+how full the context is (`ctx 62%`, yellow from 60%, red from 75%, or
+`ctx 84.0k` for an unknown window) and each compaction appears as a note.
+
 ### Added — the conversation is compacted before it outgrows the window (FR-CTX-01..06, 09, 10)
 
 A transcript used to grow until the turn cap or a context-length error: every

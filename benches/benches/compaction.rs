@@ -57,6 +57,7 @@ fn bench(c: &mut Criterion) {
             spill: None,
             elide_args: &none,
             archived: &mut archived,
+            summarise: None,
         };
         m.force_compact(&mut h, Some(200_000), &mut deps)
             .expect("valid")

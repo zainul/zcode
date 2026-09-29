@@ -415,6 +415,25 @@ pub struct Session {
     pub last_message_at: String,
     pub step_count: u64,
     pub messages: Box<[LlmMessage]>,
+    /// Every compaction applied to `messages` (FR-CTX-11), oldest first.
+    pub compactions: Vec<CompactionEntry>,
+    /// The repo map frozen into this session's system prompt (FR-INDEX-08).
+    /// `Some("")` records "decided: no map", so a resume never adds one
+    /// later and changes the cached prefix (CE-DQ22).
+    pub repo_map: Option<String>,
+}
+
+/// One compaction, as recorded on the session (FR-CTX-11).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompactionEntry {
+    /// The step before which it ran.
+    pub step: u32,
+    /// Deepest tier used: 1 supersession, 2 elision, 3 summary.
+    pub tier: u8,
+    pub tokens_before: u64,
+    pub tokens_after: u64,
+    /// Messages replaced (their originals are in the archive).
+    pub archived: u32,
 }
 
 /// Where the full text of an over-budget tool output is kept (FR-READ-07,
@@ -442,6 +461,12 @@ pub trait SessionStorePort {
     /// checkpoint that drops them from the live transcript.
     fn archive(&mut self, _id: &str, _messages: &[LlmMessage]) -> Result<(), crate::BoxError> {
         Ok(())
+    }
+
+    /// Export including the archived (pre-compaction) messages, so the whole
+    /// conversation travels with the file. Defaults to a plain export.
+    fn export_full(&self, id: &str, path: &Path) -> Result<(), crate::BoxError> {
+        self.export_to(id, path)
     }
 }
 
@@ -553,6 +578,12 @@ pub enum UiEvent {
         tier: u8,
         tokens_before: u64,
         tokens_after: u64,
+    },
+    /// How full the context is after a provider call (FR-CTX-13), for a
+    /// status display. `window` is `None` for a model the table does not know.
+    Context {
+        live_tokens: u64,
+        window: Option<u64>,
     },
     /// Something invalidated the provider's prompt cache (FR-CACHE-08):
     /// the next request re-writes it.

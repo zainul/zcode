@@ -193,6 +193,9 @@ pub struct App {
     spill: Option<Box<dyn SpillPort + Send>>,
     /// Compaction settings (`[context]`, FR-CTX-*).
     context_cfg: ContextConfig,
+    /// A cheaper model for Tier 3 summaries (`context.compaction_model`,
+    /// FR-CTX-08); `None` uses the session's own client.
+    compaction_llm: Option<Box<dyn LlmPort + Send>>,
 }
 
 impl App {
@@ -215,7 +218,13 @@ impl App {
             cancel: CancelFlag::default(),
             spill: None,
             context_cfg: ContextConfig::default(),
+            compaction_llm: None,
         }
+    }
+
+    /// Summarise with this client instead of the session's (FR-CTX-08).
+    pub fn set_compaction_llm(&mut self, llm: Box<dyn LlmPort + Send>) {
+        self.compaction_llm = Some(llm);
     }
 
     /// Compaction settings (`[context]`).
@@ -376,13 +385,91 @@ impl App {
     /// replaced, tell the UI and telemetry, and note the prompt-cache reset
     /// it causes (FR-CTX-11/13, FR-CACHE-08). A failed compaction is a
     /// warning, never a failed run (FR-CTX-09).
+    /// Run one compaction with every collaborator it needs: the spill store,
+    /// the registry's argument shrinker, and a summariser on the compaction
+    /// model (or the session's model when none is configured). `forced`
+    /// ignores the trigger — a provider already refused the prompt.
+    fn compact_now(
+        &mut self,
+        ctx_mgr: &mut ContextManager,
+        history: &mut Vec<LlmMessage>,
+        session: &Session,
+        forced: bool,
+        focus: Option<&str>,
+    ) -> (Result<Option<CompactionRecord>, String>, Vec<LlmMessage>) {
+        let window = self.context_window.lookup(&session.model);
+        let mut archived = Vec::new();
+        let tools = &self.tools;
+        let elide = |name: &str, args: &str| tools.elide_args(name, args);
+        let llm: &mut (dyn LlmPort + Send) = match self.compaction_llm.as_mut() {
+            Some(l) => l.as_mut(),
+            None => self.llm.as_mut(),
+        };
+        let max_tokens = u64::from(self.context_cfg.summary_max_tokens) * 2;
+        let model = session.model.clone();
+        let focus = focus.map(str::to_string);
+        let mut summarise = move |span: &str| -> Result<(String, LlmFinish), String> {
+            let mut prompt = String::from("Summarise this part of the session.\n\n");
+            prompt.push_str(span);
+            if let Some(f) = &focus {
+                prompt.push_str(&format!("\n\nPay special attention to: {f}"));
+            }
+            let request = LlmRequest {
+                messages: Box::new([
+                    LlmMessage::system(context::SUMMARY_PROMPT),
+                    LlmMessage::user(&prompt),
+                ]),
+                tools: Box::new([]),
+                model: model.clone(),
+                max_tokens,
+                temperature: 0.0,
+                images: Box::new([]),
+            };
+            let (mut text, mut finish) = (String::new(), None);
+            for event in llm.stream(&request) {
+                match event.map_err(|e| e.to_string())? {
+                    LlmEvent::Delta(t) => text.push_str(&t),
+                    LlmEvent::Finish(f) => finish = Some(f),
+                    _ => {}
+                }
+            }
+            let finish = finish.unwrap_or(LlmFinish {
+                reason: LlmFinishReason::Stop,
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                cost_usd: None,
+            });
+            Ok((text, finish))
+        };
+        let mut deps = CompactDeps {
+            session_id: &session.id,
+            spill: self
+                .spill
+                .as_deref_mut()
+                .map(|s| s as &mut (dyn SpillPort + Send)),
+            elide_args: &elide,
+            archived: &mut archived,
+            summarise: Some(&mut summarise),
+        };
+        let result = if forced {
+            ctx_mgr.force_compact(history, window, &mut deps)
+        } else {
+            ctx_mgr.maybe_compact(history, window, &mut deps)
+        };
+        (result, archived)
+    }
+
     fn after_compaction(
         &mut self,
-        session: &Session,
-        step: u64,
+        session: &mut Session,
+        step: u32,
         outcome: (Result<Option<CompactionRecord>, String>, Vec<LlmMessage>),
         compactions: &mut u32,
+        usage: &mut RunUsage,
     ) {
+        let step_u64 = u64::from(step);
         let (result, archived) = outcome;
         let record = match result {
             Ok(Some(record)) => record,
@@ -392,13 +479,48 @@ impl App {
                 self.emit_telemetry(
                     "context_compaction_failed",
                     session,
-                    step,
+                    step_u64,
                     vec![("reason".into(), ExtraField::Text(problem))],
                 );
                 return;
             }
         };
         *compactions += 1;
+        // The summariser call was billed like any other.
+        if let Some(u) = &record.summary_usage {
+            usage.input += u.input_tokens;
+            usage.output += u.output_tokens;
+            usage.cache_read += u.cache_read_tokens;
+            usage.cache_write += u.cache_write_tokens;
+            self.emit_telemetry(
+                "llm_finish",
+                session,
+                step_u64,
+                vec![
+                    ("purpose".into(), ExtraField::Text("compaction".into())),
+                    (
+                        "input_tokens".into(),
+                        ExtraField::Number(u.input_tokens as f64),
+                    ),
+                    (
+                        "output_tokens".into(),
+                        ExtraField::Number(u.output_tokens as f64),
+                    ),
+                ],
+            );
+        }
+        if let Some(problem) = &record.summary_error {
+            self.emitter.emit(UiEvent::Notice(format!(
+                "could not summarise older steps ({problem}); kept the other compactions"
+            )));
+        }
+        session.compactions.push(domain::CompactionEntry {
+            step,
+            tier: record.tier,
+            tokens_before: record.tokens_before,
+            tokens_after: record.tokens_after,
+            archived: u32::try_from(archived.len()).unwrap_or(u32::MAX),
+        });
         if let Err(e) = self.sessions.archive(&session.id, &archived) {
             self.logger.log(
                 LogLevel::Warn,
@@ -416,7 +538,7 @@ impl App {
         self.emit_telemetry(
             "context_compacted",
             session,
-            step,
+            step_u64,
             vec![
                 ("tier".into(), ExtraField::Number(f64::from(record.tier))),
                 (
@@ -442,7 +564,7 @@ impl App {
         self.emit_telemetry(
             "cache_reset",
             session,
-            step,
+            step_u64,
             vec![("reason".into(), ExtraField::Text("compaction".into()))],
         );
     }
@@ -669,24 +791,14 @@ impl AgentLoop for App {
             // clamped to what is actually left; an unknown model is sent
             // exactly what was configured, as before.
             // FR-CTX-01: keep the transcript bounded before it is sent.
-            let window = self.context_window.lookup(&session.model);
-            let outcome = {
-                let mut archived = Vec::new();
-                let tools = &self.tools;
-                let elide = |name: &str, args: &str| tools.elide_args(name, args);
-                let mut deps = CompactDeps {
-                    session_id: &session.id,
-                    spill: self
-                        .spill
-                        .as_deref_mut()
-                        .map(|s| s as &mut (dyn SpillPort + Send)),
-                    elide_args: &elide,
-                    archived: &mut archived,
-                };
-                let r = ctx_mgr.maybe_compact(&mut history, window, &mut deps);
-                (r, archived)
-            };
-            self.after_compaction(&session, steps + 1, outcome, &mut compactions);
+            let outcome = self.compact_now(&mut ctx_mgr, &mut history, &session, false, None);
+            self.after_compaction(
+                &mut session,
+                step_base + steps as u32 + 1,
+                outcome,
+                &mut compactions,
+                &mut usage,
+            );
 
             let estimated_prompt_tokens = ctx_mgr.live_tokens(&history);
             peak_context_tokens = peak_context_tokens.max(estimated_prompt_tokens);
@@ -834,25 +946,16 @@ impl AgentLoop for App {
                     if let Some(tokens) = domain::parse_window_from_error(&error) {
                         self.context_window.learn(&session.model, tokens);
                     }
-                    let window = self.context_window.lookup(&session.model);
-                    let outcome = {
-                        let mut archived = Vec::new();
-                        let tools = &self.tools;
-                        let elide = |name: &str, args: &str| tools.elide_args(name, args);
-                        let mut deps = CompactDeps {
-                            session_id: &session.id,
-                            spill: self
-                                .spill
-                                .as_deref_mut()
-                                .map(|s| s as &mut (dyn SpillPort + Send)),
-                            elide_args: &elide,
-                            archived: &mut archived,
-                        };
-                        let r = ctx_mgr.force_compact(&mut history, window, &mut deps);
-                        (r, archived)
-                    };
+                    let outcome =
+                        self.compact_now(&mut ctx_mgr, &mut history, &session, true, None);
                     let changed = matches!(outcome.0, Ok(Some(_)));
-                    self.after_compaction(&session, steps + 1, outcome, &mut compactions);
+                    self.after_compaction(
+                        &mut session,
+                        step_base + steps as u32 + 1,
+                        outcome,
+                        &mut compactions,
+                        &mut usage,
+                    );
                     if changed {
                         self.emitter.emit(UiEvent::Notice(
                             "the provider refused the prompt as too long — compacted the \
@@ -907,6 +1010,10 @@ impl AgentLoop for App {
             // and each one has already been billed — showing `0 in / 0 out`
             // until it finishes tells the user nothing about a cost they are
             // already incurring.
+            self.emitter.emit(UiEvent::Context {
+                live_tokens: ctx_mgr.live_tokens(&history),
+                window: self.context_window.lookup(&session.model),
+            });
             self.emitter.emit(UiEvent::Usage(LlmFinish {
                 reason: finish.reason,
                 input_tokens: usage.input,
@@ -1328,6 +1435,8 @@ mod tests {
                     last_message_at: "now".into(),
                     step_count: 0,
                     messages: Box::new([]),
+                    compactions: Vec::new(),
+                    repo_map: None,
                 },
             );
             Ok(id)
@@ -1910,6 +2019,7 @@ mod tests {
                     UiEvent::Notice(_) => "notice",
                     UiEvent::Compacted { .. } => "compacted",
                     UiEvent::CacheReset { .. } => "cache_reset",
+                    UiEvent::Context { .. } => "context",
                 };
                 self.0.lock().unwrap().push(label.to_string());
             }
@@ -2346,6 +2456,56 @@ mod tests {
             long_session(vec![Err("401 invalid api key".into())], 2, 10, 1_000_000);
         assert!(app.execute(&ctx(), long_request()).is_err());
         assert_eq!(seen.lock().unwrap().len(), 3, "no retry");
+    }
+
+    /// FR-CTX-07/08/11: when elision cannot reach the target, older steps
+    /// are summarised — through the compaction client when one is set — and
+    /// the compaction is recorded on the session.
+    #[test]
+    fn tier3_runs_through_the_compaction_client_and_is_recorded() {
+        // Tool results under the elision threshold force Tier 3.
+        let (mut app, telemetry, _, sessions) = long_session(vec![], 60, 300, 20_000);
+        app.set_context_config(ContextConfig {
+            elide_over_tokens: u32::MAX,
+            ..ContextConfig::default()
+        });
+        let summariser = ScriptLlm::new(vec![Ok(vec![
+            LlmEvent::Delta("## Goal\n- read the files".into()),
+            LlmEvent::Finish(LlmFinish {
+                reason: LlmFinishReason::Stop,
+                input_tokens: 4_000,
+                output_tokens: 200,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                cost_usd: None,
+            }),
+        ])]);
+        let summariser_calls = summariser.seen.clone();
+        app.set_compaction_llm(Box::new(summariser));
+        let result = app.execute(&ctx(), long_request()).unwrap();
+        assert!(result.compactions >= 1);
+        assert_eq!(
+            summariser_calls.lock().unwrap().len(),
+            1,
+            "one summary call"
+        );
+        assert!(result.input_tokens >= 4_000, "the summary call is billed");
+        let session = sessions.load(&result.session_id).unwrap();
+        assert!(
+            session.compactions.iter().any(|c| c.tier == 3),
+            "{:?}",
+            session.compactions
+        );
+        let summary = session
+            .messages
+            .iter()
+            .find(|m| m.meta.kind == domain::MessageKind::Summary)
+            .expect("a summary message");
+        assert!(summary.content.contains("## Goal"));
+        assert!(summary
+            .content
+            .contains("## Files touched (from the tool ledger)"));
+        assert!(kinds(&telemetry).contains(&"llm_finish".to_string()));
     }
 
     #[test]

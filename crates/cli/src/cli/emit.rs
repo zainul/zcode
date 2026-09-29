@@ -101,6 +101,7 @@ impl<W: Write> Emitter for PrettyEmitter<W> {
             UiEvent::ToolCallArgs { .. }
             | UiEvent::Finish(_)
             | UiEvent::Usage(_)
+            | UiEvent::Context { .. }
             | UiEvent::LoopStart { .. } => {}
         }
         let _ = self.out.flush();

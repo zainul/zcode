@@ -252,6 +252,10 @@ pub enum SessionCmd {
         /// Destination file.
         #[arg(long = "to", value_name = "FILE")]
         to: PathBuf,
+        /// Include the messages compaction replaced (the session's archive),
+        /// so the whole conversation travels with the file.
+        #[arg(long)]
+        full: bool,
     },
 }
 
@@ -528,6 +532,15 @@ pub fn wire_with_format(
         summary_max_tokens: cfg.context.summary_max_tokens,
         ..app::ContextConfig::default()
     });
+    // FR-CTX-08: a cheaper model for Tier 3 summaries, resolved exactly like
+    // `--model` so a bad value fails here, at startup, not mid-session.
+    if !cfg.context.compaction_model.trim().is_empty() {
+        let mut summariser = cfg.clone();
+        summariser
+            .select_model(&cfg.context.compaction_model)
+            .map_err(|e| AppError::Config(format!("context.compaction_model: {e}")))?;
+        app.set_compaction_llm(build_llm(&summariser)?);
+    }
     // FR-READ-07: over-budget tool output is kept in full under .zcode/spill.
     app.set_spill(Box::new(infra_filesystem::SpillStore::new(
         &cfg.working_dir,
@@ -833,16 +846,18 @@ fn cmd_session(command: SessionCmd) -> CliResult {
         SessionCmd::Import { file } => {
             outln!("{}", store.import_from(&file)?);
         }
-        SessionCmd::Export { id, to } => {
-            store.export_to(&id, &to)?;
+        SessionCmd::Export { id, to, full } => {
+            if full {
+                store.export_full(&id, &to)?;
+            } else {
+                store.export_to(&id, &to)?;
+            }
             outln!("{}", to.display());
         }
     }
     Ok(ExitCode::SUCCESS)
 }
 
-/// `zcode config` — which files were consulted, and what they add up to.
-/// Secrets are never printed: only whether the named variable resolves.
 /// The PRD-CTX-EFF-003 settings, grouped the way `zcode.toml` spells them.
 fn print_efficiency(cfg: &Config) {
     let c = &cfg.context;
@@ -905,6 +920,8 @@ fn print_efficiency(cfg: &Config) {
     );
 }
 
+/// `zcode config` — which files were consulted, and what they add up to.
+/// Secrets are never printed: only whether the named variable resolves.
 fn cmd_config(args: ConfigArgs) -> CliResult {
     let loader = Loader::with_default();
     let cfg = loader.load_with_override(args.config.as_deref())?;

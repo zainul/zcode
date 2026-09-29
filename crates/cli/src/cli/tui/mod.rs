@@ -148,6 +148,25 @@ impl Phase {
     }
 }
 
+/// `ctx 62%`, or `ctx 84.0k` when the model's window is unknown.
+fn context_label(live: u64, window: Option<u64>) -> String {
+    match window.filter(|w| *w > 0) {
+        Some(w) => format!("ctx {}%", (live as f64 / w as f64 * 100.0).round() as u64),
+        None if live >= 1_000 => format!("ctx {:.1}k", live as f64 / 1_000.0),
+        None => format!("ctx {live}"),
+    }
+}
+
+fn context_span(live: u64, window: Option<u64>) -> Span<'static> {
+    let share = window.filter(|w| *w > 0).map(|w| live as f64 / w as f64);
+    let style = match share {
+        Some(s) if s >= 0.75 => Style::default().fg(Color::Red),
+        Some(s) if s >= 0.60 => Style::default().fg(Color::Yellow),
+        _ => Style::default(),
+    };
+    Span::styled(context_label(live, window), style)
+}
+
 /// Running totals for the whole TUI session, across turns.
 #[derive(Debug, Default, Clone)]
 pub struct Totals {
@@ -227,6 +246,8 @@ pub struct TuiState {
     pub session_id: Option<String>,
     pub session_dir: String,
     pub totals: Totals,
+    /// The latest live-context report: (tokens, window) — FR-CTX-13.
+    pub context: Option<(u64, Option<u64>)>,
     pub tool_names: Vec<String>,
     /// Names from the config's `providers` array, for `/provider`.
     pub providers: Vec<String>,
@@ -286,6 +307,7 @@ impl Default for TuiState {
             session_id: None,
             session_dir: String::new(),
             totals: Totals::default(),
+            context: None,
             tool_names: Vec::new(),
             providers: Vec::new(),
             run_override: std::collections::HashMap::new(),
@@ -550,6 +572,10 @@ impl TuiState {
                 NoteLevel::Info,
             ),
             UiEvent::CacheReset { .. } => {}
+            UiEvent::Context {
+                live_tokens,
+                window,
+            } => self.context = Some((live_tokens, window)),
             UiEvent::LoopStart { step, max_turns } => {
                 self.phase = Phase::Working {
                     since: match &self.phase {
@@ -785,6 +811,15 @@ impl TuiState {
                 tokens.push_str(&format!(" / {} cached", self.totals.cache_tokens));
             }
             spans.push(Span::raw(tokens));
+        }
+
+        // FR-CTX-13: how full the context is, coloured as it nears the
+        // compaction trigger (75% by default).
+        if detail.shows_tokens() {
+            if let Some((live, window)) = self.context {
+                spans.push(Span::raw(SEP));
+                spans.push(context_span(live, window));
+            }
         }
 
         // The cost is never dropped: showing it is the point.
@@ -3874,5 +3909,46 @@ drwxr-xr-x  ..."
         let payload = "fn main() {\n    println!(\"hi\");\n}\n";
         state.input.insert_str(payload);
         assert_eq!(state.input.text(), payload);
+    }
+
+    // ---- FR-CTX-13: context fill and compaction notes --------------------
+
+    #[test]
+    fn context_labels_show_a_share_or_a_size() {
+        assert_eq!(context_label(124_000, Some(200_000)), "ctx 62%");
+        assert_eq!(context_label(84_000, None), "ctx 84.0k");
+        assert_eq!(context_label(900, None), "ctx 900");
+    }
+
+    #[test]
+    fn context_and_compaction_events_update_the_state() {
+        let mut state = TuiState::default();
+        state.apply(UiEvent::Context {
+            live_tokens: 150_000,
+            window: Some(200_000),
+        });
+        assert_eq!(state.context, Some((150_000, Some(200_000))));
+        state.apply(UiEvent::Compacted {
+            tier: 3,
+            tokens_before: 150_000,
+            tokens_after: 61_000,
+        });
+        state.apply(UiEvent::CacheReset {
+            reason: "compaction".into(),
+        });
+        state.apply(UiEvent::CacheReset {
+            reason: "mode changed".into(),
+        });
+        let text = format!("{:?}", state.timeline);
+        assert!(
+            text.contains("context compacted 150.0k → 61.0k tokens (older steps summarised)"),
+            "{text}"
+        );
+        assert!(text.contains("prompt cache reset: mode changed"), "{text}");
+        assert_eq!(
+            text.matches("prompt cache reset").count(),
+            1,
+            "compaction's reset is not repeated"
+        );
     }
 }

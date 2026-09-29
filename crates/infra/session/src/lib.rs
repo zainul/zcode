@@ -23,7 +23,10 @@ use serde::{Deserialize, Serialize};
 
 use uuid::Uuid;
 
-const SCHEMA_VERSION: u32 = 1;
+/// v2 (context-efficiency milestone): compaction records and the frozen repo
+/// map. v1 files load unchanged; a file from a newer zcode is refused with a
+/// message saying so, not misread.
+const SCHEMA_VERSION: u32 = 2;
 const DEFAULT_MODEL: &str = "gpt-4o-mini";
 
 /// Errors surfaced from `SessionStorePort` methods (mapped to `Box<dyn Error>`
@@ -124,6 +127,24 @@ struct SessionFile {
     last_message_at: String,
     step_count: u64,
     messages: Vec<SerializableMessage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    compactions: Vec<CompactionFile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    repo_map: Option<String>,
+    /// Pre-compaction messages, present only in a `--full` export.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    archived_messages: Vec<SerializableMessage>,
+}
+
+/// Mirror of `domain::CompactionEntry`.
+#[derive(Debug, Serialize, Deserialize)]
+struct CompactionFile {
+    step: u32,
+    tier: u8,
+    tokens_before: u64,
+    tokens_after: u64,
+    #[serde(default)]
+    archived: u32,
 }
 
 /// On-disk spelling of `domain::AgentMode`.
@@ -344,6 +365,19 @@ impl SessionFile {
                 .iter()
                 .map(SerializableMessage::from)
                 .collect(),
+            compactions: session
+                .compactions
+                .iter()
+                .map(|c| CompactionFile {
+                    step: c.step,
+                    tier: c.tier,
+                    tokens_before: c.tokens_before,
+                    tokens_after: c.tokens_after,
+                    archived: c.archived,
+                })
+                .collect(),
+            repo_map: session.repo_map.clone(),
+            archived_messages: Vec::new(),
         }
     }
 
@@ -361,6 +395,18 @@ impl SessionFile {
                 .map(SerializableMessage::into_llm_message)
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
+            compactions: self
+                .compactions
+                .into_iter()
+                .map(|c| domain::CompactionEntry {
+                    step: c.step,
+                    tier: c.tier,
+                    tokens_before: c.tokens_before,
+                    tokens_after: c.tokens_after,
+                    archived: c.archived,
+                })
+                .collect(),
+            repo_map: self.repo_map,
         }
     }
 }
@@ -546,8 +592,27 @@ impl UuidSessionStore {
             )));
         }
         let content = fs::read_to_string(path)?;
-        let file: SessionFile = serde_json::from_str(&content)?;
+        let file = parse_session_file(&content)?;
         Ok(file.into_session())
+    }
+
+    fn archive_path(&self, id: &str) -> Result<PathBuf, SessionError> {
+        if !is_safe_id(id) {
+            return Err(SessionError::InvalidId(id.into()));
+        }
+        Ok(self.base.join(format!("{id}.archive.jsonl")))
+    }
+
+    fn read_archive(&self, id: &str) -> Result<Vec<SerializableMessage>, SessionError> {
+        let path = self.archive_path(id)?;
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        fs::read_to_string(path)?
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).map_err(SessionError::from))
+            .collect()
     }
 
     fn write_session(&self, id: &str, session: &Session) -> Result<(), SessionError> {
@@ -560,6 +625,21 @@ impl UuidSessionStore {
         let json = serde_json::to_string_pretty(&file)?;
         self.atomic_write(&path, &json)
     }
+}
+
+/// Parse a session file of any version this build understands.
+fn parse_session_file(content: &str) -> Result<SessionFile, SessionError> {
+    let version = serde_json::from_str::<serde_json::Value>(content)?
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(1);
+    if version > u64::from(SCHEMA_VERSION) {
+        return Err(SessionError::Other(format!(
+            "session file version {version} is newer than this zcode understands (max \
+             {SCHEMA_VERSION}) — upgrade zcode to open it"
+        )));
+    }
+    Ok(serde_json::from_str(content)?)
 }
 
 impl Default for UuidSessionStore {
@@ -580,6 +660,8 @@ impl SessionStorePort for UuidSessionStore {
             last_message_at: now,
             step_count: 0,
             messages: Box::new([]),
+            compactions: Vec::new(),
+            repo_map: None,
         };
         self.write_session(&id, &session)?;
         Ok(id)
@@ -611,6 +693,11 @@ impl SessionStorePort for UuidSessionStore {
         };
         let json = serde_json::to_string_pretty(&file)?;
         self.atomic_write(&path, &json)?;
+        // The archive belongs to the transcript: a fork keeps it.
+        let archive = self.archive_path(id)?;
+        if archive.exists() {
+            fs::copy(archive, self.archive_path(new_id)?)?;
+        }
         Ok(())
     }
 
@@ -622,9 +709,20 @@ impl SessionStorePort for UuidSessionStore {
             ))));
         }
         let content = fs::read_to_string(path)?;
-        let mut file: SessionFile = serde_json::from_str(&content)?;
+        let mut file = parse_session_file(&content)?;
         let new_id = Uuid::now_v7().to_string();
         file.id = new_id.clone();
+        // A `--full` export carries the archive inline; put it back beside
+        // the session rather than into it.
+        let archived = std::mem::take(&mut file.archived_messages);
+        if !archived.is_empty() {
+            let mut lines = String::new();
+            for m in &archived {
+                lines.push_str(&serde_json::to_string(m)?);
+                lines.push('\n');
+            }
+            self.atomic_write(&self.archive_path(&new_id)?, &lines)?;
+        }
         let json = serde_json::to_string_pretty(&file)?;
         let dest = self.base.join(format!("{new_id}.json"));
         self.atomic_write(&dest, &json)?;
@@ -640,6 +738,40 @@ impl SessionStorePort for UuidSessionStore {
             }
         }
         self.atomic_write(path, &file_json)?;
+        Ok(())
+    }
+
+    fn export_full(&self, id: &str, path: &Path) -> Result<(), domain::BoxError> {
+        let src = self.id_path(id)?;
+        let mut file = parse_session_file(&fs::read_to_string(&src)?)?;
+        file.archived_messages = self.read_archive(id)?;
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        self.atomic_write(path, &serde_json::to_string_pretty(&file)?)?;
+        Ok(())
+    }
+
+    /// FR-CTX-11: append the replaced messages, one JSON object per line.
+    /// Called before the checkpoint that drops them from the live file, so
+    /// a crash in between leaves the archive a superset, never a gap.
+    fn archive(&mut self, id: &str, messages: &[LlmMessage]) -> Result<(), domain::BoxError> {
+        if messages.is_empty() {
+            return Ok(());
+        }
+        let mut lines = String::new();
+        for m in messages {
+            lines.push_str(&serde_json::to_string(&SerializableMessage::from(m))?);
+            lines.push('\n');
+        }
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.archive_path(id)?)?;
+        f.write_all(lines.as_bytes())?;
+        f.sync_data()?;
         Ok(())
     }
 }
@@ -710,6 +842,8 @@ mod tests {
             mode: AgentMode::Auto,
             last_message_at: now,
             step_count: steps,
+            compactions: Vec::new(),
+            repo_map: None,
             messages: Box::new([
                 LlmMessage::system("you are helpful"),
                 LlmMessage {
@@ -868,7 +1002,7 @@ mod tests {
         let session = with_two_messages("01900000-0000-7000-8000-000000000001", 3);
         let file = SessionFile::from_session(&session);
         let json = serde_json::to_string(&file).unwrap();
-        assert!(json.contains("\"version\":1"));
+        assert!(json.contains("\"version\":2"));
         assert!(json.contains("\"role\":\"assistant\""));
         assert!(json.contains("\"tool_calls\""));
         let back: SessionFile = serde_json::from_str(&json).unwrap();
@@ -964,5 +1098,84 @@ mod tests {
         let parsed: SessionFile = serde_json::from_str(v1).unwrap();
         let session = parsed.into_session();
         assert_eq!(session.messages[0].meta, MessageMeta::default());
+    }
+
+    // ---- schema v2: compactions and the archive (FR-CTX-11) --------------
+
+    fn compacted(id: &str) -> Session {
+        let mut s = with_two_messages(id, 5);
+        s.compactions = vec![domain::CompactionEntry {
+            step: 4,
+            tier: 2,
+            tokens_before: 150_000,
+            tokens_after: 61_000,
+            archived: 1,
+        }];
+        s.repo_map = Some("src/lib.rs\n  fn a()".into());
+        s
+    }
+
+    #[test]
+    fn compactions_and_the_repo_map_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = UuidSessionStore::new(dir.path().join("sessions"));
+        let id = store.create().unwrap();
+        store.checkpoint(&id, &compacted(&id)).unwrap();
+        let loaded = store.load(&id).unwrap();
+        assert_eq!(loaded.compactions, compacted(&id).compactions);
+        assert_eq!(loaded.repo_map, compacted(&id).repo_map);
+    }
+
+    #[test]
+    fn a_session_from_a_newer_zcode_is_a_clear_error() {
+        let err = parse_session_file(r#"{"version":3,"id":"x"}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("version 3 is newer than this zcode"), "{err}");
+    }
+
+    #[test]
+    fn archive_export_full_and_import_restore_the_whole_conversation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = UuidSessionStore::new(dir.path().join("sessions"));
+        let id = store.create().unwrap();
+        let original = LlmMessage::user("the long message that compaction replaced");
+        store.archive(&id, std::slice::from_ref(&original)).unwrap();
+        store
+            .archive(&id, &[LlmMessage::assistant("a second batch")])
+            .unwrap();
+        store.checkpoint(&id, &compacted(&id)).unwrap();
+
+        let out = dir.path().join("full.json");
+        store.export_full(&id, &out).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&out).unwrap()).unwrap();
+        assert_eq!(json["archived_messages"].as_array().unwrap().len(), 2);
+
+        let imported = store.import_from(&out).unwrap();
+        let archive = store.read_archive(&imported).unwrap();
+        assert_eq!(archive.len(), 2);
+        assert_eq!(archive[0].content, original.content);
+        // The live transcript is unchanged by the import.
+        assert_eq!(
+            store.load(&imported).unwrap().messages.len(),
+            compacted(&id).messages.len()
+        );
+        // A plain export stays small: no archive inline.
+        let plain = dir.path().join("plain.json");
+        store.export_to(&id, &plain).unwrap();
+        assert!(!fs::read_to_string(plain)
+            .unwrap()
+            .contains("archived_messages"));
+    }
+
+    #[test]
+    fn a_fork_keeps_the_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = UuidSessionStore::new(dir.path().join("sessions"));
+        let id = store.create().unwrap();
+        store.archive(&id, &[LlmMessage::user("old")]).unwrap();
+        store.fork(&id, "branch").unwrap();
+        assert_eq!(store.read_archive("branch").unwrap().len(), 1);
     }
 }
