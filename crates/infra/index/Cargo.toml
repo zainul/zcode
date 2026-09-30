@@ -1,0 +1,30 @@
+[package]
+name = "infra-index"
+description = "tree-sitter code index: definitions, outline, symbol lookup, file graph, repo map (PRD-CTX-EFF-003)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+domain = { path = "../../domain", version = "0.6.0" }
+infra-search = { path = "../search", version = "0.6.0" }
+# CE-DQ1: 0.27 declares rust-version 1.90; the fallback resolver picks 0.26.
+tree-sitter = "0.26"
+streaming-iterator = "0.1"
+tree-sitter-rust = { version = "0.24", optional = true }
+tree-sitter-go = { version = "0.25", optional = true }
+tree-sitter-typescript = { version = "0.23", optional = true }
+tree-sitter-python = { version = "0.25", optional = true }
+log = { workspace = true }
+
+[features]
+# CE-DQ16: each grammar costs binary size; a packager can drop any of them.
+default = ["lang-rust", "lang-go", "lang-typescript", "lang-python"]
+lang-rust = ["dep:tree-sitter-rust"]
+lang-go = ["dep:tree-sitter-go"]
+lang-typescript = ["dep:tree-sitter-typescript"]
+lang-python = ["dep:tree-sitter-python"]
+
+[dev-dependencies]
+tempfile = "3.10"

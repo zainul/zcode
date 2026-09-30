@@ -16,6 +16,7 @@ infra-config = { path = "../infra/config", version = "0.6.0" }
 infra-session = { path = "../infra/session", version = "0.6.0" }
 infra-telemetry = { path = "../infra/telemetry", version = "0.6.0" }
 tools = { path = "../tools", version = "0.6.0", default-features = false }
+infra-index = { path = "../infra/index", version = "0.6.0", optional = true }
 clap = { workspace = true }
 log = { workspace = true }
 env_logger = { workspace = true }
@@ -28,12 +29,15 @@ serde_json = { workspace = true }
 tempfile = { workspace = true }
 
 [features]
-default = ["mcp", "lsp"]
+default = ["mcp", "lsp", "code-index"]
 # Forwarded to `tools`, which owns the optional adapters. Building with
 # --no-default-features drops the MCP and LSP clients from the binary.
 mcp = ["tools/mcp"]
 lsp = ["tools/lsp"]
 pty = ["infra-shell/pty"]
+# The tree-sitter code index (PRD-CTX-EFF-003 §5.4). Grammars are selected
+# on `infra-index` itself (lang-rust, lang-go, lang-typescript, lang-python).
+code-index = ["dep:infra-index"]
 
 [build-dependencies]
 # Build script embeds the git SHA + profile; no external build deps.

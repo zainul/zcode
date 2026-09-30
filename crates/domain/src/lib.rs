@@ -11,6 +11,7 @@
 //!  * **Pure helpers** (`tokens::estimate_tokens`, `modes::system_prompt`,
 //!    `pricing::PriceTable`, `context_window::WindowTable`).
 
+pub mod code_index;
 pub mod context;
 pub mod context_window;
 pub mod error;
@@ -23,6 +24,7 @@ pub mod pricing;
 pub mod search;
 pub mod tokens;
 
+pub use code_index::{CodeIndexPort, IndexState, ParsedFile, Related, Span, SymbolDef, SymbolKind};
 pub use context_window::{parse_window_from_error, WindowEntry, WindowTable};
 pub use error::DomainError;
 pub use model::{

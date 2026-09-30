@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — code index (FR-INDEX-01..04, 10, 11; FR-FILTER-06)
+
+New crate `infra-index`: a tree-sitter index of definitions, imports and
+identifier occurrences for Rust, Go, TypeScript/TSX (and JS) and Python, each
+grammar behind its own cargo feature. It builds on a `zcode-index` thread
+and never delays the first request; queries answer from partial data while
+`IndexState::Building`. The store is a small versioned binary file at
+`.zcode/index/v1/index.zcix`, written atomically and discarded (then rebuilt)
+on any corruption or extractor change. Rebuilds are incremental — a file is
+re-read only when its mtime or size moved and re-parsed only when its FNV-1a
+hash changed. Freshness: zcode's own writes re-index synchronously, a query
+re-checks the files it is about to return, and each turn starts with a
+stat-only rescan. Generated, minified, binary and oversized files are
+recorded as skipped; a parse is cut off after 500 ms. `zcode index
+status|rebuild|clear`, `--no-index` on `run`/`repl`, `index.enabled = false`.
+
+Measured (release, 10k synthetic Rust files, 80k definitions): cold build
+1.1 s, warm start 0.1 s, heap 20 MB (budget 25 MB), symbol query ≈ 3.5 ms.
+Signatures are not stored — reading the name's line back from the file for
+the few results a query returns took the heap from 30 MB to 20 MB.
+
+The index reaches the tools through `domain::CodeIndexPort`, so `tools` does
+not depend on `infra-index`; the `code-index` feature lives on the CLI,
+which spawns it (a departure from task-32's `tools/code-index` feature).
+
 ### Added — prompt-cache TTL policy (FR-CACHE-07, 08, 10)
 
 `[cache] ttl = "auto" | "5m" | "1h"` (default `auto`). In the TUI, where a

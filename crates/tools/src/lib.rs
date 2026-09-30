@@ -150,6 +150,9 @@ pub struct ToolRegistry {
     write_log: edit::WriteLog,
     /// URIs the language server has been told about.
     opened: std::collections::HashSet<String>,
+    /// The code index, told about every write so its spans stay exact
+    /// (FR-INDEX-04).
+    code_index: Option<Arc<dyn domain::CodeIndexPort>>,
 }
 
 impl ToolRegistry {
@@ -165,7 +168,19 @@ impl ToolRegistry {
             search: None,
             write_log: edit::WriteLog::default(),
             opened: std::collections::HashSet::new(),
+            code_index: None,
         }
+    }
+
+    /// Attach the code index.
+    pub fn with_code_index(mut self, index: Arc<dyn domain::CodeIndexPort>) -> Self {
+        self.code_index = Some(index);
+        self
+    }
+
+    /// The attached code index, if any.
+    pub fn code_index(&self) -> Option<&Arc<dyn domain::CodeIndexPort>> {
+        self.code_index.as_ref()
     }
 
     /// The log write tools record into; pass it to each one registered.
@@ -175,6 +190,9 @@ impl ToolRegistry {
 
     /// Sync one written file everywhere that keeps a view of the tree.
     fn after_write(&mut self, path: &Path, text: &str) {
+        if let Some(index) = &self.code_index {
+            index.notify_changed(&path.to_string_lossy());
+        }
         if let Some(lsp) = self.lsp.as_mut() {
             let absolute = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
             let uri = file_uri(&absolute);
@@ -1032,6 +1050,62 @@ mod tests {
             std::fs::read_to_string(dir.path().join("a.rs")).unwrap(),
             "foo"
         );
+    }
+
+    /// Records what the registry tells the index.
+    #[derive(Default)]
+    struct FakeIndex(std::sync::Mutex<Vec<String>>);
+
+    impl domain::CodeIndexPort for FakeIndex {
+        fn state(&self) -> domain::IndexState {
+            domain::IndexState::Ready
+        }
+        fn outline(&self, _: &str) -> Result<Option<Vec<domain::SymbolDef>>, BoxError> {
+            Ok(None)
+        }
+        fn symbols(
+            &self,
+            _: &str,
+            _: Option<domain::SymbolKind>,
+            _: Option<&str>,
+            _: usize,
+        ) -> Result<Vec<domain::SymbolDef>, BoxError> {
+            Ok(Vec::new())
+        }
+        fn locate(&self, _: Option<&str>, _: &str) -> Result<Vec<domain::SymbolDef>, BoxError> {
+            Ok(Vec::new())
+        }
+        fn related(&self, _: &str) -> Result<domain::Related, BoxError> {
+            Ok(domain::Related::default())
+        }
+        fn parse_text(&self, _: &str, _: &str) -> Result<Option<domain::ParsedFile>, BoxError> {
+            Ok(None)
+        }
+        fn repo_map(&self, _: &str, _: u32) -> Result<String, BoxError> {
+            Ok(String::new())
+        }
+        fn notify_changed(&self, path: &str) {
+            self.0.lock().unwrap().push(path.to_string());
+        }
+    }
+
+    #[test]
+    fn writes_are_pushed_to_the_code_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = Arc::new(FakeIndex::default());
+        let registry = ToolRegistry::new(dir.path().to_path_buf());
+        let log = registry.write_log();
+        let mut registry = registry
+            .with_native(Box::new(
+                WriteTool::new(dir.path().to_path_buf()).with_write_log(log),
+            ))
+            .with_code_index(index.clone());
+        registry
+            .call(TOOL_WRITE, r#"{"path":"src/a.rs","content":"fn a() {}"}"#)
+            .unwrap();
+        let seen = index.0.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].ends_with("src/a.rs"), "{seen:?}");
     }
 
     #[test]

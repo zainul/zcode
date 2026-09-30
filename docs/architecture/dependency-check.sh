@@ -23,7 +23,7 @@ STATUS=0
 
 INFRA_CRATES=(
     infra-llm infra-filesystem infra-shell infra-config
-    infra-mcp infra-lsp infra-session infra-telemetry infra-search
+    infra-mcp infra-lsp infra-session infra-telemetry infra-search infra-index
 )
 
 echo "=== Checking domain purity (FR-DI-01) ==="

@@ -229,6 +229,9 @@ pub struct App {
     spill: Option<Box<dyn SpillPort + Send>>,
     /// Compaction settings (`[context]`, FR-CTX-*).
     context_cfg: ContextConfig,
+    /// The code index (FR-INDEX-*), when one is running. The engine only
+    /// tells it a turn is starting; the tools query it.
+    code_index: Option<std::sync::Arc<dyn domain::CodeIndexPort>>,
     /// A cheaper model for Tier 3 summaries (`context.compaction_model`,
     /// FR-CTX-08); `None` uses the session's own client.
     compaction_llm: Option<Box<dyn LlmPort + Send>>,
@@ -322,6 +325,7 @@ impl App {
             emitter: Box::new(NullEmitter),
             cancel: CancelFlag::default(),
             spill: None,
+            code_index: None,
             context_cfg: ContextConfig::default(),
             compaction_llm: None,
             tool_budgets: ToolBudgets::default(),
@@ -347,6 +351,12 @@ impl App {
     /// Keep the full text of over-budget tool output (FR-READ-07).
     pub fn set_spill(&mut self, spill: Box<dyn SpillPort + Send>) {
         self.spill = Some(spill);
+    }
+
+    /// The code index, so each turn starts with a cheap freshness check
+    /// for edits made outside zcode (FR-INDEX-04).
+    pub fn set_code_index(&mut self, index: std::sync::Arc<dyn domain::CodeIndexPort>) {
+        self.code_index = Some(index);
     }
 
     /// Point the loop at a different provider client.
@@ -854,6 +864,9 @@ impl AgentLoop for App {
         req: ExecutionRequest,
     ) -> Result<ExecutionResult, AppError> {
         let started = Instant::now();
+        if let Some(index) = &self.code_index {
+            index.notify_turn_start();
+        }
         let mut session = self.open_session(&req, ctx)?;
         // FR-CACHE-03: cache routing is per session.
         self.llm.set_session(&session.id);

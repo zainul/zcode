@@ -110,6 +110,25 @@ pub enum Commands {
         #[command(subcommand)]
         command: ListCmd,
     },
+    // FR-INDEX-10
+    /// Inspect, rebuild or clear the code index under .zcode/index.
+    Index {
+        #[command(subcommand)]
+        command: IndexCmd,
+        /// Config file to use instead of ./zcode.json or ./zcode.toml.
+        #[arg(long, value_name = "FILE", global = true)]
+        config: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand, Clone, Copy)]
+pub enum IndexCmd {
+    /// What the stored index holds, without building it.
+    Status,
+    /// Delete the stored index and build it again in the foreground.
+    Rebuild,
+    /// Delete the stored index; the next run rebuilds it in the background.
+    Clear,
 }
 
 #[derive(clap::Args)]
@@ -152,6 +171,9 @@ pub struct RunArgs {
     /// Give up after this many seconds and checkpoint the session.
     #[arg(long, value_name = "SECS")]
     pub timeout: Option<u64>,
+    /// Do not build or use the code index for this run (FR-INDEX-10).
+    #[arg(long)]
+    pub no_index: bool,
 }
 
 #[derive(clap::Args)]
@@ -181,6 +203,9 @@ pub struct ReplArgs {
     /// Resume an existing session id.
     #[arg(long)]
     pub session: Option<String>,
+    /// Do not build or use the code index for this session (FR-INDEX-10).
+    #[arg(long)]
+    pub no_index: bool,
 }
 
 impl ReplArgs {
@@ -205,6 +230,9 @@ impl ReplArgs {
         }
         if self.config.is_some() {
             return Some("--config");
+        }
+        if self.no_index {
+            return Some("--no-index");
         }
         None
     }
@@ -562,6 +590,8 @@ pub fn wire_on(
     for warning in registry.warnings() {
         log::warn!("{warning}");
     }
+    let registry = attach_code_index(cfg, registry);
+    let code_index = registry.code_index().cloned();
 
     let ag_dir = cfg.working_dir.join(".zcode");
     let sessions = UuidSessionStore::new(ag_dir.join("sessions"));
@@ -614,7 +644,164 @@ pub fn wire_on(
         &cfg.working_dir,
         cfg.context.spill_ttl_days,
     )));
+    if let Some(index) = code_index {
+        app.set_code_index(index);
+    }
     Ok(app)
+}
+
+/// Start the code index in the background (FR-INDEX-01) and hand it to the
+/// registry. Returns at once: the build never delays the first request.
+#[cfg(feature = "code-index")]
+fn attach_code_index(cfg: &Config, registry: ToolRegistry) -> ToolRegistry {
+    if !cfg.index.enabled {
+        return registry;
+    }
+    let Some(search) = registry.search().cloned() else {
+        return registry;
+    };
+    let index = infra_index::spawn(index_options(cfg), search, None);
+    registry.with_code_index(index)
+}
+
+#[cfg(not(feature = "code-index"))]
+fn attach_code_index(_cfg: &Config, registry: ToolRegistry) -> ToolRegistry {
+    registry
+}
+
+#[cfg(feature = "code-index")]
+fn index_options(cfg: &Config) -> infra_index::IndexOptions {
+    infra_index::IndexOptions {
+        max_file_bytes: cfg.index.max_file_bytes,
+        ..infra_index::IndexOptions::new(&cfg.working_dir)
+    }
+}
+
+/// `zcode index status|rebuild|clear` (FR-INDEX-10).
+#[cfg(feature = "code-index")]
+fn cmd_index(command: IndexCmd, config: Option<&Path>) -> CliResult {
+    use domain::{CodeIndexPort, IndexState};
+
+    let cfg = load_config(config, Overrides::default())?;
+    let store = infra_index::default_store_path(&cfg.working_dir);
+    match command {
+        IndexCmd::Status => {
+            if !cfg.index.enabled {
+                outln!("code index: off (index.enabled = false)");
+            }
+            match infra_index::stored_stats(&store) {
+                Some(stats) => {
+                    let meta = std::fs::metadata(&store).ok();
+                    let size = meta.as_ref().map_or(0, |m| m.len());
+                    let age = meta
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|t| t.elapsed().ok())
+                        .map_or_else(|| "unknown".to_string(), |d| render_age(d.as_secs()));
+                    outln!(
+                        "store:     {} ({} KiB, updated {age} ago)",
+                        store.display(),
+                        size / 1024
+                    );
+                    print_index_stats(&stats);
+                }
+                None => outln!(
+                    "no index at {} — it is built in the background on the next run",
+                    store.display()
+                ),
+            }
+        }
+        IndexCmd::Clear => {
+            remove_index_store(&store)?;
+            outln!("cleared {}", store.display());
+        }
+        IndexCmd::Rebuild => {
+            remove_index_store(&store)?;
+            let search: tools::Search = Arc::new(infra_search::RipgrepSearch::new(
+                &cfg.working_dir,
+                &infra_search::FilterConfig {
+                    exclude: cfg.context.exclude.clone(),
+                    include: cfg.context.include.clone(),
+                },
+            )?);
+            let index = infra_index::CodeIndex::open(index_options(&cfg), search);
+            let worker = index.clone();
+            let build = std::thread::spawn(move || worker.build());
+            while !build.is_finished() {
+                if let IndexState::Building { done, total } = index.state() {
+                    eprint!("\rindexing {done}/{total} files");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            let report = build.join().map_err(|_| "index build failed")?;
+            eprintln!(
+                "\rindexed {} files in {}ms          ",
+                report.files, report.elapsed_ms
+            );
+            print_index_stats(&index.stats());
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(not(feature = "code-index"))]
+fn cmd_index(_command: IndexCmd, _config: Option<&Path>) -> CliResult {
+    outln!("this zcode was built without the code index (feature `code-index`)");
+    Ok(ExitCode::from(EXIT_USAGE))
+}
+
+#[cfg(feature = "code-index")]
+fn print_index_stats(stats: &infra_index::IndexStats) {
+    outln!("files:     {}", stats.files);
+    outln!("symbols:   {}", stats.symbols);
+    let langs: Vec<String> = stats
+        .languages
+        .iter()
+        .map(|(l, n)| format!("{l} {n}"))
+        .collect();
+    outln!(
+        "languages: {}",
+        if langs.is_empty() {
+            "none".into()
+        } else {
+            langs.join(", ")
+        }
+    );
+    let skipped: Vec<String> = stats
+        .skipped
+        .iter()
+        .map(|(r, n)| format!("{r} {n}"))
+        .collect();
+    outln!(
+        "skipped:   {}",
+        if skipped.is_empty() {
+            "none".into()
+        } else {
+            skipped.join(", ")
+        }
+    );
+}
+
+/// Remove the store file (and its temporary sibling), not the directory
+/// around it: nothing else lives there today, but nothing says it never will.
+#[cfg(feature = "code-index")]
+fn remove_index_store(store: &Path) -> Result<(), std::io::Error> {
+    for path in [store.to_path_buf(), store.with_extension("zcix.tmp")] {
+        match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "code-index")]
+fn render_age(secs: u64) -> String {
+    match secs {
+        0..=59 => format!("{secs}s"),
+        60..=3599 => format!("{}m", secs / 60),
+        3600..=86_399 => format!("{}h", secs / 3600),
+        _ => format!("{}d", secs / 86_400),
+    }
 }
 
 /// Sends every event to two ports. Only `report` writes the report file, so
@@ -682,6 +869,7 @@ pub fn run() -> CliResult {
         Some(Commands::Config(args)) => cmd_config(args),
         Some(Commands::Tools { command: _ }) => cmd_tools_list(),
         Some(Commands::Skills { command: _ }) => cmd_skills_list(),
+        Some(Commands::Index { command, config }) => cmd_index(command, config.as_deref()),
     }
 }
 
@@ -790,7 +978,7 @@ fn install_signal_handler() -> CancelFlag {
 
 /// The TUI, however it was reached: `zcode`, or `zcode repl`.
 fn cmd_repl(args: ReplArgs) -> CliResult {
-    let cfg = load_config(
+    let mut cfg = load_config(
         args.config.as_deref(),
         Overrides {
             mode: args.mode,
@@ -798,13 +986,16 @@ fn cmd_repl(args: ReplArgs) -> CliResult {
             model: args.model.as_deref(),
         },
     )?;
+    if args.no_index {
+        cfg.index.enabled = false;
+    }
     let cancel = install_signal_handler();
     tui::run_tui(cfg, cancel, args.session)?;
     Ok(ExitCode::SUCCESS)
 }
 
 fn cmd_run(args: RunArgs) -> CliResult {
-    let cfg = load_config(
+    let mut cfg = load_config(
         args.config.as_deref(),
         Overrides {
             mode: args.mode,
@@ -812,6 +1003,9 @@ fn cmd_run(args: RunArgs) -> CliResult {
             model: args.model.as_deref(),
         },
     )?;
+    if args.no_index {
+        cfg.index.enabled = false;
+    }
     let cancel = install_signal_handler();
 
     let telemetry_out: Box<dyn Write + Send> = if args.json {
@@ -893,6 +1087,7 @@ fn cmd_session(command: SessionCmd) -> CliResult {
                     json_format,
                     config: None,
                     timeout: None,
+                    no_index: false,
                 }),
                 None => {
                     let cancel = install_signal_handler();

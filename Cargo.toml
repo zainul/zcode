@@ -13,6 +13,7 @@ members = [
     "crates/infra/session",
     "crates/infra/telemetry",
     "crates/infra/search",
+    "crates/infra/index",
     "crates/cli",
     "benches",
     "evals",
