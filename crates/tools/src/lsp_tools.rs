@@ -45,7 +45,10 @@ pub fn utf16_to_char_col(line: &str, utf16: u32) -> u32 {
         units += c.len_utf16() as u32;
         chars += 1;
     }
-    chars + 1
+    // A line shorter than the offset (unreadable, or changed since the
+    // server answered): count the rest one unit per character rather than
+    // snapping to column 1.
+    chars + utf16.saturating_sub(units) + 1
 }
 
 /// Line `line0` (0-based) of the file at `path`, if it can be read.
@@ -450,6 +453,11 @@ mod tests {
         assert_eq!(utf16_to_char_col(line, col16), 13);
         assert_eq!(char_col_to_utf16("abc", 1), 0);
         assert_eq!(utf16_to_char_col("abc", 0), 1);
+        assert_eq!(
+            utf16_to_char_col("", 3),
+            4,
+            "no line text: assume one unit per char"
+        );
     }
 
     #[test]

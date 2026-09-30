@@ -27,8 +27,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use domain::{
-    canonical_tool_name, BoxError, LspLocation, LspPort, LspWorkspaceEdit, McpPort, Tool,
-    ToolRegistryPort, ToolResult, ToolSpec,
+    canonical_tool_name, BoxError, LspPort, McpPort, Tool, ToolRegistryPort, ToolResult, ToolSpec,
 };
 
 pub use guard::{allowlist_is_unrestricted, builtin_deny_rule_count, GuardedShell, ShellToolError};
@@ -100,6 +99,7 @@ fn resolve_rtk(cfg: &infra_config::RtkConfig, notes: &mut Vec<String>) -> Option
 pub const LSP_GOTO_DEFINITION: &str = "lsp__goto_definition";
 pub const LSP_FIND_REFERENCES: &str = "lsp__find_references";
 pub const LSP_HOVER: &str = "lsp__hover";
+pub use lsp_tools::LSP_DIAGNOSTICS;
 pub const LSP_RENAME_SYMBOL: &str = "lsp__rename_symbol";
 
 const MCP_PREFIX: &str = "mcp__";
@@ -148,6 +148,8 @@ pub struct ToolRegistry {
     /// Every file a native tool wrote during the current call, drained after
     /// it to keep the language server (and index) in sync (FR-EDIT-09).
     write_log: edit::WriteLog,
+    /// URIs the language server has been told about.
+    opened: std::collections::HashSet<String>,
 }
 
 impl ToolRegistry {
@@ -162,6 +164,7 @@ impl ToolRegistry {
             cancel: SharedCancel::default(),
             search: None,
             write_log: edit::WriteLog::default(),
+            opened: std::collections::HashSet::new(),
         }
     }
 
@@ -174,7 +177,10 @@ impl ToolRegistry {
     fn after_write(&mut self, path: &Path, text: &str) {
         if let Some(lsp) = self.lsp.as_mut() {
             let absolute = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-            let _ = lsp.port.open_document(&file_uri(&absolute), text);
+            let uri = file_uri(&absolute);
+            if lsp.port.open_document(&uri, text).is_ok() {
+                self.opened.insert(uri);
+            }
         }
     }
 
@@ -378,15 +384,26 @@ impl ToolRegistry {
         self.native.iter().position(|e| e.name == canonical)
     }
 
-    /// `file://` URI for a model-supplied `uri` or `path` argument.
-    fn uri_from_args(&self, args: &serde_json::Value) -> Option<String> {
-        if let Some(uri) = args.get("uri").and_then(|v| v.as_str()) {
-            return Some(uri.to_string());
+    /// `file://` URI for a model-supplied path.
+    fn uri_for_path(root: &Path, path: &str) -> String {
+        let resolved = native::resolve(root, path);
+        file_uri(&resolved.canonicalize().unwrap_or(resolved))
+    }
+
+    /// Tell the server about a file the first time the agent touches it, so
+    /// references and diagnostics cover it (FR-LSP-04/09).
+    fn ensure_open(&mut self, uri: &str) {
+        if self.opened.contains(uri) {
+            return;
         }
-        let path = args.get("path").and_then(|v| v.as_str())?;
-        let resolved = native::resolve(&self.root, path);
-        let absolute = resolved.canonicalize().unwrap_or(resolved);
-        Some(file_uri(&absolute))
+        let Some(lsp) = self.lsp.as_mut() else {
+            return;
+        };
+        if let Ok(text) = std::fs::read_to_string(lsp_tools::uri_path(uri)) {
+            if lsp.port.open_document(uri, &text).is_ok() {
+                self.opened.insert(uri.to_string());
+            }
+        }
     }
 
     fn call_lsp(&mut self, canonical: &str, args_json: &str) -> Result<ToolResult, BoxError> {
@@ -397,34 +414,77 @@ impl ToolRegistry {
         if self.lsp.is_none() {
             return Ok(native::tool_error("no language server is configured"));
         }
-        // Resolve the URI before borrowing the port mutably.
-        let Some(uri) = self.uri_from_args(&args) else {
-            return Ok(native::tool_error(
-                "missing required argument `path` (or `uri`)",
-            ));
+        let root = self.root.clone();
+
+        if canonical == LSP_DIAGNOSTICS {
+            let path = args
+                .get("path")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let severity = match args
+                .get("severity")
+                .and_then(|v| v.as_str())
+                .unwrap_or("error")
+            {
+                "error" => 1,
+                "warning" => 2,
+                "all" => 4,
+                other => {
+                    return Ok(native::tool_error(format!(
+                        "unknown severity `{other}`; expected error, warning or all"
+                    )))
+                }
+            };
+            let uri = path.as_deref().map(|p| Self::uri_for_path(&root, p));
+            if let Some(u) = &uri {
+                self.ensure_open(u);
+            }
+            let scope = path
+                .clone()
+                .unwrap_or_else(|| "the files opened this session".into());
+            let lsp = self.lsp.as_mut().ok_or("no language server")?;
+            return Ok(match lsp.port.diagnostics(uri.as_deref()) {
+                Ok(found) => ToolResult::ok(&lsp_tools::render_diagnostics(
+                    &root, &found, severity, &scope,
+                ))
+                .with_subject(domain::Subject::Diagnostics { path }),
+                Err(e) => native::tool_error(e.to_string()),
+            });
+        }
+
+        let target = match lsp_tools::parse_target(&args) {
+            Ok(t) => t,
+            Err(e) => return Ok(native::tool_error(e)),
         };
-        let line = args.get("line").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-        let character = args.get("character").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-        let lsp = self.lsp.as_mut().expect("checked above");
+        if let lsp_tools::Target::Position { path, .. } = &target {
+            let uri = Self::uri_for_path(&root, path);
+            self.ensure_open(&uri);
+        }
+        let uri_for = |p: &str| Self::uri_for_path(&root, p);
+        let resolved = {
+            let lsp = self.lsp.as_mut().ok_or("no language server")?;
+            lsp_tools::resolve(lsp.port.as_mut(), &root, &target, &uri_for)
+        };
+        let (uri, line, column) = match resolved {
+            Ok(r) => r,
+            Err(e) => return Ok(native::tool_error(e)),
+        };
+        self.ensure_open(&uri);
+        let lsp = self.lsp.as_mut().ok_or("no language server")?;
 
         let result = match canonical {
-            LSP_GOTO_DEFINITION => match lsp.port.goto_definition(&uri, line, character) {
-                Ok(loc) => ToolResult::ok(&format_location(&loc)),
+            LSP_GOTO_DEFINITION => match lsp.port.goto_definition(&uri, line, column) {
+                Ok(loc) => ToolResult::ok(&lsp_tools::render_definition(&root, &loc)),
                 Err(e) => native::tool_error(e.to_string()),
             },
-            LSP_FIND_REFERENCES => match lsp.port.find_references(&uri, line, character) {
-                Ok(locs) if locs.is_empty() => ToolResult::ok("no references found"),
-                Ok(locs) => ToolResult::ok(
-                    &locs
-                        .iter()
-                        .map(format_location)
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                ),
+            LSP_FIND_REFERENCES => match lsp.port.find_references(&uri, line, column) {
+                Ok(locs) => {
+                    ToolResult::ok(&lsp_tools::render_locations(&root, &locs, "references"))
+                }
                 Err(e) => native::tool_error(e.to_string()),
             },
-            LSP_HOVER => match lsp.port.hover(&uri, line, character) {
-                Ok(text) => ToolResult::ok(&text),
+            LSP_HOVER => match lsp.port.hover(&uri, line, column) {
+                Ok(text) => ToolResult::ok(&lsp_tools::clean_hover(&text)),
                 Err(e) => native::tool_error(e.to_string()),
             },
             LSP_RENAME_SYMBOL => {
@@ -435,8 +495,8 @@ impl ToolRegistry {
                 if new_name.is_empty() {
                     return Ok(native::tool_error("missing required argument `new_name`"));
                 }
-                match lsp.port.rename_symbol(&uri, line, character, new_name) {
-                    Ok(edit) => ToolResult::ok(&format_workspace_edit(&edit)),
+                match lsp.port.rename_symbol(&uri, line, column, new_name) {
+                    Ok(edit) => ToolResult::ok(&lsp_tools::render_rename(&root, &edit)),
                     Err(e) => native::tool_error(e.to_string()),
                 }
             }
@@ -448,7 +508,7 @@ impl ToolRegistry {
 
 impl ToolRegistryPort for ToolRegistry {
     fn list(&self) -> Box<[ToolSpec]> {
-        let lsp_count = if self.lsp.is_some() { 4 } else { 0 };
+        let lsp_count = if self.lsp.is_some() { 5 } else { 0 };
         let mcp_count: usize = self.mcp.iter().map(|e| e.tools.len()).sum();
         let mut specs = Vec::with_capacity(self.native.len() + mcp_count + lsp_count);
 
@@ -524,6 +584,14 @@ impl ToolRegistryPort for ToolRegistry {
             for (path, text) in written {
                 self.after_write(&path, &text);
             }
+            // FR-LSP-04: a file the agent reads is opened on the server, so
+            // references and diagnostics cover it.
+            if canonical == TOOL_READ && self.lsp.is_some() {
+                if let Some(domain::Subject::FileRange { path, .. }) = &result.subject {
+                    let uri = Self::uri_for_path(&self.root.clone(), path);
+                    self.ensure_open(&uri);
+                }
+            }
             return Ok(result);
         }
 
@@ -560,58 +628,44 @@ impl ToolRegistryPort for ToolRegistry {
 }
 
 fn lsp_tool_specs() -> Vec<ToolSpec> {
-    let position_schema = r#"{"type":"object","properties":{"path":{"type":"string","description":"File path"},"line":{"type":"integer","description":"0-based line"},"character":{"type":"integer","description":"0-based column"}},"required":["path","line","character"]}"#;
+    // FR-LSP-05: name the symbol, or give a 1-based position.
+    let target = r#""path":{"type":"string"},"symbol":{"type":"string","description":"e.g. \"AgentLoop::execute\" — instead of line/column"},"line":{"type":"integer","description":"1-based"},"column":{"type":"integer","description":"1-based"}"#;
+    let position_schema = format!(r#"{{"type":"object","properties":{{{target}}}}}"#);
     vec![
         ToolSpec {
             name: LSP_GOTO_DEFINITION.into(),
-            description: "Resolve the definition site of the symbol at a position.".into(),
-            params_json: position_schema.into(),
+            description: "Where a symbol is defined. Address it by `symbol` name, or by path + \
+                          line + column (1-based)."
+                .into(),
+            params_json: position_schema.clone(),
         },
         ToolSpec {
             name: LSP_FIND_REFERENCES.into(),
-            description: "List every reference to the symbol at a position.".into(),
-            params_json: position_schema.into(),
+            description: "Every reference to a symbol, grouped by file.".into(),
+            params_json: position_schema.clone(),
         },
         ToolSpec {
             name: LSP_HOVER.into(),
-            description: "Type and documentation for the symbol at a position.".into(),
-            params_json: position_schema.into(),
+            description: "Type and documentation of a symbol.".into(),
+            params_json: position_schema,
         },
         ToolSpec {
             name: LSP_RENAME_SYMBOL.into(),
-            description: "Compute the edits that rename a symbol. The edits are advice — \
-                          apply them with str_replace_editor."
+            description: "Compute the edits that rename a symbol across files (advice; apply \
+                          them with str_replace_editor)."
                 .into(),
-            params_json: r#"{"type":"object","properties":{"path":{"type":"string"},"line":{"type":"integer"},"character":{"type":"integer"},"new_name":{"type":"string"}},"required":["path","line","character","new_name"]}"#.into(),
+            params_json: format!(
+                r#"{{"type":"object","properties":{{{target},"new_name":{{"type":"string"}}}},"required":["new_name"]}}"#
+            ),
+        },
+        ToolSpec {
+            name: LSP_DIAGNOSTICS.into(),
+            description: "Compiler errors (and warnings with severity) from the language server \
+                          — cheaper than a full build after an edit."
+                .into(),
+            params_json: r#"{"type":"object","properties":{"path":{"type":"string","description":"One file; default: every file touched this session"},"severity":{"type":"string","enum":["error","warning","all"]}}}"#.into(),
         },
     ]
-}
-
-fn format_location(loc: &LspLocation) -> String {
-    format!(
-        "{}:{}:{}",
-        loc.uri,
-        loc.range.start.line + 1,
-        loc.range.start.character + 1
-    )
-}
-
-fn format_workspace_edit(edit: &LspWorkspaceEdit) -> String {
-    if edit.changes.is_empty() {
-        return "no edits proposed".to_string();
-    }
-    let mut out = String::with_capacity(edit.changes.len() * 48);
-    out.push_str("proposed edits (apply with str_replace_editor):\n");
-    for change in edit.changes.iter() {
-        out.push_str(&format!(
-            "{}:{}:{} -> {:?}\n",
-            change.uri,
-            change.range.start.line + 1,
-            change.range.start.character + 1,
-            change.new_text
-        ));
-    }
-    out
 }
 
 /// `file://` URI for an absolute path. Kept local so the registry does not
@@ -635,7 +689,7 @@ fn file_uri(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use domain::{LspPosition, LspRange, LspTextEdit, McpToolDef};
+    use domain::{LspLocation, LspPosition, LspRange, LspTextEdit, LspWorkspaceEdit, McpToolDef};
 
     /// Canned MCP server: records the calls it receives.
     struct FakeMcp {
@@ -896,19 +950,21 @@ mod tests {
         let names: Vec<String> = registry.list().iter().map(|s| s.name.clone()).collect();
         assert!(names.contains(&LSP_HOVER.to_string()));
 
+        // FR-LSP-05: positions are 1-based, like every other tool.
         let hover = registry
-            .call(LSP_HOVER, r#"{"path":"a.rs","line":0,"character":3}"#)
+            .call(LSP_HOVER, r#"{"path":"a.rs","line":1,"column":4}"#)
             .unwrap();
-        assert_eq!(hover.content, "fn foo()");
+        assert_eq!(hover.content, "fn foo()", "{hover:?}");
 
         let def = registry
             .call(
                 "lsp::goto_definition",
-                r#"{"path":"a.rs","line":0,"character":3}"#,
+                r#"{"path":"a.rs","line":1,"column":4}"#,
             )
             .unwrap();
-        // Positions are reported 1-based for humans/LLMs.
-        assert!(def.content.ends_with(":42:4"), "{def:?}");
+        // Reported 1-based, as a path rather than a file:// URI.
+        assert!(def.content.contains(":42:4"), "{def:?}");
+        assert!(!def.content.contains("file://"), "{def:?}");
     }
 
     #[test]
@@ -931,10 +987,13 @@ mod tests {
         let res = registry
             .call(
                 LSP_RENAME_SYMBOL,
-                r#"{"path":"a.rs","line":0,"character":0,"new_name":"bar"}"#,
+                r#"{"path":"a.rs","line":1,"column":1,"new_name":"bar"}"#,
             )
             .unwrap();
-        assert!(res.content.contains("apply with str_replace_editor"));
+        assert!(
+            res.content.contains("apply with str_replace_editor"),
+            "{res:?}"
+        );
         // The file itself is untouched — FS tools remain the only write path.
         assert_eq!(
             std::fs::read_to_string(dir.path().join("a.rs")).unwrap(),
@@ -1132,5 +1191,214 @@ mod tests {
             registry.elide_args("write", &small).is_none(),
             "nothing worth eliding"
         );
+    }
+
+    // ---- FR-LSP-05..07/09: addressing, diagnostics, sync on read -----------
+
+    /// A language server that knows two symbols and records what it is asked.
+    #[derive(Clone, Default)]
+    struct SymLsp {
+        asked: Arc<std::sync::Mutex<Vec<(String, u32, u32)>>>,
+        opened: Arc<std::sync::Mutex<Vec<String>>>,
+        root: PathBuf,
+    }
+
+    impl LspPort for SymLsp {
+        fn goto_definition(&mut self, uri: &str, l: u32, c: u32) -> Result<LspLocation, BoxError> {
+            self.asked.lock().unwrap().push((uri.into(), l, c));
+            Err("unused".into())
+        }
+        fn find_references(
+            &mut self,
+            uri: &str,
+            l: u32,
+            c: u32,
+        ) -> Result<Box<[LspLocation]>, BoxError> {
+            self.asked.lock().unwrap().push((uri.into(), l, c));
+            Ok(Box::new([]))
+        }
+        fn hover(&mut self, uri: &str, l: u32, c: u32) -> Result<String, BoxError> {
+            self.asked.lock().unwrap().push((uri.into(), l, c));
+            Ok("```rust\nfn run()\n```".into())
+        }
+        fn rename_symbol(
+            &mut self,
+            _u: &str,
+            _l: u32,
+            _c: u32,
+            _n: &str,
+        ) -> Result<LspWorkspaceEdit, BoxError> {
+            Ok(LspWorkspaceEdit {
+                changes: Box::new([]),
+            })
+        }
+        fn open_document(&mut self, uri: &str, _text: &str) -> Result<(), BoxError> {
+            self.opened.lock().unwrap().push(uri.into());
+            Ok(())
+        }
+        fn workspace_symbols(
+            &mut self,
+            query: &str,
+        ) -> Result<Box<[domain::LspSymbolInfo]>, BoxError> {
+            let at = |file: &str, line: u32, container: &str| domain::LspSymbolInfo {
+                name: query.into(),
+                kind: 6,
+                container: Some(container.into()),
+                location: LspLocation {
+                    uri: file_uri(&self.root.join(file).canonicalize().unwrap()),
+                    range: LspRange {
+                        start: LspPosition { line, character: 0 },
+                        end: LspPosition {
+                            line: line + 2,
+                            character: 1,
+                        },
+                    },
+                },
+            };
+            Ok(match query {
+                "run" => Box::new([at("a.rs", 1, "Engine"), at("b.rs", 0, "Other")]),
+                "start" => Box::new([at("a.rs", 4, "Engine")]),
+                _ => Box::new([]),
+            })
+        }
+        fn diagnostics(
+            &mut self,
+            uri: Option<&str>,
+        ) -> Result<Box<[domain::LspDiagnostic]>, BoxError> {
+            let uri = uri.unwrap_or("").to_string();
+            Ok(Box::new([domain::LspDiagnostic {
+                uri,
+                range: LspRange {
+                    start: LspPosition {
+                        line: 1,
+                        character: 4,
+                    },
+                    end: LspPosition {
+                        line: 1,
+                        character: 7,
+                    },
+                },
+                severity: 1,
+                code: Some("E0425".into()),
+                message: "cannot find value `x`".into(),
+            }]))
+        }
+    }
+
+    fn sym_registry() -> (tempfile::TempDir, ToolRegistry, SymLsp) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.rs"),
+            "impl Engine {\n    pub fn run(&self) {}\n}\n\n    fn start() {}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("b.rs"), "fn run() {}\n").unwrap();
+        let lsp = SymLsp {
+            root: dir.path().to_path_buf(),
+            ..SymLsp::default()
+        };
+        let registry =
+            registry_with_native(dir.path().to_path_buf()).with_lsp(Box::new(lsp.clone()));
+        (dir, registry, lsp)
+    }
+
+    #[test]
+    fn a_symbol_resolves_to_its_name_not_the_declaration_start() {
+        let (_dir, mut registry, lsp) = sym_registry();
+        let res = registry.call(LSP_HOVER, r#"{"symbol":"start"}"#).unwrap();
+        assert_eq!(res.content, "fn run()", "fences stripped");
+        let asked = lsp.asked.lock().unwrap();
+        let (uri, line, col) = asked.last().unwrap().clone();
+        assert!(uri.ends_with("a.rs"));
+        // `    fn start() {}` — the name starts at 0-based column 7.
+        assert_eq!((line, col), (4, 7));
+    }
+
+    #[test]
+    fn an_ambiguous_symbol_lists_candidates_and_a_qualifier_disambiguates() {
+        let (_dir, mut registry, lsp) = sym_registry();
+        let res = registry
+            .call(LSP_FIND_REFERENCES, r#"{"symbol":"run"}"#)
+            .unwrap();
+        let err = res.error.unwrap();
+        assert!(err.contains("`run` is ambiguous (2 matches)"), "{err}");
+        assert!(
+            err.contains("Engine::run — a.rs:2") && err.contains("Other::run — b.rs:1"),
+            "{err}"
+        );
+        let ok = registry
+            .call(LSP_FIND_REFERENCES, r#"{"symbol":"Engine::run"}"#)
+            .unwrap();
+        assert!(ok.error.is_none(), "{ok:?}");
+        let (_, line, col) = lsp.asked.lock().unwrap().last().unwrap().clone();
+        assert_eq!((line, col), (1, 11), "`    pub fn run` — name at column 11");
+        let missing = registry.call(LSP_HOVER, r#"{"symbol":"nothing"}"#).unwrap();
+        assert!(missing
+            .error
+            .unwrap()
+            .starts_with("no symbol named `nothing`"));
+    }
+
+    #[test]
+    fn the_diagnostics_tool_renders_one_based_and_is_read_only() {
+        let (_dir, mut registry, lsp) = sym_registry();
+        let res = registry
+            .call(LSP_DIAGNOSTICS, r#"{"path":"a.rs"}"#)
+            .unwrap();
+        assert_eq!(
+            res.content,
+            "a.rs:2:5  error[E0425]  cannot find value `x`\n[1 errors]"
+        );
+        assert_eq!(
+            res.subject,
+            Some(domain::Subject::Diagnostics {
+                path: Some("a.rs".into())
+            })
+        );
+        assert!(
+            lsp.opened.lock().unwrap()[0].ends_with("a.rs"),
+            "the file was opened first"
+        );
+        for mode in domain::AgentMode::all() {
+            assert!(!domain::modes::denies(*mode, LSP_DIAGNOSTICS));
+        }
+        assert!(registry.list().iter().any(|s| s.name == LSP_DIAGNOSTICS));
+    }
+
+    #[test]
+    fn reading_a_file_opens_it_on_the_language_server_once() {
+        let (_dir, mut registry, lsp) = sym_registry();
+        registry.call(TOOL_READ, r#"{"path":"a.rs"}"#).unwrap();
+        registry
+            .call(TOOL_READ, r#"{"path":"a.rs","offset":2}"#)
+            .unwrap();
+        let opened = lsp.opened.lock().unwrap();
+        assert_eq!(opened.len(), 1, "{opened:?}");
+        assert!(opened[0].ends_with("a.rs"));
+    }
+
+    /// CE-DQ14: one line-number convention across tools — the line `grep`
+    /// reports is the line the LSP tools address.
+    #[test]
+    fn a_grep_line_number_addresses_the_same_line_in_lsp_tools() {
+        let (_dir, mut registry, lsp) = sym_registry();
+        let root = registry.root.clone();
+        let mut registry = registry.with_search(default_search(&root), 2_000_000, 10_000);
+        let hit = registry
+            .call(TOOL_GREP, r#"{"pattern":"fn start","output":"content"}"#)
+            .unwrap();
+        let line: u32 = hit
+            .content
+            .lines()
+            .find_map(|l| l.split('│').next()?.trim().parse().ok())
+            .unwrap();
+        registry
+            .call(
+                LSP_HOVER,
+                &serde_json::json!({ "path": "a.rs", "line": line, "column": 8 }).to_string(),
+            )
+            .unwrap();
+        let (_, l0, c0) = lsp.asked.lock().unwrap().last().unwrap().clone();
+        assert_eq!((l0 + 1, c0 + 1), (line, 8));
     }
 }

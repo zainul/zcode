@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — LSP tools take a symbol name or a 1-based position (FR-LSP-05, 06)
+
+**Behaviour change for the model-facing schema.** `lsp__goto_definition`,
+`lsp__find_references`, `lsp__hover` and `lsp__rename_symbol` now accept
+`symbol: "AgentLoop::execute"` (resolved through `workspace/symbol`, landing
+on the name itself), or `path` + `line` + `column`, both **1-based** — the
+convention every other zcode tool uses; `character` is still accepted, as a
+1-based alias. Asking for 0-based coordinates meant the model had to read the
+file first, so the semantic tools cost *more* than reading and went unused.
+A missing `line` used to default silently to 0; it is now an error saying to
+give the symbol instead. An ambiguous name lists its candidates. Columns are
+converted to and from UTF-16, as the protocol requires, so positions are
+right on lines with non-ASCII text.
+
+Results are compact: paths relative to the project with the source line
+(`src/app.rs:386:8  fn execute(&mut self, …)`), references grouped by file
+and capped at 50, hover text without markdown fences, rename advice as a
+per-file count — instead of `file:///…` URIs.
+
+### Added — `lsp__diagnostics` (FR-LSP-07)
+
+A read-only tool returning the language server's errors (or warnings, or
+all, with `severity`) for one file or every file touched this session, as
+`path:line:col  error[E0308]  message` — much cheaper than a build log after
+an edit. It uses pull diagnostics where the server supports them and
+otherwise waits for published ones to settle, taking only a report newer than
+the file's last change.
+
+### Fixed — the LSP client ignored everything that was not its own response
+
+Server→client requests (`workspace/configuration`, progress creation,
+capability registration) were skipped, which can stall a server that waits
+for the reply; they are now answered. Published diagnostics and `$/progress`
+were discarded; they are now kept. Files the agent reads are opened on the
+server, so references and diagnostics cover them.
+
 ### Added — older steps are summarised when eliding is not enough (FR-CTX-07, 08)
 
 The third compaction tier: when superseding and eliding still leave the
