@@ -232,6 +232,9 @@ pub struct App {
     /// The code index (FR-INDEX-*), when one is running. The engine only
     /// tells it a turn is starting; the tools query it.
     code_index: Option<std::sync::Arc<dyn domain::CodeIndexPort>>,
+    /// Token budget of the repo map in the system message; 0 = none
+    /// (`index.repo_map_tokens`, FR-INDEX-08).
+    repo_map_tokens: u32,
     /// A cheaper model for Tier 3 summaries (`context.compaction_model`,
     /// FR-CTX-08); `None` uses the session's own client.
     compaction_llm: Option<Box<dyn LlmPort + Send>>,
@@ -326,6 +329,7 @@ impl App {
             cancel: CancelFlag::default(),
             spill: None,
             code_index: None,
+            repo_map_tokens: 0,
             context_cfg: ContextConfig::default(),
             compaction_llm: None,
             tool_budgets: ToolBudgets::default(),
@@ -355,8 +359,15 @@ impl App {
 
     /// The code index, so each turn starts with a cheap freshness check
     /// for edits made outside zcode (FR-INDEX-04).
-    pub fn set_code_index(&mut self, index: std::sync::Arc<dyn domain::CodeIndexPort>) {
+    /// `repo_map_tokens` sizes the repository map a new session carries in
+    /// its system message (FR-INDEX-08); 0 turns the map off.
+    pub fn set_code_index(
+        &mut self,
+        index: std::sync::Arc<dyn domain::CodeIndexPort>,
+        repo_map_tokens: u32,
+    ) {
         self.code_index = Some(index);
+        self.repo_map_tokens = repo_map_tokens;
     }
 
     /// Point the loop at a different provider client.
@@ -857,6 +868,16 @@ impl App {
     }
 }
 
+/// The system message: the mode's policy, then the repo map if there is one.
+fn system_text(mode: domain::AgentMode, repo_map: Option<&str>) -> String {
+    match repo_map {
+        Some(map) if !map.is_empty() => {
+            format!("{}\n\n# Repository map\n{map}", modes::system_prompt(mode))
+        }
+        _ => modes::system_prompt(mode).to_string(),
+    }
+}
+
 impl AgentLoop for App {
     fn execute(
         &mut self,
@@ -880,7 +901,21 @@ impl AgentLoop for App {
 
         // The system prompt encodes the mode policy (FR-MODE-03). A resumed
         // session gets its prompt rewritten so a mode switch takes effect.
-        let system = LlmMessage::system(modes::system_prompt(req.mode));
+        // FR-INDEX-08, CE-DQ22: the repo map is decided once per session and
+        // frozen — `Some("")` records "decided: none" — so the system
+        // message, the head of every cached prefix, never changes under a
+        // resumed session.
+        if session.repo_map.is_none() {
+            if let Some(index) = &self.code_index {
+                match index.repo_map(&req.prompt, self.repo_map_tokens) {
+                    Ok(map) => session.repo_map = Some(map),
+                    Err(e) => self
+                        .logger
+                        .log(LogLevel::Warn, &format!("repo map skipped: {e}")),
+                }
+            }
+        }
+        let system = LlmMessage::system(&system_text(req.mode, session.repo_map.as_deref()));
         match history.first_mut() {
             Some(first) if first.role == LlmRole::System => *first = system,
             _ => history.insert(0, system),
@@ -2120,6 +2155,120 @@ mod tests {
                 .filter(|m| m.role == LlmRole::System)
                 .count(),
             1
+        );
+    }
+
+    /// An index that answers only the repo map, and counts what it is asked.
+    #[derive(Default)]
+    struct MapIndex {
+        maps: Mutex<Vec<String>>,
+        turn_starts: Mutex<u32>,
+    }
+
+    impl domain::CodeIndexPort for MapIndex {
+        fn state(&self) -> domain::IndexState {
+            domain::IndexState::Ready
+        }
+        fn outline(&self, _: &str) -> Result<Option<Vec<domain::SymbolDef>>, BoxError> {
+            Ok(None)
+        }
+        fn symbols(
+            &self,
+            _: &str,
+            _: Option<domain::SymbolKind>,
+            _: Option<&str>,
+            _: usize,
+        ) -> Result<Vec<domain::SymbolDef>, BoxError> {
+            Ok(Vec::new())
+        }
+        fn locate(&self, _: Option<&str>, _: &str) -> Result<Vec<domain::SymbolDef>, BoxError> {
+            Ok(Vec::new())
+        }
+        fn related(&self, _: &str) -> Result<domain::Related, BoxError> {
+            Ok(domain::Related::default())
+        }
+        fn parse_text(&self, _: &str, _: &str) -> Result<Option<domain::ParsedFile>, BoxError> {
+            Ok(None)
+        }
+        fn repo_map(&self, prompt: &str, budget: u32) -> Result<String, BoxError> {
+            self.maps.lock().unwrap().push(prompt.to_string());
+            Ok(format!(
+                "src/lib.rs\n  fn about_{} ({budget})",
+                prompt.replace(' ', "_")
+            ))
+        }
+        fn notify_changed(&self, _: &str) {}
+        fn notify_turn_start(&self) {
+            *self.turn_starts.lock().unwrap() += 1;
+        }
+    }
+
+    #[test]
+    fn the_repo_map_is_computed_once_and_frozen_across_a_resume() {
+        let mut h = harness(Vec::new(), "ok");
+        let index = Arc::new(MapIndex::default());
+        h.app.set_code_index(index.clone(), 512);
+        let first = h
+            .app
+            .execute(&ctx(), ExecutionRequest::new("checkout page"))
+            .unwrap();
+        let system_after_first = h.sessions.load(&first.session_id).unwrap().messages[0]
+            .content
+            .clone();
+        assert!(system_after_first
+            .contains("# Repository map\nsrc/lib.rs\n  fn about_checkout_page (512)"));
+
+        let mut req = ExecutionRequest::new("something else entirely");
+        req.session_id = Some(first.session_id.clone());
+        h.app.execute(&ctx(), req).unwrap();
+        let session = h.sessions.load(&first.session_id).unwrap();
+        // CE-DQ22: the same bytes at the head of the prefix, one map computed.
+        assert_eq!(session.messages[0].content, system_after_first);
+        assert_eq!(*index.maps.lock().unwrap(), ["checkout page"]);
+        assert_eq!(*index.turn_starts.lock().unwrap(), 2);
+    }
+
+    #[test]
+    fn an_empty_map_is_a_decision_and_leaves_the_system_prompt_plain() {
+        struct NoMap;
+        impl domain::CodeIndexPort for NoMap {
+            fn state(&self) -> domain::IndexState {
+                domain::IndexState::Ready
+            }
+            fn outline(&self, _: &str) -> Result<Option<Vec<domain::SymbolDef>>, BoxError> {
+                Ok(None)
+            }
+            fn symbols(
+                &self,
+                _: &str,
+                _: Option<domain::SymbolKind>,
+                _: Option<&str>,
+                _: usize,
+            ) -> Result<Vec<domain::SymbolDef>, BoxError> {
+                Ok(Vec::new())
+            }
+            fn locate(&self, _: Option<&str>, _: &str) -> Result<Vec<domain::SymbolDef>, BoxError> {
+                Ok(Vec::new())
+            }
+            fn related(&self, _: &str) -> Result<domain::Related, BoxError> {
+                Ok(domain::Related::default())
+            }
+            fn parse_text(&self, _: &str, _: &str) -> Result<Option<domain::ParsedFile>, BoxError> {
+                Ok(None)
+            }
+            fn repo_map(&self, _: &str, _: u32) -> Result<String, BoxError> {
+                Ok(String::new())
+            }
+            fn notify_changed(&self, _: &str) {}
+        }
+        let mut h = harness(Vec::new(), "ok");
+        h.app.set_code_index(Arc::new(NoMap), 512);
+        let r = h.app.execute(&ctx(), ExecutionRequest::new("q")).unwrap();
+        let session = h.sessions.load(&r.session_id).unwrap();
+        assert_eq!(session.repo_map.as_deref(), Some(""));
+        assert_eq!(
+            session.messages[0].content,
+            modes::system_prompt(AgentMode::Auto)
         );
     }
 

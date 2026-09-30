@@ -392,3 +392,130 @@ fn index_heap_under_budget_for_10k_files() {
     eprintln!("warm start: {:?}", t.elapsed());
     assert_eq!(warm.parses(), 0);
 }
+
+fn map_index(root: &Path, min_files: usize) -> Arc<CodeIndex> {
+    let mut opts = IndexOptions::new(root);
+    opts.repo_map_min_files = min_files;
+    let idx = CodeIndex::open(opts, search(root));
+    idx.build();
+    idx
+}
+
+/// A small web app: most files use `formatPrice`; `checkout` is named in
+/// paths; `render` is defined everywhere.
+fn web_app() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let r = dir.path();
+    write(
+        r,
+        "lib/money.ts",
+        "export function formatPrice(n: number) { return `$${n}`; }\n",
+    );
+    write(r, "lib/log.ts", "export function logEvent(e: string) {}\n");
+    for page in ["home", "about", "cart", "checkout", "account"] {
+        write(
+            r,
+            &format!("app/{page}/page.tsx"),
+            &format!(
+                "import {{ formatPrice }} from '../../lib/money';\n\
+                 export function render() {{ return formatPrice(1); }}\n\
+                 export function {page}Page() {{ return render(); }}\n"
+            ),
+        );
+    }
+    write(
+        r,
+        "components/CheckoutForm.tsx",
+        "export function CheckoutForm() { return null; }\nexport function render() {}\n",
+    );
+    dir
+}
+
+#[test]
+fn pagerank_is_deterministic_and_favours_what_everything_uses() {
+    let dir = web_app();
+    let idx = map_index(dir.path(), 1);
+    let a = idx.repo_map("", 4_000).expect("map");
+    let b = idx.repo_map("", 4_000).expect("map");
+    assert_eq!(a, b);
+    let first = a.lines().nth(1).expect("a file");
+    assert_eq!(first, "lib/money.ts", "{a}");
+    assert!(a.contains("  export function formatPrice(n: number) { return `$${n}`; }"));
+    // `logEvent` is used by nobody: last.
+    let order: Vec<&str> = a.lines().filter(|l| !l.starts_with(' ')).collect();
+    assert_eq!(order.last(), Some(&"lib/log.ts"), "{a}");
+}
+
+#[test]
+fn prompt_mentions_boost_files() {
+    let dir = web_app();
+    let idx = map_index(dir.path(), 1);
+    let map = idx
+        .repo_map("add a loading state to the checkout page", 4_000)
+        .expect("map");
+    let order: Vec<&str> = map
+        .lines()
+        .skip(1)
+        .filter(|l| !l.starts_with(' '))
+        .collect();
+    let pos = |p: &str| order.iter().position(|l| *l == p).expect(p);
+    assert!(
+        pos("app/checkout/page.tsx") < pos("app/home/page.tsx"),
+        "{map}"
+    );
+    // "form" as well as "checkout": the component outranks unrelated pages.
+    let map = idx
+        .repo_map("the checkout form needs a loading state", 4_000)
+        .expect("map");
+    let order: Vec<&str> = map
+        .lines()
+        .skip(1)
+        .filter(|l| !l.starts_with(' '))
+        .collect();
+    let pos = |p: &str| order.iter().position(|l| *l == p).expect(p);
+    assert!(
+        pos("components/CheckoutForm.tsx") < pos("app/home/page.tsx"),
+        "{map}"
+    );
+}
+
+#[test]
+fn common_names_are_downweighted() {
+    // `render` is defined in six files, so mentioning it says little about
+    // which one is meant; `formatPrice` is defined once.
+    let dir = web_app();
+    let idx = map_index(dir.path(), 1);
+    let map = idx.repo_map("", 4_000).expect("map");
+    let order: Vec<&str> = map
+        .lines()
+        .skip(1)
+        .filter(|l| !l.starts_with(' '))
+        .collect();
+    let pos = |p: &str| order.iter().position(|l| *l == p).expect(p);
+    assert!(
+        pos("lib/money.ts") < pos("components/CheckoutForm.tsx"),
+        "{map}"
+    );
+}
+
+#[test]
+fn render_respects_the_budget() {
+    let dir = web_app();
+    let idx = map_index(dir.path(), 1);
+    for budget in [40, 80, 200] {
+        let map = idx.repo_map("", budget).expect("map");
+        assert!(
+            domain::tokens::estimate_tokens(&map) <= u64::from(budget),
+            "{budget}: {map}"
+        );
+    }
+    assert_eq!(idx.repo_map("", 5).expect("map"), "", "nothing fits");
+    assert_eq!(idx.repo_map("", 0).expect("map"), "", "0 disables");
+}
+
+#[test]
+fn repo_map_is_empty_below_the_file_threshold() {
+    let dir = web_app();
+    let idx = map_index(dir.path(), 200);
+    assert_eq!(idx.repo_map("checkout", 4_000).expect("map"), "");
+}

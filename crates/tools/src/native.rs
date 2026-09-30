@@ -80,6 +80,8 @@ pub(crate) fn resolve(root: &Path, path: &str) -> PathBuf {
 
 /// Lines a `read` with no range returns (config `read.default_limit`).
 pub const DEFAULT_READ_LIMIT: u32 = 400;
+/// Outline lines the large-file guard appends at most (FR-READ-02).
+const READ_GUARD_OUTLINE: usize = 40;
 /// Longest line shown whole (FR-READ-04).
 const MAX_LINE_CHARS: usize = 2_000;
 
@@ -118,6 +120,7 @@ pub(crate) fn read_excerpt(
     offset: Option<u32>,
     limit: Option<u32>,
     default_limit: u32,
+    rest_outline: Option<&dyn Fn(u32) -> Option<String>>,
 ) -> ToolResult {
     let shown = display_path(root, full);
     let bytes = match std::fs::read(full) {
@@ -172,10 +175,21 @@ pub(crate) fn read_excerpt(
                 end + 1
             ));
         } else {
-            out.push_str(&format!(
-                "[lines 1-{end} of {} — use offset/limit, or grep to find the part you need]",
-                thousands(total)
-            ));
+            // FR-READ-02: the guard fired. What follows is described, not
+            // shown, so the next call can be a targeted range.
+            match rest_outline.and_then(|f| f(end as u32)) {
+                Some(outline) => {
+                    out.push_str(&format!(
+                        "[lines 1-{end} of {} — read the part you need with offset/limit]\n",
+                        thousands(total)
+                    ));
+                    out.push_str(&outline);
+                }
+                None => out.push_str(&format!(
+                    "[lines 1-{end} of {} — use offset/limit, or grep to find the part you need]",
+                    thousands(total)
+                )),
+            }
         }
     } else if out.ends_with('\n') {
         out.pop();
@@ -191,6 +205,7 @@ pub(crate) fn read_excerpt(
 pub struct ReadTool {
     root: PathBuf,
     default_limit: u32,
+    index: Option<crate::index_tools::IndexSlot>,
 }
 
 impl ReadTool {
@@ -198,7 +213,15 @@ impl ReadTool {
         Self {
             root,
             default_limit: DEFAULT_READ_LIMIT,
+            index: None,
         }
+    }
+
+    /// Append an outline of the unshown rest when the large-file guard
+    /// fires (FR-READ-02).
+    pub fn with_index(mut self, slot: crate::index_tools::IndexSlot) -> Self {
+        self.index = Some(slot);
+        self
     }
 
     /// Lines returned when no range is given (`read.default_limit`).
@@ -236,12 +259,19 @@ impl Tool for ReadTool {
             Err(e) => return Ok(e),
         };
         let full = resolve(&self.root, &path);
+        let index = self.index.as_ref().and_then(|slot| slot.get());
+        let rest = |after: u32| {
+            index.and_then(|ix| {
+                crate::index_tools::outline_after(ix.as_ref(), &full, after, READ_GUARD_OUTLINE)
+            })
+        };
         Ok(read_excerpt(
             &self.root,
             &full,
             u32_arg(&args, "offset"),
             u32_arg(&args, "limit"),
             self.default_limit,
+            Some(&rest),
         ))
     }
 }
@@ -551,7 +581,7 @@ impl Tool for StrReplaceTool {
                         )),
                         None => (None, None),
                     };
-                read_excerpt(&self.root, &full, offset, limit, DEFAULT_READ_LIMIT)
+                read_excerpt(&self.root, &full, offset, limit, DEFAULT_READ_LIMIT, None)
             }
             "create" => {
                 let text = args

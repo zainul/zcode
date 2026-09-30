@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — `outline`, `symbols`, `related`, and the repo map (FR-INDEX-05..09)
+
+Three read-only tools on the code index, registered after `grep` (the order
+is pinned: it heads every cached prefix). `outline` lists a file's
+definitions — signatures cut at the body, spans right-aligned — or the
+top-level definitions of each file in a directory. Over this workspace's
+larger sources and the eval fixtures an outline costs 12.4% of reading the
+same files. `symbols` finds definitions by name (exact, prefix, substring,
+subsequence; `Type::method` narrows to a container). `related` gives a
+file's imports and importers, or a symbol's definitions and name-based
+references, pointing at `lsp__find_references` for exact ones. Without an
+index (or a grammar) they answer from a labelled regex/grep fallback; while
+the index builds they say so.
+
+The repo map: files ranked by a personalised PageRank over "mentions a name
+defined there" (common names down-weighted, prompt words boosting matching
+paths and definitions), rendered as top-level signatures within
+`index.repo_map_tokens` (1,024; 0 = off). It is decided once per session
+and frozen into the system message — `Some("")` records "none" — so a
+resumed session's prefix never changes. Projects under 200 indexed files get
+no map. A cold first session waits at most 1.5 s for the index and otherwise
+takes a partial map, marked as such.
+
+`read`'s large-file guard now appends an outline of the definitions it did
+not show. LSP tools addressed by `symbol` resolve through the index first,
+preferring a type over its `impl` block, and ask the server only when the
+index does not know the name. The mode prompts mention the new tools.
+
 ### Added — code index (FR-INDEX-01..04, 10, 11; FR-FILTER-06)
 
 New crate `infra-index`: a tree-sitter index of definitions, imports and

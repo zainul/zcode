@@ -190,12 +190,22 @@ fn name_position(sym: &LspSymbolInfo) -> (u32, u32) {
 
 /// Resolve a target to (uri, 0-based line, 0-based UTF-16 column), or an
 /// error the model can act on — a list of candidates when ambiguous.
+///
+/// A symbol is looked up in the code index first when there is one
+/// (FR-LSP-05): it answers at once, while the server may still be indexing,
+/// and it knows definitions the server's `workspace/symbol` omits.
 pub fn resolve(
     port: &mut dyn LspPort,
     root: &Path,
     target: &Target,
     uri_for: &dyn Fn(&str) -> String,
+    index: Option<&dyn domain::CodeIndexPort>,
 ) -> Result<(String, u32, u32), String> {
+    if let (Target::Symbol { symbol, path }, Some(ix)) = (target, index) {
+        if let Some(found) = resolve_in_index(ix, symbol, path.as_deref(), uri_for)? {
+            return Ok(found);
+        }
+    }
     match target {
         Target::Position { path, line, column } => {
             let uri = uri_for(path);
@@ -264,6 +274,56 @@ pub fn resolve(
                     ))
                 }
             }
+        }
+    }
+}
+
+/// The index's answer for a symbol: `Ok(None)` when it has none, so the
+/// server gets asked; an ambiguity is an error listing the candidates.
+fn resolve_in_index(
+    ix: &dyn domain::CodeIndexPort,
+    symbol: &str,
+    path: Option<&str>,
+    uri_for: &dyn Fn(&str) -> String,
+) -> Result<Option<(String, u32, u32)>, String> {
+    let path_abs = path.map(|p| uri_path(&uri_for(p)).to_string_lossy().into_owned());
+    let Ok(mut defs) = ix.locate(path_abs.as_deref(), symbol) else {
+        return Ok(None);
+    };
+    // `impl Foo` shares its type's name; the type is what is meant.
+    if defs.iter().any(|d| d.kind != domain::SymbolKind::Impl) {
+        defs.retain(|d| d.kind != domain::SymbolKind::Impl);
+    }
+    match defs.as_slice() {
+        [] => Ok(None),
+        [one] => {
+            let uri = uri_for(&one.path);
+            let text = line_of_file(&uri_path(&uri), one.name_line - 1).unwrap_or_default();
+            Ok(Some((
+                uri,
+                one.name_line - 1,
+                char_col_to_utf16(&text, one.name_col),
+            )))
+        }
+        many => {
+            let list: Vec<String> = many
+                .iter()
+                .take(10)
+                .map(|d| {
+                    format!(
+                        "  {} {} — {}:{}",
+                        d.kind.as_str(),
+                        d.qualified,
+                        d.path,
+                        d.name_line
+                    )
+                })
+                .collect();
+            Err(format!(
+                "`{symbol}` is ambiguous ({} matches) — qualify it (`Type::method`) or add `path`:\n{}",
+                many.len(),
+                list.join("\n")
+            ))
         }
     }
 }

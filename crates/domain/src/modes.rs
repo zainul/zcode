@@ -16,10 +16,10 @@ pub fn system_prompt(mode: AgentMode) -> &'static str {
         AgentMode::Planning => {
             "You are a planning coding agent. Propose edits, ask for confirmation. \
              Do NOT call write, str_replace_editor, apply_patch, shell, or rename tools. \
-             Only use read-only tools (grep, glob, list_dir, read, hover, \
-             find_references, MCP read tools) to investigate, then describe the plan. \
-             Find code with grep and glob before reading files, and read only the \
-             lines you need."
+             Only use read-only tools (symbols, outline, related, grep, glob, \
+             list_dir, read, hover, find_references, MCP read tools) to investigate, \
+             then describe the plan. Find code with symbols, grep and glob, outline a \
+             file before reading it, and read only the lines you need."
         }
         AgentMode::Editing => {
             "You are a coding agent working in edit-only mode. Make edits directly \
@@ -27,14 +27,15 @@ pub fn system_prompt(mode: AgentMode) -> &'static str {
              NOT run shell commands — the `shell` tool is disabled, so do not call \
              it and do not plan around running builds or tests yourself. When a \
              change needs verifying, say which command the user should run. \
-             Find code with grep and glob before reading files, and read only the \
-             lines you need."
+             Find code with symbols, grep and glob, outline a file before reading \
+             it, and read only the lines you need."
         }
         AgentMode::Auto => {
             "You are an autonomous coding agent. Make edits directly using the \
              available tools. Be efficient and iterative: edit, then verify. \
-             Find code with grep and glob before reading files (prefer them to \
-             searching through shell), and read only the lines you need."
+             Find code with symbols, grep and glob (prefer them to searching \
+             through shell), outline a file before reading it, and read only the \
+             lines you need."
         }
     }
 }
@@ -120,6 +121,9 @@ mod tests {
             "list_dir",
             "grep",
             "glob",
+            "outline",
+            "symbols",
+            "related",
             "zcode_skill",
             "lsp__hover",
         ] {

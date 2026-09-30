@@ -34,3 +34,6 @@ optional = true
 
 [dev-dependencies]
 tempfile = "3.10"
+# The index tools are tested against the real index; the dependency is a
+# test-only one, so `tools` itself still reaches the index through the port.
+infra-index = { path = "../infra/index" }

@@ -12,6 +12,7 @@
 #![deny(clippy::unwrap_used)]
 
 pub mod extract;
+mod graph;
 pub mod lang;
 mod resolve;
 mod snapshot;
@@ -58,6 +59,12 @@ pub struct IndexOptions {
     pub max_file_bytes: u64,
     /// Longest a single parse may take (FR-INDEX-11).
     pub parse_budget: Duration,
+    /// Below this many indexed files there is no repo map: a small project
+    /// is cheaper to list than to summarise (PRD §14.2 Q2).
+    pub repo_map_min_files: usize,
+    /// How long a session start waits for a building index before taking
+    /// a partial map (CE-DQ22).
+    pub repo_map_wait: Duration,
 }
 
 impl IndexOptions {
@@ -67,6 +74,8 @@ impl IndexOptions {
             store_path: default_store_path(root),
             max_file_bytes: 1_000_000,
             parse_budget: Duration::from_millis(500),
+            repo_map_min_files: 200,
+            repo_map_wait: Duration::from_millis(1_500),
         }
     }
 }
@@ -891,8 +900,36 @@ impl CodeIndexPort for CodeIndex {
         }))
     }
 
-    fn repo_map(&self, _prompt: &str, _budget_tokens: u32) -> Result<String, BoxError> {
-        Ok(String::new())
+    fn repo_map(&self, prompt: &str, budget_tokens: u32) -> Result<String, BoxError> {
+        if budget_tokens == 0 {
+            return Ok(String::new());
+        }
+        let deadline = Instant::now() + self.opts.repo_map_wait;
+        while self.phase.load(Ordering::Acquire) != READY && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let partial = self.phase.load(Ordering::Acquire) != READY;
+        let snap = read(&self.snap);
+        let indexed = snap.live_files().filter(|r| r.skip == Skip::None).count();
+        if indexed < self.opts.repo_map_min_files {
+            return Ok(String::new());
+        }
+        let ranked = graph::rank(&snap, prompt);
+        let signatures = |path: &str, lines: &[u32]| -> Vec<String> {
+            let text = std::fs::read_to_string(self.abs(path)).unwrap_or_default();
+            lines
+                .iter()
+                .map(|l| extract::signature_at(&text, *l))
+                .filter(|s| !s.is_empty())
+                .collect()
+        };
+        Ok(graph::render(
+            &snap,
+            &ranked,
+            budget_tokens,
+            partial,
+            &signatures,
+        ))
     }
 
     fn notify_changed(&self, path: &str) {

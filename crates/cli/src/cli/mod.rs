@@ -645,7 +645,7 @@ pub fn wire_on(
         cfg.context.spill_ttl_days,
     )));
     if let Some(index) = code_index {
-        app.set_code_index(index);
+        app.set_code_index(index, cfg.index.repo_map_tokens);
     }
     Ok(app)
 }

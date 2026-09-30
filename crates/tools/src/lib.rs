@@ -15,6 +15,7 @@
 
 pub mod edit;
 pub mod guard;
+pub mod index_tools;
 pub mod lsp_tools;
 pub mod native;
 pub mod patch;
@@ -31,6 +32,9 @@ use domain::{
 };
 
 pub use guard::{allowlist_is_unrestricted, builtin_deny_rule_count, GuardedShell, ShellToolError};
+pub use index_tools::{
+    IndexSlot, OutlineTool, RelatedTool, SymbolsTool, TOOL_OUTLINE, TOOL_RELATED, TOOL_SYMBOLS,
+};
 pub use native::{
     ApplyPatchTool, ReadTool, ShellTool, SkillTool, StrReplaceTool, WriteTool, TOOL_APPLY_PATCH,
     TOOL_LIST_DIR, TOOL_READ, TOOL_SHELL, TOOL_SKILL, TOOL_STR_REPLACE, TOOL_WRITE,
@@ -150,9 +154,9 @@ pub struct ToolRegistry {
     write_log: edit::WriteLog,
     /// URIs the language server has been told about.
     opened: std::collections::HashSet<String>,
-    /// The code index, told about every write so its spans stay exact
-    /// (FR-INDEX-04).
-    code_index: Option<Arc<dyn domain::CodeIndexPort>>,
+    /// The code index, once started: told about every write so its spans
+    /// stay exact (FR-INDEX-04), and read by the index tools at call time.
+    index_slot: IndexSlot,
 }
 
 impl ToolRegistry {
@@ -168,19 +172,26 @@ impl ToolRegistry {
             search: None,
             write_log: edit::WriteLog::default(),
             opened: std::collections::HashSet::new(),
-            code_index: None,
+            index_slot: IndexSlot::default(),
         }
     }
 
     /// Attach the code index.
-    pub fn with_code_index(mut self, index: Arc<dyn domain::CodeIndexPort>) -> Self {
-        self.code_index = Some(index);
+    pub fn with_code_index(self, index: Arc<dyn domain::CodeIndexPort>) -> Self {
+        if self.index_slot.set(index).is_err() {
+            log::warn!("code index attached twice; keeping the first");
+        }
         self
     }
 
     /// The attached code index, if any.
     pub fn code_index(&self) -> Option<&Arc<dyn domain::CodeIndexPort>> {
-        self.code_index.as_ref()
+        self.index_slot.get()
+    }
+
+    /// The slot the index tools read; filled by [`Self::with_code_index`].
+    pub fn index_slot(&self) -> IndexSlot {
+        self.index_slot.clone()
     }
 
     /// The log write tools record into; pass it to each one registered.
@@ -190,7 +201,7 @@ impl ToolRegistry {
 
     /// Sync one written file everywhere that keeps a view of the tree.
     fn after_write(&mut self, path: &Path, text: &str) {
-        if let Some(index) = &self.code_index {
+        if let Some(index) = self.index_slot.get() {
             index.notify_changed(&path.to_string_lossy());
         }
         if let Some(lsp) = self.lsp.as_mut() {
@@ -318,16 +329,32 @@ impl ToolRegistry {
         // §8): discover/inspect tools first, then the ones that change things.
         let registry = Self::new(root.clone());
         let log = registry.write_log();
+        let slot = registry.index_slot();
         #[allow(unused_mut)]
         let mut registry = registry
             .with_native(Box::new(
-                ReadTool::new(root.clone()).with_default_limit(cfg.read.default_limit),
+                ReadTool::new(root.clone())
+                    .with_default_limit(cfg.read.default_limit)
+                    .with_index(slot.clone()),
             ))
             .with_search(
                 search.clone(),
                 cfg.search.max_file_bytes,
                 cfg.search.timeout_ms,
             )
+            // FR-INDEX-05..07: registered whether or not an index will run —
+            // without one they answer from a labelled regex fallback.
+            .with_native(Box::new(OutlineTool::new(root.clone(), slot.clone())))
+            .with_native(Box::new(SymbolsTool::new(
+                root.clone(),
+                slot.clone(),
+                search.clone(),
+            )))
+            .with_native(Box::new(RelatedTool::new(
+                root.clone(),
+                slot,
+                search.clone(),
+            )))
             .with_native(Box::new(
                 WriteTool::new(root.clone()).with_write_log(log.clone()),
             ))
@@ -480,8 +507,15 @@ impl ToolRegistry {
         }
         let uri_for = |p: &str| Self::uri_for_path(&root, p);
         let resolved = {
+            let index = self.index_slot.get().cloned();
             let lsp = self.lsp.as_mut().ok_or("no language server")?;
-            lsp_tools::resolve(lsp.port.as_mut(), &root, &target, &uri_for)
+            lsp_tools::resolve(
+                lsp.port.as_mut(),
+                &root,
+                &target,
+                &uri_for,
+                index.as_deref(),
+            )
         };
         let (uri, line, column) = match resolved {
             Ok(r) => r,
@@ -1207,6 +1241,9 @@ mod tests {
                 TOOL_LIST_DIR,
                 TOOL_GLOB,
                 TOOL_GREP,
+                TOOL_OUTLINE,
+                TOOL_SYMBOLS,
+                TOOL_RELATED,
                 TOOL_WRITE,
                 TOOL_STR_REPLACE,
                 TOOL_APPLY_PATCH,
