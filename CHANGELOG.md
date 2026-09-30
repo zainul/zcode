@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-09-30
+
 **Context efficiency (PRD-CTX-EFF-003).** The three phases the PRD planned
 as v0.7–v0.9 ship together here: token accounting and prompt caching,
 ripgrep search and discovery filtering, output shaping and safe edits,

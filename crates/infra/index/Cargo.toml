@@ -7,8 +7,8 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-domain = { path = "../../domain", version = "0.6.0" }
-infra-search = { path = "../search", version = "0.6.0" }
+domain = { path = "../../domain", version = "0.7.0" }
+infra-search = { path = "../search", version = "0.7.0" }
 # CE-DQ1: 0.27 declares rust-version 1.90; the fallback resolver picks 0.26.
 tree-sitter = "0.26"
 streaming-iterator = "0.1"
