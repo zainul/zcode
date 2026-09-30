@@ -4,7 +4,7 @@
 **Technical plan:** CE-DQ3, CE-DQ13, §8 (`native.rs`, `patch.rs`)
 **Depends on:** task-21 (`subject`), task-25 (`render.rs`)
 **Phase:** 1 (v0.7.0)
-**Status:** Todo
+**Status:** Done (v0.7.0)
 **Priority:** High. Removes the "read the whole file before every edit" loop, and a wrong-place edit hazard.
 
 ## Objective

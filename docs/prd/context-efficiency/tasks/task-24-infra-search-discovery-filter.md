@@ -4,7 +4,7 @@
 **Technical plan:** CE-DQ1, CE-DQ2, §3, §4, §5.2, §7.1
 **Depends on:** — (Phase 1 can start in parallel with task-23)
 **Phase:** 1 (v0.7.0)
-**Status:** Todo
+**Status:** Done (v0.7.0)
 **Priority:** High. `grep`, `glob`, `list_dir` (task-25) and the index (task-32) all go through this filter.
 
 ## Objective

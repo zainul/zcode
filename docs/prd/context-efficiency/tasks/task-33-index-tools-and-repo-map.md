@@ -4,7 +4,7 @@
 **Technical plan:** CE-DQ13, CE-DQ18, CE-DQ21, CE-DQ22, §2.1 (Q2 answer), §6.1, §8
 **Depends on:** task-32 (CodeIndex), task-26 (read guard hook), task-30 (symbol resolution seam)
 **Phase:** 3 (v0.9.0)
-**Status:** Todo
+**Status:** Done (v0.7.0)
 **Priority:** High. This is where the index turns into fewer tokens.
 
 ## Objective

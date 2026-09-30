@@ -4,7 +4,7 @@
 **Technical plan:** CE-DQ6, CE-DQ8, CE-DQ9, CE-DQ10, §5.1, §7.4, §7.6, §10
 **Depends on:** task-21 (`cache_tokens()` helper, `PromptSize`)
 **Phase:** 1 (v0.7.0)
-**Status:** Todo
+**Status:** Done (v0.7.0)
 **Priority:** Critical. The largest single cost lever in the milestone.
 
 ## Objective

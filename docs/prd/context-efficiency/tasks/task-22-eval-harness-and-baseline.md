@@ -4,7 +4,7 @@
 **Technical plan:** CE-DQ23, §4 (`evals` crate), §12
 **Depends on:** task-21
 **Phase:** 0 (v0.6.x)
-**Status:** Todo
+**Status:** Done (v0.7.0)
 **Priority:** Critical. No phase gate can be evaluated without it.
 
 ## Objective

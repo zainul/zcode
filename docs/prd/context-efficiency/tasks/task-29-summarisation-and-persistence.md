@@ -4,7 +4,7 @@
 **Technical plan:** CE-DQ4, CE-DQ5, CE-DQ12, CE-DQ22, §6.2, §7.5, §7.6, §9, §10
 **Depends on:** task-28
 **Phase:** 2 (v0.8.0)
-**Status:** Todo
+**Status:** Done (v0.7.0)
 **Priority:** High. The last line of defence for very long sessions; makes compaction visible and lossless on disk.
 
 ## Objective

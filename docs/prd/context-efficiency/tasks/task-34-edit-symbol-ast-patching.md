@@ -4,7 +4,7 @@
 **Technical plan:** CE-DQ2, CE-DQ13, CE-DQ15, §5.5, §8 (`edit_symbol.rs`), §11 rule 3
 **Depends on:** task-32 (`parse_text`, spans with attached trivia), task-27 (`after_write`, seams renderer), task-30 (LSP sync listener)
 **Phase:** 3 (v0.9.0)
-**Status:** Todo
+**Status:** Done (v0.7.0)
 **Priority:** High. Makes edit payloads proportional to the change, with no preceding full read.
 
 ## Objective

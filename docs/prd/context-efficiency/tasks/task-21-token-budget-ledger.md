@@ -4,7 +4,7 @@
 **Technical plan:** CE-DQ3, CE-DQ10, CE-DQ11, §5.1, §5.4, §6.1, §7.6
 **Depends on:** — (first task of the milestone)
 **Phase:** 0 (v0.6.x)
-**Status:** Todo
+**Status:** Done (v0.7.0)
 **Priority:** Critical. Every later task's acceptance is measured with this. It also lands the `LlmMessage.meta` field that tasks 26, 28, 29 and 33 build on.
 
 ## Objective

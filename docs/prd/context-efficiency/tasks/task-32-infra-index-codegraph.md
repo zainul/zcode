@@ -4,7 +4,7 @@
 **Technical plan:** CE-DQ1, CE-DQ2, CE-DQ15, CE-DQ16, CE-DQ17, §3, §5.2, §7.2, §11
 **Depends on:** task-24 (`SearchPort::walk_files`, DiscoveryFilter)
 **Phase:** 3 (v0.9.0)
-**Status:** Todo
+**Status:** Done (v0.7.0)
 **Priority:** High. The foundation for `outline`, `symbols`, `related`, the repo map, `edit_symbol`, and index-backed LSP addressing.
 
 ## Objective

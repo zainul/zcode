@@ -4,7 +4,7 @@
 **Technical plan:** CE-DQ3, CE-DQ12, CE-DQ13, CE-DQ14, §6.1, §7.7, §8
 **Depends on:** task-21 (`meta`, `subject`), task-25 (`render.rs`)
 **Phase:** 1 (v0.7.0)
-**Status:** Todo
+**Status:** Done (v0.7.0)
 **Priority:** High. Without ranged reads, cheaper search does not turn into cheaper reading.
 
 ## Objective

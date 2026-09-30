@@ -4,7 +4,7 @@
 **Technical plan:** CE-DQ14, CE-DQ19, CE-DQ21, §7.3, §8
 **Depends on:** task-25 (`render.rs`), task-27 (`after_write` hook). Symbol addressing uses the code index when present (task-32), so this task implements the `workspace/symbol` path and the index path is a one-line addition in task-33.
 **Phase:** 2 (v0.8.0)
-**Status:** Todo
+**Status:** Done (v0.7.0)
 **Priority:** High. Makes the semantic tools cheaper than reading, rather than more expensive.
 
 ## Objective

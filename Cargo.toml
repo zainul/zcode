@@ -59,7 +59,10 @@ grep-regex = "0.1"
 grep-matcher = "0.1"
 
 [profile.release]
-lto = "thin"
+# Fat LTO: -0.7 MB over thin with the tree-sitter grammars in, which keeps
+# the release inside NFR-CTX-SIZE-01 (≤ v0.6.0 + 6 MB). Costs ~1 min of
+# release build time.
+lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = "symbols"

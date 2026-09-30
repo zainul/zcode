@@ -4,7 +4,7 @@
 **Technical plan:** CE-DQ2, CE-DQ13, CE-DQ14, §7.1 (`grep.rs`, `glob.rs`), §8
 **Depends on:** task-24 (DiscoveryFilter, `SearchPort` types)
 **Phase:** 1 (v0.7.0)
-**Status:** Todo
+**Status:** Done (v0.7.0)
 **Priority:** High. Makes search possible in every mode (PRD B3).
 
 ## Objective

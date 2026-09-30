@@ -1,7 +1,7 @@
 # PRD: Context Efficiency — Stop Paying for Tokens the Model Does Not Need
 
 **Document ID:** PRD-CTX-EFF-003
-**Status:** Draft — for review
+**Status:** Implemented in v0.7.0 — the live evaluation (§2.3) is still to run; see `code-review.md` §4
 **Author:** Technical Product Manager
 **Created:** 2026-09-28
 **Target Releases:** v0.7.0 (Phase 1) → v0.8.0 (Phase 2) → v0.9.0 (Phase 3) — see §11
@@ -716,9 +716,9 @@ filter, compaction and caching invariants) and `examples/`.
 | # | Question | Owner / by | Current lean |
 |---|----------|-----------|--------------|
 | Q1 | Index persistence format: `serde_json` (already a dependency, slow for 10 k files) or a small custom versioned binary format (no new dependency)? | Tech plan / before Phase 3 | Custom length-prefixed format, `serde_json` for metadata only |
-| Q2 | Repo map on by default? It costs up to 1 K tokens per request (cached) and may not pay for itself on small repos. | Evaluation / Phase 3 gate | On for repos over 200 files, off below that. Decide from evaluation data. |
+| Q2 | Repo map on by default? It costs up to 1 K tokens per request (cached) and may not pay for itself on small repos. | Evaluation / Phase 3 gate | On for repos over 200 files, off below that. Decide from evaluation data. **v0.7.0 ships the lean; the deciding evaluation has not run yet (`code-review.md` §4).** |
 | Q3 | Use Anthropic's server-side context management when on a native Anthropic route, as an *extra* layer? | Tech plan / after Phase 2 | Not in this milestone. Re-evaluate against R4. |
-| Q4 | Exact tree-sitter crate and grammar versions compatible with Rust 1.85, and their measured size. | Tech plan / before Phase 3 | Must be measured, not assumed. |
+| Q4 | Exact tree-sitter crate and grammar versions compatible with Rust 1.85, and their measured size. | Tech plan / before Phase 3 | Must be measured, not assumed. **Resolved:** tree-sitter 0.26, rust 0.24, go 0.25, typescript 0.23, python 0.25; together +5.09 MB (fat LTO). |
 | Q5 | Should `read` of a large file without a range return *only* the outline (more aggressive) rather than the first 400 lines plus the outline? | Evaluation / Phase 1 | First 400 lines plus outline. Revisit if R1 materialises. |
 | Q6 | The gutter costs ~1–2 tokens per line. Keep it for all reads, or only for ranged reads? | Evaluation / Phase 1 | Keep it everywhere. Addressability pays for it. |
 

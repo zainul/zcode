@@ -4,7 +4,7 @@
 **Technical plan:** CE-DQ19, CE-DQ20, CE-DQ21, §7.3, §9
 **Depends on:** task-30 (routing, diagnostics, readiness), task-33 (index fallback for readiness), task-34 (`edit_symbol` result hook), task-29 (manual compaction entry point), task-24 (`DiscoveryFilter::explain`)
 **Phase:** 3 (v0.9.0)
-**Status:** Todo
+**Status:** Done (v0.7.0)
 **Priority:** Medium. Correctness and comfort features that complete the milestone.
 
 ## Objective

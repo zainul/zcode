@@ -4,7 +4,7 @@
 **Technical plan:** CE-DQ7, CE-DQ9, §6.1, §7.4, §7.8, §9
 **Depends on:** task-23 (split usage, layout), task-25 (grep), task-26 (shaping), task-28 (`UiEvent::CacheReset`)
 **Phase:** 2 (v0.8.0)
-**Status:** Todo
+**Status:** Done (v0.7.0)
 **Priority:** Medium. Completes the caching and visibility story; several items are small.
 
 ## Objective

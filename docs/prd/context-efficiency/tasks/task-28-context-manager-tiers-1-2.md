@@ -4,7 +4,7 @@
 **Technical plan:** CE-DQ3, CE-DQ4, CE-DQ10, CE-DQ12, §5.3, §6.1, §6.2
 **Depends on:** task-21 (meta, calibrated live size), task-26 (spill; the stubs point at spill files), task-27 (`FileWrite` subjects)
 **Phase:** 2 (v0.8.0)
-**Status:** Todo
+**Status:** Done (v0.7.0)
 **Priority:** Critical. Bounds the transcript, and removes the quadratic growth and the context-length failures.
 
 ## Objective
