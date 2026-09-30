@@ -24,6 +24,8 @@ pub enum SlashCommand {
     Cost,
     /// Show what fills the model's context right now (FR-BUDGET-05).
     Context,
+    /// Compact the conversation now, optionally with a focus (FR-CTX-12).
+    Compact(Option<String>),
     /// Show provider, model, and where the config came from.
     Model,
     /// List the configured providers, or switch to one of them.
@@ -50,6 +52,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ),
     ("/cost", "token usage and estimated spend for this session"),
     ("/context", "what fills the model's context right now"),
+    (
+        "/compact [focus]",
+        "compact now; focus = what the summary must keep",
+    ),
     ("/model", "provider, model, and config source"),
     (
         "/provider [NAME]",
@@ -127,6 +133,11 @@ pub fn parse(line: &str) -> Option<SlashCommand> {
         "new" | "reset" => SlashCommand::New,
         "cost" | "usage" | "tokens" => SlashCommand::Cost,
         "context" | "ctx" => SlashCommand::Context,
+        // The focus is free text: everything after the command word.
+        "compact" => {
+            let focus = rest[rest.find(char::is_whitespace).unwrap_or(rest.len())..].trim();
+            SlashCommand::Compact((!focus.is_empty()).then(|| focus.to_string()))
+        }
         "model" => SlashCommand::Model,
         // `/provider` on its own lists; with a name it switches. The name is
         // taken verbatim — profiles are named by the user, so validating the
@@ -289,5 +300,12 @@ mod tests {
     fn context_parses() {
         assert_eq!(parse("/context"), Some(SlashCommand::Context));
         assert_eq!(parse("/ctx"), Some(SlashCommand::Context));
+        assert_eq!(parse("/compact"), Some(SlashCommand::Compact(None)));
+        assert_eq!(
+            parse("/compact  the failing parser test "),
+            Some(SlashCommand::Compact(Some(
+                "the failing parser test".into()
+            )))
+        );
     }
 }

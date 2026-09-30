@@ -1101,6 +1101,8 @@ enum Command {
     SwitchProvider(String),
     /// Report what fills the context (FR-BUDGET-05).
     Context,
+    /// Compact the session now, with an optional focus (FR-CTX-12).
+    Compact(Option<String>),
 }
 
 /// Everything the engine thread sends back, on one ordered channel.
@@ -1206,6 +1208,21 @@ fn engine_thread(
                     },
                 };
                 let _ = msg_tx.send(EngineMsg::Lines(lines));
+            }
+            Command::Compact(focus) => {
+                let lines = match &session_id {
+                    None => vec!["compact: nothing yet — the conversation has not started".into()],
+                    // The Compacted event carries the numbers; this only
+                    // covers the case where there was nothing to do.
+                    Some(id) => match app.compact_session(id, focus.as_deref()) {
+                        Ok(Some(_)) => Vec::new(),
+                        Ok(None) => vec!["compact: nothing to compact yet".into()],
+                        Err(e) => vec![format!("compact: {e}")],
+                    },
+                };
+                if !lines.is_empty() {
+                    let _ = msg_tx.send(EngineMsg::Lines(lines));
+                }
             }
             Command::SwitchProvider(name) => {
                 // Build the new client *before* installing it: a typo or a
@@ -1694,6 +1711,14 @@ fn run_command(
                 state.push_lines(vec!["wait for the turn to finish, or /stop".into()]);
             } else {
                 let _ = cmd_tx.send(Command::Context);
+            }
+        }
+        SlashCommand::Compact(focus) => {
+            if state.busy() {
+                state.push_lines(vec!["wait for the turn to finish, or /stop".into()]);
+            } else {
+                state.push_lines(vec!["compacting…".into()]);
+                let _ = cmd_tx.send(Command::Compact(focus));
             }
         }
         SlashCommand::Cost => {

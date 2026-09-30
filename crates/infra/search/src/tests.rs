@@ -425,13 +425,14 @@ fn explain_names_the_rule_and_where_it_came_from() {
     let e = t.search.explain(Path::new("src/app.log")).expect("hidden");
     assert_eq!(
         (e.rule.as_str(), e.source.as_str()),
-        ("*.log", ".gitignore")
+        ("*.log", ".gitignore:2"),
+        "the source names the line"
     );
     let e = t
         .search
         .explain(Path::new("secret-notes/a.md"))
         .expect("hidden");
-    assert_eq!(e.source, ".zcodeignore");
+    assert_eq!(e.source, ".zcodeignore:1");
     assert!(t.search.explain(Path::new("src/main.rs")).is_none());
     assert!(t.search.explain(Path::new("src/keep.log")).is_none());
 }

@@ -110,6 +110,11 @@ pub enum Commands {
         #[command(subcommand)]
         command: ListCmd,
     },
+    /// Explain what discovery (grep, glob, list_dir, the index) skips.
+    Ignore {
+        #[command(subcommand)]
+        command: IgnoreCmd,
+    },
     // FR-INDEX-10
     /// Inspect, rebuild or clear the code index under .zcode/index.
     Index {
@@ -174,6 +179,10 @@ pub struct RunArgs {
     /// Do not build or use the code index for this run (FR-INDEX-10).
     #[arg(long)]
     pub no_index: bool,
+    /// Never compact the conversation — not even to retry a prompt the
+    /// provider refused as too long (FR-CTX-12).
+    #[arg(long)]
+    pub no_compact: bool,
 }
 
 #[derive(clap::Args)]
@@ -206,6 +215,9 @@ pub struct ReplArgs {
     /// Do not build or use the code index for this session (FR-INDEX-10).
     #[arg(long)]
     pub no_index: bool,
+    /// Never compact automatically — `/compact` still works (FR-CTX-12).
+    #[arg(long)]
+    pub no_compact: bool,
 }
 
 impl ReplArgs {
@@ -233,6 +245,9 @@ impl ReplArgs {
         }
         if self.no_index {
             return Some("--no-index");
+        }
+        if self.no_compact {
+            return Some("--no-compact");
         }
         None
     }
@@ -285,6 +300,27 @@ pub enum SessionCmd {
         /// so the whole conversation travels with the file.
         #[arg(long)]
         full: bool,
+    },
+    // FR-CTX-12
+    /// Compact a session now: stale results dropped, old output elided,
+    /// older steps summarised.
+    Compact {
+        /// The session to compact.
+        id: String,
+        /// What the summary must keep, e.g. "the failing parser test".
+        #[arg(long, value_name = "TEXT")]
+        focus: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum IgnoreCmd {
+    // FR-FILTER-07
+    /// Say whether search, listing and the index see a path, and if not,
+    /// which rule hides it and where that rule is written.
+    Check {
+        /// A file or directory.
+        path: PathBuf,
     },
 }
 
@@ -620,7 +656,7 @@ pub fn wire_on(
     // FR-CTX-*: the context manager's settings.
     app.set_context_config(app::ContextConfig {
         enabled: cfg.context.compaction,
-        reactive: true,
+        reactive: cfg.context.reactive,
         compact_at: cfg.context.compact_at,
         compact_target: cfg.context.compact_target,
         compact_at_tokens: cfg.context.compact_at_tokens,
@@ -870,6 +906,7 @@ pub fn run() -> CliResult {
         Some(Commands::Tools { command: _ }) => cmd_tools_list(),
         Some(Commands::Skills { command: _ }) => cmd_skills_list(),
         Some(Commands::Index { command, config }) => cmd_index(command, config.as_deref()),
+        Some(Commands::Ignore { command }) => cmd_ignore(command),
     }
 }
 
@@ -989,6 +1026,10 @@ fn cmd_repl(args: ReplArgs) -> CliResult {
     if args.no_index {
         cfg.index.enabled = false;
     }
+    if args.no_compact {
+        cfg.context.compaction = false;
+        cfg.context.reactive = false;
+    }
     let cancel = install_signal_handler();
     tui::run_tui(cfg, cancel, args.session)?;
     Ok(ExitCode::SUCCESS)
@@ -1005,6 +1046,10 @@ fn cmd_run(args: RunArgs) -> CliResult {
     )?;
     if args.no_index {
         cfg.index.enabled = false;
+    }
+    if args.no_compact {
+        cfg.context.compaction = false;
+        cfg.context.reactive = false;
     }
     let cancel = install_signal_handler();
 
@@ -1088,6 +1133,7 @@ fn cmd_session(command: SessionCmd) -> CliResult {
                     config: None,
                     timeout: None,
                     no_index: false,
+                    no_compact: false,
                 }),
                 None => {
                     let cancel = install_signal_handler();
@@ -1117,6 +1163,75 @@ fn cmd_session(command: SessionCmd) -> CliResult {
             }
             outln!("{}", to.display());
         }
+        SessionCmd::Compact { id, focus } => {
+            // The summariser is a model call; nothing here needs the index.
+            let mut cfg = cfg;
+            cfg.index.enabled = false;
+            let mut app = wire_with_format(&cfg, Box::new(std::io::sink()), JsonFormat::Zcode)?;
+            match app.compact_session(&id, focus.as_deref())? {
+                Some(r) => {
+                    let mut line =
+                        domain::describe_compaction(r.tier, r.tokens_before, r.tokens_after);
+                    // The headless form has no next request to speak of.
+                    if let Some(i) = line.find("; the prompt cache") {
+                        line.truncate(i);
+                    }
+                    outln!("{line}");
+                }
+                None => outln!("nothing to compact in {id}"),
+            }
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `zcode ignore check <path>` (FR-FILTER-07). Exit 0 either way: it is an
+/// inspection, not a test.
+fn cmd_ignore(command: IgnoreCmd) -> CliResult {
+    let IgnoreCmd::Check { path } = command;
+    let cfg = load_config(None, Overrides::default())?;
+    let root = cfg
+        .working_dir
+        .canonicalize()
+        .unwrap_or_else(|_| cfg.working_dir.clone());
+    let filter = infra_search::DiscoveryFilter::new(
+        &root,
+        &infra_search::FilterConfig {
+            exclude: cfg.context.exclude.clone(),
+            include: cfg.context.include.clone(),
+        },
+    )?;
+    // Relative to where the command was typed, which may be a subdirectory
+    // of the project.
+    let abs = if path.is_absolute() {
+        path.clone()
+    } else {
+        std::env::current_dir()?.join(&path)
+    };
+    let abs = abs.canonicalize().unwrap_or(abs);
+    if !abs.starts_with(&root) {
+        outln!(
+            "{}: outside the project ({})",
+            path.display(),
+            root.display()
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+    // A directory-only rule (`build/`) cannot match a path that does not
+    // exist, so say that the answer is for a file of that name.
+    let missing = if abs.exists() {
+        ""
+    } else {
+        "  (no such path — judged as a file)"
+    };
+    match filter.explain(&abs) {
+        Some(e) => outln!(
+            "{}: excluded by {} ({}){missing}",
+            path.display(),
+            e.rule,
+            e.source
+        ),
+        None => outln!("{}: included{missing}", path.display()),
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -1567,6 +1682,33 @@ fn base64_encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn efficiency_commands_parse() {
+        let cli = Cli::try_parse_from(["zcode", "session", "compact", "abc", "--focus", "the bug"])
+            .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Session {
+                command: SessionCmd::Compact { ref id, focus: Some(ref f) }
+            }) if id == "abc" && f == "the bug"
+        ));
+        let cli = Cli::try_parse_from(["zcode", "ignore", "check", "dist/app.js"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Ignore {
+                command: IgnoreCmd::Check { ref path }
+            }) if path == Path::new("dist/app.js")
+        ));
+        for sub in ["status", "rebuild", "clear"] {
+            assert!(
+                Cli::try_parse_from(["zcode", "index", sub]).is_ok(),
+                "{sub}"
+            );
+        }
+        let cli = Cli::try_parse_from(["zcode", "run", "--no-index", "task"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Run(ref a)) if a.no_index));
+    }
 
     #[test]
     fn version_command_parses() {

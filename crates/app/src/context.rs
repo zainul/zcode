@@ -167,7 +167,8 @@ impl ContextManager {
         if !self.cfg.enabled || self.live_tokens(history) < self.limit(window) {
             return Ok(None);
         }
-        self.compact(history, window, deps)
+        let target = self.target(window);
+        self.compact(history, window, target, deps)
     }
 
     /// FR-CTX-10: compact regardless of the trigger (a provider already
@@ -178,7 +179,20 @@ impl ContextManager {
         window: Option<u64>,
         deps: &mut CompactDeps<'_>,
     ) -> Result<Option<CompactionRecord>, String> {
-        self.compact(history, window, deps)
+        let target = self.target(window);
+        self.compact(history, window, target, deps)
+    }
+
+    /// FR-CTX-12: the user asked (`/compact`, `zcode session compact`) —
+    /// every tier runs as far as the protected set allows, Tier 3 included,
+    /// whatever the transcript's size.
+    pub fn compact_fully(
+        &mut self,
+        history: &mut Vec<LlmMessage>,
+        window: Option<u64>,
+        deps: &mut CompactDeps<'_>,
+    ) -> Result<Option<CompactionRecord>, String> {
+        self.compact(history, window, 0, deps)
     }
 
     fn stub(message: &mut LlmMessage, text: String, archived: &mut Vec<LlmMessage>) {
@@ -197,10 +211,10 @@ impl ContextManager {
         &mut self,
         history: &mut Vec<LlmMessage>,
         window: Option<u64>,
+        target: u64,
         deps: &mut CompactDeps<'_>,
     ) -> Result<Option<CompactionRecord>, String> {
         let before = self.live_tokens(history);
-        let target = self.target(window);
         let snapshot = history.clone();
         let archived_from = deps.archived.len();
         let p = Policy {

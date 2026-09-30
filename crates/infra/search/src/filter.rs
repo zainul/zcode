@@ -264,9 +264,20 @@ impl DiscoveryFilter {
                 }
                 let (gi, _) = ignore::gitignore::Gitignore::new(&file);
                 if let ignore::Match::Ignore(glob) = gi.matched_path_or_any_parents(&abs, is_dir) {
+                    // `ignore` does not keep line numbers; the rule's own
+                    // text finds it again, which is what a person checks.
+                    let line = std::fs::read_to_string(&file).ok().and_then(|text| {
+                        text.lines()
+                            .position(|l| l.trim() == glob.original().trim())
+                            .map(|i| i + 1)
+                    });
+                    let source = match line {
+                        Some(n) => format!("{}:{n}", self.relative(&file)),
+                        None => self.relative(&file),
+                    };
                     return Some(Exclusion {
                         rule: glob.original().to_string(),
-                        source: self.relative(&file),
+                        source,
                     });
                 }
             }

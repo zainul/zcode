@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — `/compact`, `zcode session compact`, `--no-compact`, `zcode ignore check` (FR-CTX-12, FR-FILTER-07)
+
+`/compact [focus]` in the TUI and `zcode session compact <id> [--focus
+TEXT]` compact a session now: every tier, down as far as the protected set
+allows, with the focus passed to the summariser. They archive, record and
+report exactly like automatic compaction. `/compact` waits for the running
+turn. `--no-compact` on `run`/`repl` turns off automatic compaction *and*
+the compact-and-retry after a context-length rejection;
+`context.compaction = false` alone leaves the retry on. `zcode ignore check
+<path>` says whether discovery sees a path and, if not, the rule and where
+it is written — `excluded by *.log (.gitignore:2)`, now with the ignore
+file's line.
+
 ### Changed — language servers are pooled and started on demand (FR-LSP-08, 10..12)
 
 The "first server that starts wins" rule is gone. `LspPool` holds one server

@@ -485,6 +485,10 @@ pub struct ContextConfig {
     /// Per-tool output budgets in tokens (FR-READ-06): canonical tool names
     /// or `mcp__`/`lsp__` prefixes. Merged per key across layers.
     pub tool_budgets: Vec<(String, u32)>,
+    /// Compact and retry once when a provider rejects the prompt as too
+    /// long (FR-CTX-10). Not a file setting: only `--no-compact` turns it
+    /// off, together with `compaction` (FR-CTX-12).
+    pub reactive: bool,
 }
 
 impl Default for ContextConfig {
@@ -501,6 +505,7 @@ impl Default for ContextConfig {
             include: Vec::new(),
             spill_ttl_days: 7,
             tool_budgets: Vec::new(),
+            reactive: true,
         }
     }
 }

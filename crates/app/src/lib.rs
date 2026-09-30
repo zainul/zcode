@@ -585,7 +585,7 @@ impl App {
         ctx_mgr: &mut ContextManager,
         history: &mut Vec<LlmMessage>,
         session: &Session,
-        forced: bool,
+        trigger: Trigger,
         focus: Option<&str>,
     ) -> (Result<Option<CompactionRecord>, String>, Vec<LlmMessage>) {
         let window = self.context_window.lookup(&session.model);
@@ -644,12 +644,45 @@ impl App {
             archived: &mut archived,
             summarise: Some(&mut summarise),
         };
-        let result = if forced {
-            ctx_mgr.force_compact(history, window, &mut deps)
-        } else {
-            ctx_mgr.maybe_compact(history, window, &mut deps)
+        let result = match trigger {
+            Trigger::Automatic => ctx_mgr.maybe_compact(history, window, &mut deps),
+            Trigger::Rejected => ctx_mgr.force_compact(history, window, &mut deps),
+            Trigger::Manual => ctx_mgr.compact_fully(history, window, &mut deps),
         };
         (result, archived)
+    }
+
+    /// FR-CTX-12: compact a saved session now, all tiers, optionally with a
+    /// focus for the summary — `/compact [focus]` and `zcode session
+    /// compact`. Emits the same events as automatic compaction, archives
+    /// what it replaced, and checkpoints. `Ok(None)`: nothing to compact.
+    pub fn compact_session(
+        &mut self,
+        session_id: &str,
+        focus: Option<&str>,
+    ) -> Result<Option<CompactionRecord>, AppError> {
+        let mut session = self
+            .sessions
+            .load(session_id)
+            .map_err(|e| AppError::Session(format!("cannot load session {session_id}: {e}")))?;
+        let mut history: Vec<LlmMessage> =
+            std::mem::replace(&mut session.messages, Box::new([])).into_vec();
+        let step = context::step_base(&history);
+        let mut ctx_mgr = ContextManager::new(ContextConfig {
+            enabled: true,
+            ..self.context_cfg
+        });
+        let outcome =
+            self.compact_now(&mut ctx_mgr, &mut history, &session, Trigger::Manual, focus);
+        let result = match &outcome.0 {
+            Ok(record) => Ok(record.clone()),
+            Err(e) => Err(AppError::Session(format!("compaction failed: {e}"))),
+        };
+        let (mut compactions, mut usage) = (0, RunUsage::default());
+        self.after_compaction(&mut session, step, outcome, &mut compactions, &mut usage);
+        let steps = session.step_count;
+        self.checkpoint(&mut session, &mut history, steps)?;
+        result
     }
 
     fn after_compaction(
@@ -868,6 +901,17 @@ impl App {
     }
 }
 
+/// Why a compaction runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Trigger {
+    /// The transcript crossed `compact_at` (FR-CTX-01).
+    Automatic,
+    /// The provider refused the prompt as too long (FR-CTX-10).
+    Rejected,
+    /// Someone asked (FR-CTX-12).
+    Manual,
+}
+
 /// The system message: the mode's policy, then the repo map if there is one.
 fn system_text(mode: domain::AgentMode, repo_map: Option<&str>) -> String {
     match repo_map {
@@ -1014,7 +1058,13 @@ impl AgentLoop for App {
             // clamped to what is actually left; an unknown model is sent
             // exactly what was configured, as before.
             // FR-CTX-01: keep the transcript bounded before it is sent.
-            let outcome = self.compact_now(&mut ctx_mgr, &mut history, &session, false, None);
+            let outcome = self.compact_now(
+                &mut ctx_mgr,
+                &mut history,
+                &session,
+                Trigger::Automatic,
+                None,
+            );
             self.after_compaction(
                 &mut session,
                 step_base + steps as u32 + 1,
@@ -1169,8 +1219,13 @@ impl AgentLoop for App {
                     if let Some(tokens) = domain::parse_window_from_error(&error) {
                         self.context_window.learn(&session.model, tokens);
                     }
-                    let outcome =
-                        self.compact_now(&mut ctx_mgr, &mut history, &session, true, None);
+                    let outcome = self.compact_now(
+                        &mut ctx_mgr,
+                        &mut history,
+                        &session,
+                        Trigger::Rejected,
+                        None,
+                    );
                     let changed = matches!(outcome.0, Ok(Some(_)));
                     self.after_compaction(
                         &mut session,
@@ -2856,6 +2911,37 @@ mod tests {
             .content
             .contains("## Files touched (from the tool ledger)"));
         assert!(kinds(&telemetry).contains(&"llm_finish".to_string()));
+    }
+
+    #[test]
+    fn a_manual_compaction_runs_every_tier_with_the_focus() {
+        // A small session far below any trigger: automatic compaction
+        // would leave it alone; /compact does not.
+        let (mut app, telemetry, _, sessions) = long_session(vec![], 12, 50, 1_000_000);
+        let result = app.execute(&ctx(), long_request()).unwrap();
+        assert_eq!(result.compactions, 0);
+        let summariser = ScriptLlm::new(vec![Ok(vec![
+            LlmEvent::Delta("## Goal\n- read".into()),
+            LlmEvent::Finish(no_usage(LlmFinishReason::Stop)),
+        ])]);
+        let asked = summariser.seen.clone();
+        app.set_compaction_llm(Box::new(summariser));
+        let record = app
+            .compact_session(&result.session_id, Some("the parser bug"))
+            .unwrap()
+            .expect("compacted");
+        assert_eq!(record.tier, 3);
+        assert!(record.tokens_after < record.tokens_before);
+        let prompt = asked.lock().unwrap()[0].join("\n");
+        assert!(prompt.contains("Pay special attention to: the parser bug"));
+        let session = sessions.load(&result.session_id).unwrap();
+        assert_eq!(session.compactions.len(), 1);
+        assert!(session
+            .messages
+            .iter()
+            .any(|m| m.meta.kind == domain::MessageKind::Summary));
+        assert!(kinds(&telemetry).contains(&"context_compacted".to_string()));
+        assert!(app.compact_session("no-such-session", None).is_err());
     }
 
     #[test]
