@@ -564,6 +564,24 @@ impl ToolRegistryPort for ToolRegistry {
         changed.then(|| value.to_string())
     }
 
+    /// FR-SEARCH-09: a shell command whose program is a search tool —
+    /// after `cd … &&` and `env VAR=…` prefixes — is `shell_search`.
+    fn classify_call(&self, name: &str, args_json: &str) -> Option<&'static str> {
+        if canonical_tool_name(name) != TOOL_SHELL {
+            return None;
+        }
+        let args: serde_json::Value = serde_json::from_str(args_json).ok()?;
+        let command = args.get("command")?.as_str()?;
+        shell_program(command)
+            .is_some_and(|p| {
+                matches!(
+                    p,
+                    "grep" | "egrep" | "fgrep" | "rg" | "ag" | "ack" | "find" | "fd"
+                )
+            })
+            .then_some("shell_search")
+    }
+
     fn set_cancel(&mut self, cancel: domain::CancelFlag) {
         if let Ok(mut slot) = self.cancel.lock() {
             *slot = Some(cancel);
@@ -666,6 +684,21 @@ fn lsp_tool_specs() -> Vec<ToolSpec> {
             params_json: r#"{"type":"object","properties":{"path":{"type":"string","description":"One file; default: every file touched this session"},"severity":{"type":"string","enum":["error","warning","all"]}}}"#.into(),
         },
     ]
+}
+
+/// The program a shell command runs, past `cd … &&` and `env VAR=…`
+/// prefixes.
+fn shell_program(command: &str) -> Option<&str> {
+    let mut rest = command.trim();
+    while let Some(idx) = rest.find("&&") {
+        if rest[..idx].trim_start().starts_with("cd ") {
+            rest = rest[idx + 2..].trim_start();
+        } else {
+            break;
+        }
+    }
+    rest.split_whitespace()
+        .find(|w| *w != "env" && !w.contains('='))
 }
 
 /// `file://` URI for an absolute path. Kept local so the registry does not
@@ -1381,7 +1414,7 @@ mod tests {
     /// reports is the line the LSP tools address.
     #[test]
     fn a_grep_line_number_addresses_the_same_line_in_lsp_tools() {
-        let (_dir, mut registry, lsp) = sym_registry();
+        let (_dir, registry, lsp) = sym_registry();
         let root = registry.root.clone();
         let mut registry = registry.with_search(default_search(&root), 2_000_000, 10_000);
         let hit = registry
@@ -1400,5 +1433,21 @@ mod tests {
             .unwrap();
         let (_, l0, c0) = lsp.asked.lock().unwrap().last().unwrap().clone();
         assert_eq!((l0 + 1, c0 + 1), (line, 8));
+    }
+
+    #[test]
+    fn shell_searches_are_classified() {
+        let registry = ToolRegistry::new(PathBuf::from("."));
+        let class = |cmd: &str| {
+            registry.classify_call(
+                TOOL_SHELL,
+                &serde_json::json!({ "command": cmd }).to_string(),
+            )
+        };
+        assert_eq!(class("rg -n TODO src"), Some("shell_search"));
+        assert_eq!(class("cd web && grep -r foo ."), Some("shell_search"));
+        assert_eq!(class("env LC_ALL=C find . -name x"), Some("shell_search"));
+        assert_eq!(class("cargo test"), None);
+        assert_eq!(registry.classify_call(TOOL_READ, "{}"), None);
     }
 }

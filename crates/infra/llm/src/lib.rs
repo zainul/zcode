@@ -23,6 +23,7 @@ pub use record::{RecordingLlm, ReplayLlm};
 use std::collections::{HashSet, VecDeque};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -770,6 +771,8 @@ pub struct OpenAiShapeLlm {
     /// Sent as `prompt_cache_key` to OpenAI so a session's requests land on
     /// the same cache shard (FR-CACHE-03). Set through `LlmPort::set_session`.
     session_id: Option<String>,
+    /// Set once a gateway rejected the one-hour TTL (CE-DQ7).
+    ttl_downgraded: Arc<AtomicBool>,
     /// Known context-window sizes, consulted before every request and
     /// updated in place the moment a provider's own rejection reveals a real
     /// figure. `Arc<Mutex<_>>` because a stream reconnect
@@ -802,6 +805,7 @@ impl OpenAiShapeLlm {
             markers: CacheMarkers::Auto,
             cache_layout: CacheLayout::default(),
             session_id: None,
+            ttl_downgraded: Arc::new(AtomicBool::new(false)),
             window_table: Arc::new(Mutex::new(WindowTable::builtin())),
             window_cache_path: None,
         }
@@ -918,32 +922,37 @@ impl OpenAiShapeLlm {
         let window_table = self.window_table.clone();
         let cache_path = self.window_cache_path.clone();
         let requested_max_tokens = req.max_tokens;
+        let downgraded = self.ttl_downgraded.clone();
         let open = move || -> Result<Attempt, BoxError> {
-            let (RetriedResponse { response, retries }, learned) = send_chat_with_correction(
-                provider,
-                policy,
-                &model,
-                &window_table,
-                cache_path.as_deref(),
-                requested_max_tokens,
-                estimated_prompt_tokens,
-                |max_tokens| {
-                    build_openai_shape_request(
-                        &client,
-                        &endpoint,
-                        &api_key,
-                        &headers,
-                        &with_max_tokens(&base_payload, max_tokens),
-                    )
-                },
-            )?;
-            let mut events: Box<dyn Iterator<Item = Result<LlmEvent, BoxError>> + Send> = Box::new(
-                EventStream::from_response(response, OpenAiDecoder::default()),
-            );
-            if let Some(event) = learned {
-                events = Box::new(std::iter::once(Ok(event)).chain(events));
-            }
-            Ok((events, retries))
+            open_with_ttl_fallback(&base_payload, &downgraded, |payload| {
+                let (RetriedResponse { response, retries }, learned) = send_chat_with_correction(
+                    provider,
+                    policy,
+                    &model,
+                    &window_table,
+                    cache_path.as_deref(),
+                    requested_max_tokens,
+                    estimated_prompt_tokens,
+                    |max_tokens| {
+                        build_openai_shape_request(
+                            &client,
+                            &endpoint,
+                            &api_key,
+                            &headers,
+                            &with_max_tokens(payload, max_tokens),
+                        )
+                    },
+                )?;
+                let mut events: Box<dyn Iterator<Item = Result<LlmEvent, BoxError>> + Send> =
+                    Box::new(EventStream::from_response(
+                        response,
+                        OpenAiDecoder::default(),
+                    ));
+                if let Some(event) = learned {
+                    events = Box::new(std::iter::once(Ok(event)).chain(events));
+                }
+                Ok((events, retries))
+            })
         };
         ResilientStream::start(open, policy)
     }
@@ -1076,6 +1085,60 @@ fn mark_openai_message(message: &mut serde_json::Value, ttl: CacheTtl) -> bool {
             }
         }
         _ => false,
+    }
+}
+
+/// Remove every `"ttl"` from `cache_control` markers, leaving the default
+/// five-minute cache.
+fn strip_cache_ttl(v: &mut serde_json::Value) {
+    match v {
+        serde_json::Value::Object(map) => {
+            if let Some(serde_json::Value::Object(marker)) = map.get_mut("cache_control") {
+                marker.remove("ttl");
+            }
+            map.values_mut().for_each(strip_cache_ttl);
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(strip_cache_ttl),
+        _ => {}
+    }
+}
+
+/// CE-DQ7: open a request, and when a gateway rejects the one-hour cache
+/// TTL — some proxies and older API versions do — fall back to the default
+/// TTL for the rest of the process and retry once, reporting it as a retry
+/// so the downgrade is visible rather than silent.
+fn open_with_ttl_fallback(
+    payload: &serde_json::Value,
+    downgraded: &AtomicBool,
+    mut attempt: impl FnMut(&serde_json::Value) -> Result<Attempt, BoxError>,
+) -> Result<Attempt, BoxError> {
+    let carries_ttl = payload.to_string().contains("\"ttl\"");
+    if !carries_ttl {
+        return attempt(payload);
+    }
+    let mut stripped = payload.clone();
+    strip_cache_ttl(&mut stripped);
+    if downgraded.load(Ordering::Relaxed) {
+        return attempt(&stripped);
+    }
+    match attempt(payload) {
+        Err(e) if e.to_string().to_ascii_lowercase().contains("ttl") => {
+            downgraded.store(true, Ordering::Relaxed);
+            let (events, mut retries) = attempt(&stripped)?;
+            retries.insert(
+                0,
+                RetryNotice {
+                    attempt: 1,
+                    max_attempts: 1,
+                    delay_ms: 0,
+                    status: Some(400),
+                    reason: "one-hour prompt cache not supported here; using the 5-minute cache"
+                        .into(),
+                },
+            );
+            Ok((events, retries))
+        }
+        other => other,
     }
 }
 
@@ -1584,6 +1647,8 @@ pub struct AnthropicLlm {
     endpoint: String,
     /// Breakpoint TTLs (FR-CACHE-07).
     cache_layout: CacheLayout,
+    /// Set once a gateway rejected the one-hour TTL (CE-DQ7).
+    ttl_downgraded: Arc<AtomicBool>,
 }
 
 impl AnthropicLlm {
@@ -1606,6 +1671,7 @@ impl AnthropicLlm {
             retry: RetryPolicy::default(),
             endpoint: endpoint.to_string(),
             cache_layout: CacheLayout::default(),
+            ttl_downgraded: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -1673,15 +1739,18 @@ impl domain::LlmPort for AnthropicLlm {
         let endpoint = self.endpoint.clone();
         let api_key = self.api_key.clone();
         let policy = self.retry;
+        let downgraded = self.ttl_downgraded.clone();
         let open = move || -> Result<Attempt, BoxError> {
-            let RetriedResponse { response, retries } =
-                send_with_retry("anthropic", policy, || {
-                    build_anthropic_request_builder(&client, &endpoint, &api_key, &payload)
-                })?;
-            let events: Box<dyn Iterator<Item = Result<LlmEvent, BoxError>> + Send> = Box::new(
-                EventStream::from_response(response, AnthropicDecoder::default()),
-            );
-            Ok((events, retries))
+            open_with_ttl_fallback(&payload, &downgraded, |payload| {
+                let RetriedResponse { response, retries } =
+                    send_with_retry("anthropic", policy, || {
+                        build_anthropic_request_builder(&client, &endpoint, &api_key, payload)
+                    })?;
+                let events: Box<dyn Iterator<Item = Result<LlmEvent, BoxError>> + Send> = Box::new(
+                    EventStream::from_response(response, AnthropicDecoder::default()),
+                );
+                Ok((events, retries))
+            })
         };
         ResilientStream::start(open, policy)
     }
@@ -1981,6 +2050,9 @@ pub struct OllamaLlm {
     endpoint: String,
     model: String,
     retry: RetryPolicy,
+    /// How long Ollama keeps the model — and its KV cache for the stable
+    /// prefix — loaded between steps (FR-CACHE-10). `None`: Ollama's default.
+    keep_alive: Option<String>,
 }
 
 impl OllamaLlm {
@@ -1994,7 +2066,13 @@ impl OllamaLlm {
             endpoint: endpoint.to_string(),
             model: model.to_string(),
             retry: RetryPolicy::default(),
+            keep_alive: None,
         }
+    }
+
+    /// FR-CACHE-10: e.g. `"30m"`; empty leaves Ollama's default.
+    pub fn set_keep_alive(&mut self, keep_alive: &str) {
+        self.keep_alive = (!keep_alive.trim().is_empty()).then(|| keep_alive.trim().to_string());
     }
 
     pub fn model(&self) -> &str {
@@ -2007,7 +2085,10 @@ impl OllamaLlm {
     }
 
     fn open_stream(&self, req: &LlmRequest) -> Result<RetriedResponse, BoxError> {
-        let payload = build_ollama_request(req, &self.model);
+        let mut payload = build_ollama_request(req, &self.model);
+        if let Some(keep_alive) = &self.keep_alive {
+            payload["keep_alive"] = serde_json::json!(keep_alive);
+        }
         send_with_retry("ollama", self.retry, || {
             build_ollama_request_builder(&self.client, &self.endpoint, &payload)
         })
@@ -2056,7 +2137,10 @@ impl domain::LlmPort for OllamaLlm {
         req: &LlmRequest,
     ) -> Box<dyn Iterator<Item = Result<LlmEvent, BoxError>> + Send> {
         let warn = !req.images.is_empty();
-        let payload = build_ollama_request(req, &self.model);
+        let mut payload = build_ollama_request(req, &self.model);
+        if let Some(keep_alive) = &self.keep_alive {
+            payload["keep_alive"] = serde_json::json!(keep_alive);
+        }
         let client = self.client.clone();
         let endpoint = self.endpoint.clone();
         let policy = self.retry;
@@ -3201,6 +3285,64 @@ mod tests {
         assert!(off["messages"][0]["content"].is_string());
     }
 
+    fn empty_attempt() -> Attempt {
+        (Box::new(std::iter::empty()), Vec::new())
+    }
+
+    /// CE-DQ7: a gateway that rejects `ttl` gets one retry without it, and
+    /// every later request goes without it from the start.
+    #[test]
+    fn a_rejected_one_hour_ttl_falls_back_once_and_is_remembered() {
+        let layout = CacheLayout {
+            head: CacheTtl::OneHour,
+            tail: CacheTtl::FiveMinutes,
+        };
+        let payload = build_anthropic_request_with(&session_req(2), "claude", layout);
+        let downgraded = AtomicBool::new(false);
+        let mut sent: Vec<bool> = Vec::new();
+        let (_, retries) = open_with_ttl_fallback(&payload, &downgraded, |p| {
+            let has_ttl = p.to_string().contains("\"ttl\"");
+            sent.push(has_ttl);
+            if has_ttl {
+                Err("anthropic request failed (400): cache_control.ttl: extra inputs are not permitted".into())
+            } else {
+                Ok(empty_attempt())
+            }
+        })
+        .unwrap();
+        assert_eq!(sent, [true, false]);
+        assert!(retries[0].reason.contains("5-minute cache"));
+        assert!(downgraded.load(Ordering::Relaxed));
+        let mut later = Vec::new();
+        let _ = open_with_ttl_fallback(&payload, &downgraded, |p| {
+            later.push(p.to_string().contains("\"ttl\""));
+            Ok(empty_attempt())
+        })
+        .map(|_| ())
+        .unwrap();
+        assert_eq!(later, [false], "the downgrade sticks");
+    }
+
+    #[test]
+    fn an_unrelated_error_is_not_retried_without_ttl() {
+        let layout = CacheLayout {
+            head: CacheTtl::OneHour,
+            tail: CacheTtl::OneHour,
+        };
+        let payload = build_anthropic_request_with(&session_req(1), "claude", layout);
+        let downgraded = AtomicBool::new(false);
+        let mut calls = 0;
+        let Err(err) = open_with_ttl_fallback(&payload, &downgraded, |_| {
+            calls += 1;
+            Err("401 invalid x-api-key".into())
+        }) else {
+            panic!("expected the error to surface");
+        };
+        assert_eq!(calls, 1);
+        assert!(err.to_string().contains("401"));
+        assert!(!downgraded.load(Ordering::Relaxed));
+    }
+
     /// FR-CACHE-03: `prompt_cache_key` only where OpenAI documents it.
     #[test]
     fn prompt_cache_key_is_sent_only_to_openai() {
@@ -3772,5 +3914,15 @@ data: {\"type\":\"message_stop\"}
             second_sent["max_tokens"].as_u64().unwrap() < 50_000,
             "{second_sent}"
         );
+    }
+
+    #[test]
+    fn ollama_sends_keep_alive_only_when_set() {
+        let mut client = OllamaLlm::new("http://localhost:11434/api/chat", "llama3.2");
+        assert!(client.keep_alive.is_none());
+        client.set_keep_alive("30m");
+        assert_eq!(client.keep_alive.as_deref(), Some("30m"));
+        client.set_keep_alive("  ");
+        assert!(client.keep_alive.is_none());
     }
 }

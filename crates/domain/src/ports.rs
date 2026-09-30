@@ -358,6 +358,13 @@ pub trait ToolRegistryPort {
     fn elide_args(&self, _name: &str, _args_json: &str) -> Option<String> {
         None
     }
+
+    /// A label for what a call is, when the tool itself does not say — e.g.
+    /// `shell_search` for a shell `grep`/`rg`/`find` (FR-SEARCH-09), so
+    /// telemetry can show how often search goes around the `grep` tool.
+    fn classify_call(&self, _name: &str, _args_json: &str) -> Option<&'static str> {
+        None
+    }
 }
 
 /// A tool exposed by an MCP server.

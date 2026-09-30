@@ -22,6 +22,8 @@ pub enum SlashCommand {
     New,
     /// Show the running token/cost breakdown.
     Cost,
+    /// Show what fills the model's context right now (FR-BUDGET-05).
+    Context,
     /// Show provider, model, and where the config came from.
     Model,
     /// List the configured providers, or switch to one of them.
@@ -47,6 +49,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "show or change what the agent is allowed to do",
     ),
     ("/cost", "token usage and estimated spend for this session"),
+    ("/context", "what fills the model's context right now"),
     ("/model", "provider, model, and config source"),
     (
         "/provider [NAME]",
@@ -123,6 +126,7 @@ pub fn parse(line: &str) -> Option<SlashCommand> {
         "clear" | "cls" => SlashCommand::Clear,
         "new" | "reset" => SlashCommand::New,
         "cost" | "usage" | "tokens" => SlashCommand::Cost,
+        "context" | "ctx" => SlashCommand::Context,
         "model" => SlashCommand::Model,
         // `/provider` on its own lists; with a name it switches. The name is
         // taken verbatim — profiles are named by the user, so validating the
@@ -279,5 +283,11 @@ mod tests {
         let text = help_lines().join("\n");
         assert!(text.contains("/exit"), "{text}");
         assert!(text.contains("Esc"), "{text}");
+    }
+
+    #[test]
+    fn context_parses() {
+        assert_eq!(parse("/context"), Some(SlashCommand::Context));
+        assert_eq!(parse("/ctx"), Some(SlashCommand::Context));
     }
 }

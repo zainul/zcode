@@ -95,12 +95,39 @@ pub struct ExecutionResult {
     pub peak_context_tokens: u64,
     /// How many times the transcript was compacted (FR-CTX-13).
     pub compactions: u32,
+    /// Every prompt token sent, cached or not (FR-BUDGET-06): the
+    /// denominator of the cache hit ratio.
+    pub prompt_tokens: u64,
+    /// What cache reads saved against the full input rate; `None` when the
+    /// model is unpriced (FR-BUDGET-06).
+    pub cache_saving_usd: Option<f64>,
 }
 
 impl ExecutionResult {
     /// Cache reads and writes together.
     pub fn cache_tokens(&self) -> u64 {
         self.cache_read_tokens + self.cache_write_tokens
+    }
+}
+
+/// What fills a session's context, by part (FR-BUDGET-05). Estimated with
+/// the same heuristic the engine uses before a provider reports.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ContextBreakdown {
+    pub window: Option<u64>,
+    pub system: u64,
+    pub tool_schemas: u64,
+    pub summaries: u64,
+    /// User and assistant messages, tool-call arguments included.
+    pub conversation: u64,
+    pub tool_results: u64,
+    /// The largest tool results: (what, tokens), biggest first, at most five.
+    pub largest: Vec<(String, u64)>,
+}
+
+impl ContextBreakdown {
+    pub fn total(&self) -> u64 {
+        self.system + self.tool_schemas + self.summaries + self.conversation + self.tool_results
     }
 }
 
@@ -114,6 +141,15 @@ pub struct RunUsage {
 }
 
 impl RunUsage {
+    /// Every prompt token sent, whichever convention the provider reports in.
+    pub fn prompt_tokens(&self, cache_within_input: bool) -> u64 {
+        if cache_within_input {
+            self.input + self.cache_write
+        } else {
+            self.input + self.cache_read + self.cache_write
+        }
+    }
+
     /// Cache reads as a share of all prompt tokens sent. `None` when the
     /// provider reported nothing about caching.
     pub fn cache_hit_ratio(&self, cache_within_input: bool) -> Option<f64> {
@@ -196,6 +232,75 @@ pub struct App {
     /// A cheaper model for Tier 3 summaries (`context.compaction_model`,
     /// FR-CTX-08); `None` uses the session's own client.
     compaction_llm: Option<Box<dyn LlmPort + Send>>,
+    /// Output budgets per tool, in tokens (FR-READ-06).
+    tool_budgets: ToolBudgets,
+    /// The client was replaced since the last run: the next request
+    /// re-writes the provider's prompt cache (FR-CACHE-08).
+    llm_switched: bool,
+}
+
+/// Per-tool output budgets in tokens (FR-READ-06). A tool gets the entry
+/// that names it, else the longest matching prefix (`mcp__`, `lsp__`), else
+/// the default; `max_tool_output_chars` stays a hard ceiling over all.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolBudgets {
+    pub default_tokens: u32,
+    pub per_tool: Vec<(String, u32)>,
+}
+
+impl Default for ToolBudgets {
+    fn default() -> Self {
+        let per_tool = [
+            ("shell", 6_000),
+            ("read", 8_000),
+            ("grep", 3_000),
+            ("glob", 1_500),
+            ("list_dir", 1_500),
+            ("outline", 2_000),
+            ("symbols", 1_500),
+            ("related", 1_500),
+            ("lsp__", 2_000),
+            ("mcp__", 6_000),
+        ]
+        .into_iter()
+        .map(|(t, n)| (t.to_string(), n))
+        .collect();
+        Self {
+            default_tokens: 6_000,
+            per_tool,
+        }
+    }
+}
+
+impl ToolBudgets {
+    /// Layer configured entries over the defaults, key by key.
+    pub fn with_overrides(mut self, overrides: &[(String, u32)]) -> Self {
+        for (tool, tokens) in overrides {
+            self.per_tool.retain(|(t, _)| t != tool);
+            self.per_tool.push((tool.clone(), *tokens));
+        }
+        self
+    }
+
+    pub fn tokens_for(&self, tool: &str) -> u32 {
+        let name = domain::canonical_tool_name(tool);
+        self.per_tool
+            .iter()
+            .filter(|(t, _)| name == *t || (t.ends_with("__") && name.starts_with(t.as_str())))
+            .max_by_key(|(t, _)| t.len())
+            .map_or(self.default_tokens, |(_, n)| *n)
+    }
+
+    /// The character cap for `tool`: its token budget at the code divisor
+    /// (≈3.6 chars/token), never above `ceiling` (0 = no ceiling).
+    pub fn chars_for(&self, tool: &str, ceiling: usize) -> usize {
+        let chars = (f64::from(self.tokens_for(tool)) * 3.6) as usize;
+        if ceiling == 0 {
+            chars
+        } else {
+            chars.min(ceiling)
+        }
+    }
 }
 
 impl App {
@@ -219,7 +324,14 @@ impl App {
             spill: None,
             context_cfg: ContextConfig::default(),
             compaction_llm: None,
+            tool_budgets: ToolBudgets::default(),
+            llm_switched: false,
         }
+    }
+
+    /// Per-tool output budgets (`[context.tool_budgets]`, FR-READ-06).
+    pub fn set_tool_budgets(&mut self, budgets: ToolBudgets) {
+        self.tool_budgets = budgets;
     }
 
     /// Summarise with this client instead of the session's (FR-CTX-08).
@@ -248,6 +360,7 @@ impl App {
     /// switch — which is the point of switching mid-conversation.
     pub fn set_llm(&mut self, llm: Box<dyn LlmPort + Send>) {
         self.llm = llm;
+        self.llm_switched = true;
     }
 
     /// Replace the price table, e.g. with the config's `[[pricing]]`
@@ -311,6 +424,54 @@ impl App {
             .into_boxed_slice()
     }
 
+    /// What fills `session_id`'s context right now (FR-BUDGET-05).
+    pub fn context_breakdown(&self, session_id: &str) -> Result<ContextBreakdown, AppError> {
+        let session = self
+            .sessions
+            .load(session_id)
+            .map_err(|e| AppError::Session(e.to_string()))?;
+        let est = |m: &LlmMessage| domain::estimate_messages(std::slice::from_ref(m));
+        let mut b = ContextBreakdown {
+            window: self.context_window.lookup(&session.model),
+            tool_schemas: self
+                .tool_specs_for(session.mode)
+                .iter()
+                .map(|t| {
+                    domain::estimate_tokens(&t.name)
+                        + domain::estimate_tokens(&t.description)
+                        + domain::estimate_tokens(&t.params_json)
+                })
+                .sum(),
+            ..ContextBreakdown::default()
+        };
+        let mut results: Vec<(String, u64)> = Vec::new();
+        let messages = &session.messages;
+        for (i, m) in messages.iter().enumerate() {
+            let n = est(m);
+            match (m.role, m.meta.kind) {
+                (LlmRole::System, _) => b.system += n,
+                (_, domain::MessageKind::Summary) => b.summaries += n,
+                (LlmRole::Tool, _) => {
+                    b.tool_results += n;
+                    let tool = domain::context::call_for(messages, i)
+                        .map_or("tool".to_string(), |c| c.name.clone());
+                    let what = match &m.meta.subject {
+                        Some(domain::Subject::FileRange { path, .. })
+                        | Some(domain::Subject::FileWrite { path })
+                        | Some(domain::Subject::Listing { path }) => format!("{tool} {path}"),
+                        _ => tool,
+                    };
+                    results.push((format!("{what} (s{})", m.meta.step), n));
+                }
+                _ => b.conversation += n,
+            }
+        }
+        results.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        results.truncate(5);
+        b.largest = results;
+        Ok(b)
+    }
+
     /// Enumerate every tool, unfiltered (`zcode tools list`).
     pub fn tool_specs(&self) -> Box<[ToolSpec]> {
         self.tools.list()
@@ -337,6 +498,15 @@ impl App {
             .sessions
             .load(&id)
             .map_err(|e| AppError::Session(format!("cannot load session {id}: {e}")))?;
+        // A resumed session in another mode gets another system prompt and
+        // tool list — both at the front of every request, so the provider's
+        // prompt cache starts over (FR-CACHE-08). Accepted on purpose:
+        // advertising tools the mode refuses would break the gating rule.
+        if !session.messages.is_empty() && session.mode != req.mode {
+            self.emitter.emit(UiEvent::CacheReset {
+                reason: format!("mode changed to {}", req.mode.as_str()),
+            });
+        }
         // Mode and model are per-run properties recorded on the session
         // (FR-MODE-04, FR-SESSION-07).
         session.mode = req.mode;
@@ -687,6 +857,11 @@ impl AgentLoop for App {
         let mut session = self.open_session(&req, ctx)?;
         // FR-CACHE-03: cache routing is per session.
         self.llm.set_session(&session.id);
+        if std::mem::take(&mut self.llm_switched) && !session.messages.is_empty() {
+            self.emitter.emit(UiEvent::CacheReset {
+                reason: "provider or model switched".into(),
+            });
+        }
         let mut history: Vec<LlmMessage> =
             std::mem::replace(&mut session.messages, Box::new([])).into_vec();
 
@@ -1093,6 +1268,13 @@ impl AgentLoop for App {
                         ("tool".into(), ExtraField::Text(call.name.clone())),
                         ("tool_call_id".into(), ExtraField::Text(call.id.clone())),
                         ("arguments".into(), ExtraField::Text(call.arguments.clone())),
+                        (
+                            "class".into(),
+                            match self.tools.classify_call(&call.name, &call.arguments) {
+                                Some(c) => ExtraField::Text(c.into()),
+                                None => ExtraField::Null,
+                            },
+                        ),
                     ],
                 );
 
@@ -1113,8 +1295,10 @@ impl AgentLoop for App {
                 // the transcript can never balloon past the configured budget.
                 // What is cut is spilled first, so it stays reachable
                 // (FR-READ-07); a spill failure costs only that pointer.
-                let over_budget = req.max_tool_output_chars > 0
-                    && payload.chars().count() > req.max_tool_output_chars;
+                let budget = self
+                    .tool_budgets
+                    .chars_for(&call.name, req.max_tool_output_chars);
+                let over_budget = payload.chars().count() > budget;
                 let spill_path = match (&mut self.spill, over_budget) {
                     (Some(store), true) => match store.spill(&session.id, &call.id, &payload) {
                         Ok(path) => Some(path),
@@ -1127,7 +1311,7 @@ impl AgentLoop for App {
                     _ => None,
                 };
                 let (payload, was_truncated) =
-                    shape_tool_output(payload, req.max_tool_output_chars, spill_path.as_deref());
+                    shape_tool_output(payload, budget, spill_path.as_deref());
                 let payload_tokens = domain::estimate_tokens(&payload);
                 let category = domain::tool_category_for_call(&call.name, &call.arguments);
 
@@ -1224,6 +1408,10 @@ impl AgentLoop for App {
             cost,
             peak_context_tokens,
             compactions,
+            prompt_tokens: usage.prompt_tokens(cache_within_input),
+            cache_saving_usd: self
+                .pricing
+                .cache_saving_usd(&session.model, usage.cache_read),
         })
     }
 }
@@ -2506,6 +2694,100 @@ mod tests {
             .content
             .contains("## Files touched (from the tool ledger)"));
         assert!(kinds(&telemetry).contains(&"llm_finish".to_string()));
+    }
+
+    #[test]
+    fn tool_budgets_match_by_name_then_prefix_under_a_ceiling() {
+        let b = ToolBudgets::default()
+            .with_overrides(&[("shell".into(), 100), ("mcp__db__".into(), 50)]);
+        assert_eq!(b.tokens_for("shell"), 100);
+        assert_eq!(b.tokens_for("lsp__hover"), 2_000);
+        assert_eq!(b.tokens_for("mcp__db__query"), 50, "longest prefix wins");
+        assert_eq!(b.tokens_for("mcp__other__x"), 6_000);
+        assert_eq!(b.tokens_for("zcode_skill"), 6_000, "the default");
+        assert_eq!(b.chars_for("shell", 0), 360);
+        assert_eq!(
+            b.chars_for("read", 1_000),
+            1_000,
+            "the global cap is a ceiling"
+        );
+    }
+
+    #[test]
+    fn a_tools_budget_caps_its_output() {
+        let mut h = harness(
+            vec![
+                tool_use_turn("c1", "shell", "{}"),
+                vec![LlmEvent::Finish(finish(LlmFinishReason::Stop))],
+            ],
+            &"line of shell output\n".repeat(5_000),
+        );
+        h.app
+            .set_tool_budgets(ToolBudgets::default().with_overrides(&[("shell".into(), 100)]));
+        let mut req = ExecutionRequest::new("go");
+        req.max_tool_output_chars = 1_000_000;
+        let result = h.app.execute(&ctx(), req).unwrap();
+        let session = h.sessions.load(&result.session_id).unwrap();
+        let msg = session
+            .messages
+            .iter()
+            .find(|m| m.role == LlmRole::Tool)
+            .unwrap();
+        assert!(msg.tool_result.as_ref().unwrap().content.chars().count() < 600);
+    }
+
+    #[derive(Clone, Default)]
+    struct Resets(Arc<Mutex<Vec<String>>>);
+    impl Emitter for Resets {
+        fn emit(&mut self, ev: UiEvent) {
+            if let UiEvent::CacheReset { reason } = ev {
+                self.0.lock().unwrap().push(reason);
+            }
+        }
+    }
+
+    #[test]
+    fn a_mode_change_or_model_switch_on_a_resumed_session_reports_a_cache_reset() {
+        let mut h = harness(vec![], "ok");
+        let resets = Resets::default();
+        h.app.set_emitter(Box::new(resets.clone()));
+        let first = h.app.execute(&ctx(), ExecutionRequest::new("hi")).unwrap();
+        assert!(
+            resets.0.lock().unwrap().is_empty(),
+            "a new session resets nothing"
+        );
+
+        let mut again = ExecutionRequest::new("more");
+        again.session_id = Some(first.session_id.clone());
+        again.mode = AgentMode::Planning;
+        h.app.execute(&ctx(), again.clone()).unwrap();
+        assert_eq!(
+            resets.0.lock().unwrap().as_slice(),
+            ["mode changed to planning"]
+        );
+
+        h.app.set_llm(Box::new(FakeLlm::new(vec![])));
+        h.app.execute(&ctx(), again).unwrap();
+        assert_eq!(
+            resets.0.lock().unwrap().last().unwrap(),
+            "provider or model switched"
+        );
+    }
+
+    #[test]
+    fn the_context_breakdown_names_its_parts_and_largest_results() {
+        let (mut app, _, _, _) = long_session(vec![], 6, 300, 1_000_000);
+        let result = app.execute(&ctx(), long_request()).unwrap();
+        let b = app.context_breakdown(&result.session_id).unwrap();
+        assert!(b.system > 0 && b.tool_schemas > 0 && b.conversation > 0);
+        assert!(b.tool_results > b.conversation, "{b:?}");
+        assert_eq!(b.largest.len(), 5);
+        assert!(b.largest[0].0.starts_with("read"), "{:?}", b.largest);
+        assert_eq!(b.window, Some(1_000_000));
+        assert_eq!(
+            b.total(),
+            b.system + b.tool_schemas + b.summaries + b.conversation + b.tool_results
+        );
     }
 
     #[test]

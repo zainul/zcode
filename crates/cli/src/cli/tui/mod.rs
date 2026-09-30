@@ -46,7 +46,6 @@ use self::input::Input;
 use self::timeline::{EntryKind, NoteLevel, Timeline, ToolStatus};
 use super::emit::sanitize;
 use super::logging::LogRedirect;
-use super::wire;
 
 /// Frame budget. Short enough for a smooth spinner, long enough to idle cheap.
 const TICK: Duration = Duration::from_millis(80);
@@ -148,6 +147,53 @@ impl Phase {
     }
 }
 
+/// The `/context` report (FR-BUDGET-05): each part of the context, the five
+/// largest tool results, and what is left.
+fn context_lines(b: &app::ContextBreakdown) -> Vec<String> {
+    let k = |n: u64| {
+        if n >= 1_000 {
+            format!("{:.1}k", n as f64 / 1_000.0)
+        } else {
+            n.to_string()
+        }
+    };
+    let total = b.total();
+    let mut out = vec![match b.window {
+        Some(w) => format!(
+            "context  ~{} / {} ({:.0}%) — estimated",
+            k(total),
+            k(w),
+            total as f64 / w as f64 * 100.0
+        ),
+        None => format!("context  ~{} — estimated (window unknown)", k(total)),
+    }];
+    for (label, n) in [
+        ("system prompt", b.system),
+        ("tool schemas", b.tool_schemas),
+        ("summaries", b.summaries),
+        ("user / assistant", b.conversation),
+        ("tool results", b.tool_results),
+    ] {
+        out.push(format!("  {label:<18} {:>8}", k(n)));
+    }
+    if !b.largest.is_empty() {
+        let largest: Vec<String> = b
+            .largest
+            .iter()
+            .map(|(what, n)| format!("{what} {}", k(*n)))
+            .collect();
+        out.push(format!("  largest results    {}", largest.join(" · ")));
+    }
+    if let Some(w) = b.window {
+        out.push(format!(
+            "  {:<18} {:>8}",
+            "free",
+            k(w.saturating_sub(total))
+        ));
+    }
+    out
+}
+
 /// `ctx 62%`, or `ctx 84.0k` when the model's window is unknown.
 fn context_label(live: u64, window: Option<u64>) -> String {
     match window.filter(|w| *w > 0) {
@@ -173,6 +219,12 @@ pub struct Totals {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_tokens: u64,
+    /// Settled at the end of each turn (FR-BUDGET-06).
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub prompt_tokens: u64,
+    /// `None` until a priced turn reports one.
+    pub cache_saving_usd: Option<f64>,
     pub steps: u64,
     pub turns: u64,
     pub cost: Cost,
@@ -221,6 +273,12 @@ impl Totals {
         self.cache_tokens += result.cache_tokens().saturating_sub(self.turn.cache);
         self.steps += result.steps;
         self.turns += 1;
+        self.cache_read_tokens += result.cache_read_tokens;
+        self.cache_write_tokens += result.cache_write_tokens;
+        self.prompt_tokens += result.prompt_tokens;
+        if let Some(saved) = result.cache_saving_usd {
+            self.cache_saving_usd = Some(self.cache_saving_usd.unwrap_or(0.0) + saved);
+        }
         // A cost the provider reported has already been counted and is exact;
         // the local estimate must not be added on top of it.
         if self.turn.cost_usd <= 0.0 {
@@ -869,6 +927,28 @@ impl TuiState {
                 self.totals.input_tokens, self.totals.output_tokens, self.totals.cache_tokens
             ),
         ];
+        // FR-BUDGET-06: what the prompt cache did.
+        let t = &self.totals;
+        if t.cache_read_tokens + t.cache_write_tokens > 0 {
+            let hit = if t.prompt_tokens > 0 {
+                format!(
+                    " · hit {:.0}%",
+                    t.cache_read_tokens as f64 / t.prompt_tokens as f64 * 100.0
+                )
+            } else {
+                String::new()
+            };
+            out.push(format!(
+                "cache:   read {} · write {}{hit}",
+                t.cache_read_tokens, t.cache_write_tokens
+            ));
+            out.push(match t.cache_saving_usd {
+                Some(saved) => format!(
+                    "saved:   ≈ ${saved:.4} vs sending the cached prompt at the full input rate"
+                ),
+                None => "saved:   n/a — the model is unpriced".to_string(),
+            });
+        }
         if c.priced {
             out.push(format!(
                 "cost:    {} (input {:.4}, output {:.4}, cache {:.4}) — estimated from list \
@@ -1019,6 +1099,8 @@ enum Command {
     NewSession,
     /// Point the loop at a different configured provider, by name.
     SwitchProvider(String),
+    /// Report what fills the context (FR-BUDGET-05).
+    Context,
 }
 
 /// Everything the engine thread sends back, on one ordered channel.
@@ -1031,6 +1113,8 @@ enum EngineMsg {
     Done(Box<Result<ExecutionResult, String>>),
     /// Tool list after a mode change.
     Tools(Vec<String>),
+    /// Lines to show as-is (a `/context` report).
+    Lines(Vec<String>),
     /// The provider actually in use, after a successful switch.
     Provider {
         name: String,
@@ -1083,7 +1167,12 @@ fn engine_thread(
     cmd_rx: Receiver<Command>,
 ) {
     // Telemetry goes to a sink, never stdout: the alternate screen owns it.
-    let mut app = match wire(&cfg, Box::new(io::sink())) {
+    let mut app = match super::wire_on(
+        &cfg,
+        Box::new(io::sink()),
+        super::JsonFormat::Zcode,
+        super::Surface::Interactive,
+    ) {
         Ok(app) => app,
         Err(e) => {
             let _ = msg_tx.send(EngineMsg::Fatal(e.to_string()));
@@ -1108,6 +1197,16 @@ fn engine_thread(
                 let _ = msg_tx.send(EngineMsg::Tools(tool_names(&app, mode)));
             }
             Command::NewSession => session_id = None,
+            Command::Context => {
+                let lines = match &session_id {
+                    None => vec!["context: nothing yet — the conversation has not started".into()],
+                    Some(id) => match app.context_breakdown(id) {
+                        Ok(b) => context_lines(&b),
+                        Err(e) => vec![format!("context: {e}")],
+                    },
+                };
+                let _ = msg_tx.send(EngineMsg::Lines(lines));
+            }
             Command::SwitchProvider(name) => {
                 // Build the new client *before* installing it: a typo or a
                 // missing key must leave the working provider in place, not
@@ -1116,7 +1215,7 @@ fn engine_thread(
                     .with_provider(&name)
                     .map_err(|e| e.to_string())
                     .and_then(|next| {
-                        super::build_llm(&next)
+                        super::build_llm_on(&next, super::Surface::Interactive)
                             .map(|llm| (next, llm))
                             .map_err(|e| e.to_string())
                     }) {
@@ -1278,6 +1377,7 @@ fn render_loop(
                 EngineMsg::Event(ev) => state.apply(ev),
                 EngineMsg::Done(outcome) => state.finish_turn(*outcome),
                 EngineMsg::Ready(tools) | EngineMsg::Tools(tools) => state.tool_names = tools,
+                EngineMsg::Lines(lines) => state.push_lines(lines),
                 EngineMsg::Provider {
                     name,
                     kind,
@@ -1588,6 +1688,13 @@ fn run_command(
             state
                 .timeline
                 .push_agent("New session — the model's context is empty.");
+        }
+        SlashCommand::Context => {
+            if state.busy() {
+                state.push_lines(vec!["wait for the turn to finish, or /stop".into()]);
+            } else {
+                let _ = cmd_tx.send(Command::Context);
+            }
         }
         SlashCommand::Cost => {
             let lines = state.cost_lines();
@@ -2524,6 +2631,8 @@ mod tests {
             cache_write_tokens: 0,
             peak_context_tokens: 0,
             compactions: 0,
+            prompt_tokens: 0,
+            cache_saving_usd: None,
             cost: Cost {
                 output_usd: 0.5,
                 priced: true,
@@ -3950,5 +4059,52 @@ drwxr-xr-x  ..."
             1,
             "compaction's reset is not repeated"
         );
+    }
+
+    #[test]
+    fn cost_shows_the_cache_split_hit_ratio_and_saving() {
+        let mut state = TuiState::default();
+        let mut r = result(3, "done");
+        r.cache_read_tokens = 9_000;
+        r.cache_write_tokens = 500;
+        r.prompt_tokens = 10_000;
+        r.cache_saving_usd = Some(0.0243);
+        state.totals.record(&r);
+        let lines = state.cost_lines().join("\n");
+        assert!(
+            lines.contains("cache:   read 9000 · write 500 · hit 90%"),
+            "{lines}"
+        );
+        assert!(lines.contains("saved:   ≈ $0.0243"), "{lines}");
+        let mut unpriced = TuiState::default();
+        let mut r = result(1, "x");
+        r.cache_read_tokens = 10;
+        r.prompt_tokens = 100;
+        unpriced.totals.record(&r);
+        assert!(unpriced.cost_lines().join("\n").contains("saved:   n/a"));
+    }
+
+    #[test]
+    fn the_context_report_lists_parts_largest_and_free_space() {
+        let b = app::ContextBreakdown {
+            window: Some(200_000),
+            system: 2_100,
+            tool_schemas: 3_300,
+            summaries: 1_800,
+            conversation: 9_400,
+            tool_results: 44_600,
+            largest: vec![("read src/app.rs (s12)".into(), 9_800)],
+        };
+        let lines = context_lines(&b).join("\n");
+        assert!(
+            lines.starts_with("context  ~61.2k / 200.0k (31%) — estimated"),
+            "{lines}"
+        );
+        assert!(lines.contains("tool results          44.6k"), "{lines}");
+        assert!(
+            lines.contains("largest results    read src/app.rs (s12) 9.8k"),
+            "{lines}"
+        );
+        assert!(lines.contains("free                 138.8k"), "{lines}");
     }
 }

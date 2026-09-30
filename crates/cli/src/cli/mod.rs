@@ -24,7 +24,8 @@ use app::{AgentLoop, App, AppError, ExecutionRequest, NullEmitter};
 use domain::{AgentMode, CancelFlag, ImageRef, LogLevel, LoggerPort, SessionStorePort};
 use infra_config::{user_config_candidates, which_on_path, Config, LayerKind, Loader, Provider};
 use infra_llm::{
-    AnthropicLlm, DeepSeekLlm, OllamaLlm, OpenAiLlm, OpenRouterLlm, RetryPolicy, VllmLlm,
+    AnthropicLlm, CacheLayout, CacheMarkers, CacheTtl, DeepSeekLlm, OllamaLlm, OpenAiLlm,
+    OpenRouterLlm, RetryPolicy, VllmLlm,
 };
 use infra_session::UuidSessionStore;
 use infra_telemetry::{JsonTelemetry, OpencodeTelemetry};
@@ -345,11 +346,51 @@ pub(crate) fn resolve_context_window(cfg: &Config) -> (domain::WindowTable, Path
 pub const ENV_LLM_REPLAY: &str = "ZCODE_LLM_REPLAY";
 pub const ENV_LLM_RECORD: &str = "ZCODE_LLM_RECORD";
 
+/// Where a client will be used — it decides the prompt-cache TTL policy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Surface {
+    /// `zcode run`: requests follow each other within seconds.
+    #[default]
+    Headless,
+    /// The TUI: a person reads and types between requests, often for
+    /// longer than the five-minute cache lives.
+    Interactive,
+}
+
+/// FR-CACHE-07 / CE-DQ7: `auto` keeps the stable head (tools, system) for an
+/// hour in the TUI and uses the five-minute cache everywhere else.
+pub(crate) fn cache_layout(cfg: &Config, surface: Surface) -> CacheLayout {
+    use infra_config::CacheTtlSetting as T;
+    let (head, tail) = match (cfg.cache.ttl, surface) {
+        (T::FiveMinutes, _) | (T::Auto, Surface::Headless) => {
+            (CacheTtl::FiveMinutes, CacheTtl::FiveMinutes)
+        }
+        (T::OneHour, _) => (CacheTtl::OneHour, CacheTtl::OneHour),
+        (T::Auto, Surface::Interactive) => (CacheTtl::OneHour, CacheTtl::FiveMinutes),
+    };
+    CacheLayout { head, tail }
+}
+
+fn cache_markers(cfg: &Config) -> CacheMarkers {
+    match cfg.cache.markers {
+        infra_config::CacheMarkerSetting::Auto => CacheMarkers::Auto,
+        infra_config::CacheMarkerSetting::On => CacheMarkers::On,
+        infra_config::CacheMarkerSetting::Off => CacheMarkers::Off,
+    }
+}
+
 pub(crate) fn build_llm(cfg: &Config) -> Result<Box<dyn domain::LlmPort + Send>, AppError> {
+    build_llm_on(cfg, Surface::Headless)
+}
+
+pub(crate) fn build_llm_on(
+    cfg: &Config,
+    surface: Surface,
+) -> Result<Box<dyn domain::LlmPort + Send>, AppError> {
     if let Some(dir) = std::env::var_os(ENV_LLM_REPLAY).filter(|d| !d.is_empty()) {
         return Ok(Box::new(infra_llm::ReplayLlm::new(PathBuf::from(dir))));
     }
-    let client = build_provider_llm(cfg)?;
+    let client = build_provider_llm(cfg, surface)?;
     match std::env::var_os(ENV_LLM_RECORD).filter(|d| !d.is_empty()) {
         Some(dir) => Ok(Box::new(
             infra_llm::RecordingLlm::new(client, PathBuf::from(dir))
@@ -359,7 +400,12 @@ pub(crate) fn build_llm(cfg: &Config) -> Result<Box<dyn domain::LlmPort + Send>,
     }
 }
 
-fn build_provider_llm(cfg: &Config) -> Result<Box<dyn domain::LlmPort + Send>, AppError> {
+fn build_provider_llm(
+    cfg: &Config,
+    surface: Surface,
+) -> Result<Box<dyn domain::LlmPort + Send>, AppError> {
+    let layout = cache_layout(cfg, surface);
+    let markers = cache_markers(cfg);
     // Local/self-hosted providers are keyless; hosted ones fail fast so the
     // user learns about a missing key before a request is attempted.
     let api_key = if cfg.provider.requires_api_key() {
@@ -405,6 +451,8 @@ fn build_provider_llm(cfg: &Config) -> Result<Box<dyn domain::LlmPort + Send>, A
             );
             client.set_retry_policy(retries);
             client.set_context_window(window_table.clone(), Some(window_cache_path.clone()));
+            client.set_cache_layout(layout);
+            client.set_cache_markers(markers);
             Box::new(client)
         }
         // These three have their own hosts, but `base_url` is documented as an
@@ -426,6 +474,7 @@ fn build_provider_llm(cfg: &Config) -> Result<Box<dyn domain::LlmPort + Send>, A
                 timeout,
             );
             client.set_retry_policy(retries);
+            client.set_cache_layout(layout);
             Box::new(client)
         }
         Provider::Openrouter => {
@@ -437,6 +486,8 @@ fn build_provider_llm(cfg: &Config) -> Result<Box<dyn domain::LlmPort + Send>, A
             );
             client.set_retry_policy(retries);
             client.set_context_window(window_table.clone(), Some(window_cache_path.clone()));
+            client.set_cache_layout(layout);
+            client.set_cache_markers(markers);
             Box::new(client)
         }
         Provider::Deepseek => {
@@ -448,6 +499,8 @@ fn build_provider_llm(cfg: &Config) -> Result<Box<dyn domain::LlmPort + Send>, A
             );
             client.set_retry_policy(retries);
             client.set_context_window(window_table.clone(), Some(window_cache_path.clone()));
+            client.set_cache_layout(layout);
+            client.set_cache_markers(markers);
             Box::new(client)
         }
         Provider::Ollama => {
@@ -457,6 +510,7 @@ fn build_provider_llm(cfg: &Config) -> Result<Box<dyn domain::LlmPort + Send>, A
                 timeout,
             );
             client.set_retry_policy(retries);
+            client.set_keep_alive(&cfg.cache.ollama_keep_alive);
             Box::new(client)
         }
         // LM Studio speaks the OpenAI wire format, so it shares the client;
@@ -465,6 +519,8 @@ fn build_provider_llm(cfg: &Config) -> Result<Box<dyn domain::LlmPort + Send>, A
             let mut client = VllmLlm::with_timeout(&base_url()?, &api_key, &cfg.model, timeout);
             client.set_retry_policy(retries);
             client.set_context_window(window_table.clone(), Some(window_cache_path.clone()));
+            client.set_cache_layout(layout);
+            client.set_cache_markers(markers);
             Box::new(client)
         }
     };
@@ -489,7 +545,17 @@ pub fn wire_with_format(
     telemetry_out: Box<dyn Write + Send>,
     format: JsonFormat,
 ) -> Result<App, AppError> {
-    let llm = build_llm(cfg)?;
+    wire_on(cfg, telemetry_out, format, Surface::Headless)
+}
+
+/// As [`wire_with_format`], for a given surface (the TUI is interactive).
+pub fn wire_on(
+    cfg: &Config,
+    telemetry_out: Box<dyn Write + Send>,
+    format: JsonFormat,
+    surface: Surface,
+) -> Result<App, AppError> {
+    let llm = build_llm_on(cfg, surface)?;
 
     let registry = ToolRegistry::from_config(cfg).map_err(|e| AppError::Config(e.to_string()))?;
     // MCP/LSP servers that would not start are reported, not fatal (FR-MCP-05).
@@ -541,6 +607,8 @@ pub fn wire_with_format(
             .map_err(|e| AppError::Config(format!("context.compaction_model: {e}")))?;
         app.set_compaction_llm(build_llm(&summariser)?);
     }
+    // FR-READ-06: per-tool output budgets, configured entries over defaults.
+    app.set_tool_budgets(app::ToolBudgets::default().with_overrides(&cfg.context.tool_budgets));
     // FR-READ-07: over-budget tool output is kept in full under .zcode/spill.
     app.set_spill(Box::new(infra_filesystem::SpillStore::new(
         &cfg.working_dir,
@@ -1591,6 +1659,45 @@ mod tests {
 
     /// FR-MODEL-06: every known provider constructs; a missing key is a typed
     /// error rather than a panic.
+    /// FR-CACHE-07: `auto` pays the one-hour write only where a person pauses
+    /// between prompts, and only on the stable head.
+    #[test]
+    fn the_cache_ttl_policy_follows_the_surface() {
+        let mut cfg = Config::default();
+        let five = CacheTtl::FiveMinutes;
+        let hour = CacheTtl::OneHour;
+        assert_eq!(
+            cache_layout(&cfg, Surface::Headless),
+            CacheLayout {
+                head: five,
+                tail: five
+            }
+        );
+        assert_eq!(
+            cache_layout(&cfg, Surface::Interactive),
+            CacheLayout {
+                head: hour,
+                tail: five
+            }
+        );
+        cfg.cache.ttl = infra_config::CacheTtlSetting::OneHour;
+        assert_eq!(
+            cache_layout(&cfg, Surface::Headless),
+            CacheLayout {
+                head: hour,
+                tail: hour
+            }
+        );
+        cfg.cache.ttl = infra_config::CacheTtlSetting::FiveMinutes;
+        assert_eq!(
+            cache_layout(&cfg, Surface::Interactive),
+            CacheLayout {
+                head: five,
+                tail: five
+            }
+        );
+    }
+
     #[test]
     fn wire_dispatches_each_provider() {
         let dir = tempfile::tempdir().unwrap();

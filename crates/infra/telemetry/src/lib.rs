@@ -52,11 +52,20 @@ pub struct Agg {
 pub struct Ledger {
     pub by_tool: BTreeMap<String, Agg>,
     pub by_category: BTreeMap<String, Agg>,
+    /// Shell commands that were searches (`grep`, `rg`, `find`…) — the
+    /// leading indicator for search going around the `grep` tool
+    /// (FR-SEARCH-09).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub shell_search_calls: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 impl Ledger {
     fn is_empty(&self) -> bool {
-        self.by_tool.is_empty()
+        self.by_tool.is_empty() && self.shell_search_calls == 0
     }
 
     /// Fold one `tool_result` event's extras in.
@@ -208,6 +217,14 @@ impl TelemetryPort for JsonTelemetry {
 
         match ev.kind.as_str() {
             "tool_result" => self.ledger.record(&ev.extra),
+            "tool_call" => {
+                let search = ev.extra.iter().any(|(k, v)| {
+                    k == "class" && matches!(v, ExtraField::Text(c) if c == "shell_search")
+                });
+                if search {
+                    self.ledger.shell_search_calls += 1;
+                }
+            }
             "finish" => {
                 let number = |key: &str| {
                     ev.extra

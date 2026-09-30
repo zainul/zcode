@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — prompt-cache TTL policy (FR-CACHE-07, 08, 10)
+
+`[cache] ttl = "auto" | "5m" | "1h"` (default `auto`). In the TUI, where a
+person reads and types between prompts for longer than the five-minute cache
+lives, `auto` keeps the stable head — tools and system prompt — for an hour
+and the moving conversation for five minutes; headless runs, whose requests
+follow each other within seconds, use five minutes throughout (one-hour
+writes cost 2× instead of 1.25×). If a gateway rejects the one-hour `ttl`,
+the client drops it for the rest of the process and retries once, reporting
+the downgrade as a retry. `[cache] markers = "auto" | "on" | "off"`
+overrides the model-family rule for OpenAI-shaped routes. Switching mode on a
+resumed session, or switching provider or model, now says the prompt cache
+starts over. Ollama requests carry `keep_alive` (`[cache] ollama_keep_alive`,
+default `30m`) so the model and its prefix cache stay loaded.
+
+### Added — per-tool output budgets (FR-READ-06)
+
+Each tool's output is capped by its own budget in tokens — `shell` 6k,
+`read` 8k, `grep` 3k, `glob` and `list_dir` 1.5k, `lsp__*` 2k, `mcp__*` 6k,
+6k otherwise — overridable per tool or prefix under `[context.tool_budgets]`.
+`max_tool_output_chars` remains a hard ceiling over all of them.
+
+### Added — `/context`, and cache figures in `/cost` (FR-BUDGET-05, 06)
+
+`/context` breaks the live context down into system prompt, tool schemas,
+summaries, conversation and tool results, names the five largest results and
+the step they came from, and shows how much of the window is free. `/cost`
+now shows cache reads and writes separately, the hit ratio, and what the cache
+saved against sending the cached prompt at the full input rate (`n/a` for an
+unpriced model). The run report counts shell commands that were searches —
+how often search went around the `grep` tool.
+
 ### Changed — LSP tools take a symbol name or a 1-based position (FR-LSP-05, 06)
 
 **Behaviour change for the model-facing schema.** `lsp__goto_definition`,
