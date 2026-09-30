@@ -44,6 +44,7 @@ pub fn system_prompt(mode: AgentMode) -> &'static str {
 pub fn write_tool_names() -> &'static [&'static str] {
     &[
         "write",
+        "edit_symbol",
         "str_replace_editor",
         "apply_patch",
         "lsp__rename_symbol",
@@ -60,6 +61,7 @@ pub fn shell_tool_names() -> &'static [&'static str] {
 pub fn execute_only_tool_names() -> &'static [&'static str] {
     &[
         "write",
+        "edit_symbol",
         "str_replace_editor",
         "apply_patch",
         "shell",
@@ -132,6 +134,13 @@ mod tests {
                 assert!(!denies(*mode, name), "{mode:?} must allow {name}");
             }
         }
+    }
+
+    #[test]
+    fn edit_symbol_is_a_write_tool() {
+        assert!(denies(AgentMode::Planning, "edit_symbol"));
+        assert!(!denies(AgentMode::Editing, "edit_symbol"));
+        assert!(!denies(AgentMode::Auto, "edit_symbol"));
     }
 
     #[test]

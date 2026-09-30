@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — `edit_symbol` (FR-EDIT-01..05, 09)
+
+Edit a definition by name — `replace` (including its doc comments,
+attributes and decorators), `replace_body` (signature kept; bare statements
+are wrapped in the file's braces), `insert_before`, `insert_after`,
+`delete` — without reading or resending the rest of the file. The target is
+found by parsing the file's current text, never the index's stored spans,
+so an index that missed an outside change cannot misplace the edit. The
+content is re-indented to the file's own style (tabs, or the space width
+detected by GCD) and CRLF files stay CRLF. The edit is re-parsed and refused
+— nothing written — if it adds syntax errors (`edit.syntax_check = "reject"
+| "warn" | "off"`); a file that was already broken can still be edited. An
+unknown name lists the nearest ones; an ambiguous one lists candidates and
+takes `line`. The result is the header and the seams only. Write-class:
+denied in `planning`, and offered only when the index is on.
+
 ### Added — `outline`, `symbols`, `related`, and the repo map (FR-INDEX-05..09)
 
 Three read-only tools on the code index, registered after `grep` (the order

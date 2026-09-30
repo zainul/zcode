@@ -14,6 +14,7 @@
 #![cfg_attr(not(test), forbid(unsafe_code))]
 
 pub mod edit;
+pub mod edit_symbol;
 pub mod guard;
 pub mod index_tools;
 pub mod lsp_tools;
@@ -31,6 +32,7 @@ use domain::{
     canonical_tool_name, BoxError, LspPort, McpPort, Tool, ToolRegistryPort, ToolResult, ToolSpec,
 };
 
+pub use edit_symbol::{EditSymbolTool, TOOL_EDIT_SYMBOL};
 pub use guard::{allowlist_is_unrestricted, builtin_deny_rule_count, GuardedShell, ShellToolError};
 pub use index_tools::{
     IndexSlot, OutlineTool, RelatedTool, SymbolsTool, TOOL_OUTLINE, TOOL_RELATED, TOOL_SYMBOLS,
@@ -364,13 +366,26 @@ impl ToolRegistry {
                     .with_write_log(log.clone()),
             ))
             .with_native(Box::new(
-                ApplyPatchTool::new(root.clone()).with_write_log(log),
+                ApplyPatchTool::new(root.clone()).with_write_log(log.clone()),
             ))
             .with_native(Box::new(ShellTool::new(
                 root.clone(),
                 shell,
                 cfg.timeout_ms,
             )));
+
+        // FR-EDIT-01: only offered when an index will run — without one it
+        // could only ever fail. Registered after the shell tool so turning
+        // the index off drops a tool from the end rather than the middle of
+        // the cached tool list.
+        if cfg.index.enabled {
+            let slot = registry.index_slot();
+            registry = registry.with_native(Box::new(
+                EditSymbolTool::new(root.clone(), slot)
+                    .with_write_log(log)
+                    .with_syntax_check(cfg.edit.syntax_check),
+            ));
+        }
 
         for note in rtk_notes {
             registry.warn(note);
@@ -1247,7 +1262,8 @@ mod tests {
                 TOOL_WRITE,
                 TOOL_STR_REPLACE,
                 TOOL_APPLY_PATCH,
-                TOOL_SHELL
+                TOOL_SHELL,
+                TOOL_EDIT_SYMBOL
             ]
         );
     }
