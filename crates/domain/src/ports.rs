@@ -40,6 +40,61 @@ pub struct LlmMessage {
     pub content: String,
     pub tool_calls: Box<[LlmToolCall]>,
     pub tool_result: Option<LlmToolResult>,
+    /// Engine bookkeeping about this message (CE-DQ3). Request builders never
+    /// serialise it, so it can never change the bytes a provider sees.
+    pub meta: MessageMeta,
+}
+
+/// What kind of message this is, beyond its role. Compaction (FR-CTX-*) uses
+/// it to tell original content from content it has already rewritten.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MessageKind {
+    #[default]
+    Normal,
+    /// A Tier 3 session summary standing in for compacted steps.
+    Summary,
+    /// A tool result or call whose content was replaced by a stub.
+    Elided,
+}
+
+/// What a tool result is *about*, as declared by the tool that produced it.
+///
+/// Only the tool knows that `read` returned lines 1-400 of `src/lib.rs`
+/// without re-parsing its JSON arguments — and `domain` cannot parse JSON
+/// (FR-DI-01). Supersession (FR-CTX-05) is decided from these.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Subject {
+    /// A range of a file's lines (1-based, inclusive) and the content hash of
+    /// the whole file at the time it was read.
+    FileRange {
+        path: String,
+        start: u32,
+        end: u32,
+        hash: u64,
+    },
+    /// The file was created, overwritten or edited.
+    FileWrite { path: String },
+    /// Several files were written by one call (`apply_patch`).
+    FileWrites { paths: Vec<String> },
+    /// Diagnostics for one file, or for everything open when `None`.
+    Diagnostics { path: Option<String> },
+    /// A directory listing or glob rooted at `path`.
+    Listing { path: String },
+    /// A search, keyed by a hash of its normalised arguments.
+    Search { key: u64 },
+}
+
+/// Per-message metadata carried alongside the transcript (CE-DQ3).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MessageMeta {
+    /// The engine step that produced the message (1-based; 0 = before any step).
+    pub step: u32,
+    pub kind: MessageKind,
+    pub subject: Option<Subject>,
+    /// Estimated tokens of the content when it entered the transcript.
+    pub tokens_est: u32,
+    /// Working-dir-relative path of the full output, when it was spilled.
+    pub spill: Option<String>,
 }
 
 impl LlmMessage {
@@ -49,6 +104,7 @@ impl LlmMessage {
             content: text.into(),
             tool_calls: Box::new([]),
             tool_result: None,
+            meta: MessageMeta::default(),
         }
     }
 
@@ -58,6 +114,7 @@ impl LlmMessage {
             content: text.into(),
             tool_calls: Box::new([]),
             tool_result: None,
+            meta: MessageMeta::default(),
         }
     }
 
@@ -67,6 +124,7 @@ impl LlmMessage {
             content: text.into(),
             tool_calls: Box::new([]),
             tool_result: None,
+            meta: MessageMeta::default(),
         }
     }
 
@@ -76,6 +134,7 @@ impl LlmMessage {
             content: String::new(),
             tool_calls: Box::new([]),
             tool_result: Some(result),
+            meta: MessageMeta::default(),
         }
     }
 
@@ -114,7 +173,14 @@ pub struct LlmFinish {
     pub reason: LlmFinishReason,
     pub input_tokens: u64,
     pub output_tokens: u64,
-    pub cache_tokens: u64,
+    /// Prompt tokens served from the provider's cache (Anthropic
+    /// `cache_read_input_tokens`, OpenAI `cached_tokens`, DeepSeek
+    /// `prompt_cache_hit_tokens`). Billed at a fraction of the input rate.
+    pub cache_read_tokens: u64,
+    /// Prompt tokens written to the cache (Anthropic
+    /// `cache_creation_input_tokens`). Billed at a premium; OpenAI-shaped
+    /// providers do not report writes.
+    pub cache_write_tokens: u64,
     /// What the provider says the call cost, in USD, when it says so.
     ///
     /// Authoritative where present: it is the number that will appear on the
@@ -122,6 +188,13 @@ pub struct LlmFinish {
     /// local price table is an estimate for providers that report nothing, and
     /// cannot know about a model it has never heard of.
     pub cost_usd: Option<f64>,
+}
+
+impl LlmFinish {
+    /// Reads and writes together — the single figure v0.6 reported.
+    pub fn cache_tokens(&self) -> u64 {
+        self.cache_read_tokens + self.cache_write_tokens
+    }
 }
 
 /// A transient provider failure that was retried rather than surfaced as an
@@ -195,6 +268,11 @@ pub struct LlmResponse {
 
 /// The LLM port: the application's only dependency on a model provider.
 pub trait LlmPort {
+    /// Tell the client which session its next requests belong to, before the
+    /// first one is sent. Used for cache routing (`prompt_cache_key`,
+    /// FR-CACHE-03); a client with no use for it ignores it.
+    fn set_session(&mut self, _session_id: &str) {}
+
     fn send(&mut self, req: &LlmRequest) -> Result<LlmResponse, crate::BoxError>;
     fn stream(
         &mut self,
@@ -217,6 +295,9 @@ pub struct ToolResult {
     pub tool_call_id: String,
     pub content: String,
     pub error: Option<String>,
+    /// What the result is about (CE-DQ3); the engine copies it into the
+    /// transcript message's `meta.subject`.
+    pub subject: Option<Subject>,
 }
 
 impl ToolResult {
@@ -225,7 +306,14 @@ impl ToolResult {
             tool_call_id: String::new(),
             content: content.into(),
             error: None,
+            subject: None,
         }
+    }
+
+    /// Attach the subject this result is about.
+    pub fn with_subject(mut self, subject: Subject) -> Self {
+        self.subject = Some(subject);
+        self
     }
 
     pub fn from_tool_call_id(id: &str, content: String) -> Self {
@@ -233,6 +321,7 @@ impl ToolResult {
             tool_call_id: id.into(),
             content,
             error: None,
+            subject: None,
         }
     }
 
@@ -241,6 +330,7 @@ impl ToolResult {
             tool_call_id: tool_call_id.into(),
             content: String::new(),
             error: Some(message.into()),
+            subject: None,
         }
     }
 }
@@ -254,9 +344,27 @@ pub trait Tool {
 /// Registry of all callable tools (native + MCP + LSP), presented as a single
 /// namespace to the engine.
 pub trait ToolRegistryPort {
+    /// Share the engine's cancel flag, so tools that run long (a search walk)
+    /// stop on Ctrl-C too. Called once the flag is known.
+    fn set_cancel(&mut self, _cancel: crate::CancelFlag) {}
+
     fn list(&self) -> Box<[ToolSpec]>;
     fn call(&mut self, name: &str, args_json: &str) -> Result<ToolResult, crate::BoxError>;
     fn is_native(&self, name: &str) -> bool;
+
+    /// Shrink an edit call's arguments to a still-valid JSON value with the
+    /// file content elided, for compaction (FR-CTX-06). `None` leaves them
+    /// as they are — `domain` and `app` cannot parse JSON themselves.
+    fn elide_args(&self, _name: &str, _args_json: &str) -> Option<String> {
+        None
+    }
+
+    /// A label for what a call is, when the tool itself does not say — e.g.
+    /// `shell_search` for a shell `grep`/`rg`/`find` (FR-SEARCH-09), so
+    /// telemetry can show how often search goes around the `grep` tool.
+    fn classify_call(&self, _name: &str, _args_json: &str) -> Option<&'static str> {
+        None
+    }
 }
 
 /// A tool exposed by an MCP server.
@@ -302,6 +410,55 @@ pub trait LspPort {
     ) -> Result<crate::LspWorkspaceEdit, crate::BoxError>;
 
     fn open_document(&mut self, uri: &str, text: &str) -> Result<(), crate::BoxError>;
+
+    /// Diagnostics for one document, or for every document open when
+    /// `None` (FR-LSP-07). Waits for the server to settle after a change.
+    fn diagnostics(
+        &mut self,
+        _uri: Option<&str>,
+    ) -> Result<Box<[crate::LspDiagnostic]>, crate::BoxError> {
+        Ok(Box::new([]))
+    }
+
+    /// Diagnostics already received, without waiting (FR-LSP-08 baseline).
+    fn stored_diagnostics(&self, _uri: &str) -> Box<[crate::LspDiagnostic]> {
+        Box::new([])
+    }
+
+    /// Symbols matching `query` across the workspace (FR-LSP-05).
+    fn workspace_symbols(
+        &mut self,
+        _query: &str,
+    ) -> Result<Box<[crate::LspSymbolInfo]>, crate::BoxError> {
+        Ok(Box::new([]))
+    }
+
+    /// Whether the server has finished indexing (FR-LSP-11).
+    fn readiness(&self) -> crate::LspReadiness {
+        crate::LspReadiness::Ready
+    }
+
+    /// Readiness of whichever server answers for `uri` (a pool holds one
+    /// per language).
+    fn readiness_for(&self, _uri: &str) -> crate::LspReadiness {
+        self.readiness()
+    }
+
+    /// Whether a server is *running* for `uri` — asked before work that
+    /// must never start one, like diagnostics after an edit (FR-LSP-08).
+    fn serves(&self, _uri: &str) -> bool {
+        true
+    }
+
+    /// [`LspPort::diagnostics`] for one document, waiting at most `cap` for
+    /// the server to settle.
+    fn diagnostics_within(
+        &mut self,
+        uri: &str,
+        _cap: std::time::Duration,
+    ) -> Result<Box<[crate::LspDiagnostic]>, crate::BoxError> {
+        self.diagnostics(Some(uri))
+    }
 }
 
 /// A persisted agent session transcript.
@@ -314,6 +471,37 @@ pub struct Session {
     pub last_message_at: String,
     pub step_count: u64,
     pub messages: Box<[LlmMessage]>,
+    /// Every compaction applied to `messages` (FR-CTX-11), oldest first.
+    pub compactions: Vec<CompactionEntry>,
+    /// The repo map frozen into this session's system prompt (FR-INDEX-08).
+    /// `Some("")` records "decided: no map", so a resume never adds one
+    /// later and changes the cached prefix (CE-DQ22).
+    pub repo_map: Option<String>,
+}
+
+/// One compaction, as recorded on the session (FR-CTX-11).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompactionEntry {
+    /// The step before which it ran.
+    pub step: u32,
+    /// Deepest tier used: 1 supersession, 2 elision, 3 summary.
+    pub tier: u8,
+    pub tokens_before: u64,
+    pub tokens_after: u64,
+    /// Messages replaced (their originals are in the archive).
+    pub archived: u32,
+}
+
+/// Where the full text of an over-budget tool output is kept (FR-READ-07,
+/// CE-DQ12), so truncation never loses anything the model may need later.
+pub trait SpillPort {
+    /// Store `content` and return the working-dir-relative path it lives at.
+    fn spill(
+        &mut self,
+        session: &str,
+        call_id: &str,
+        content: &str,
+    ) -> Result<String, crate::BoxError>;
 }
 
 /// Session store port (FR-SESSION-01..07, DQ9 UUIDv7).
@@ -324,6 +512,18 @@ pub trait SessionStorePort {
     fn fork(&mut self, id: &str, new_id: &str) -> Result<(), crate::BoxError>;
     fn import_from(&mut self, path: &Path) -> Result<String, crate::BoxError>;
     fn export_to(&self, id: &str, path: &Path) -> Result<(), crate::BoxError>;
+
+    /// Keep messages replaced by compaction (FR-CTX-11), before the
+    /// checkpoint that drops them from the live transcript.
+    fn archive(&mut self, _id: &str, _messages: &[LlmMessage]) -> Result<(), crate::BoxError> {
+        Ok(())
+    }
+
+    /// Export including the archived (pre-compaction) messages, so the whole
+    /// conversation travels with the file. Defaults to a plain export.
+    fn export_full(&self, id: &str, path: &Path) -> Result<(), crate::BoxError> {
+        self.export_to(id, path)
+    }
 }
 
 /// A single serialization-bridge field carried by `TelemetryEvent.extra` so that
@@ -345,7 +545,8 @@ pub struct TelemetryEvent {
     pub model: String,
     pub input_tokens: u64,
     pub output_tokens: u64,
-    pub cache_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
     pub steps: u64,
     pub execution_time_ms: u64,
     pub session_id: String,
@@ -358,7 +559,8 @@ pub struct TelemetryTotals {
     pub model: String,
     pub input_tokens: u64,
     pub output_tokens: u64,
-    pub cache_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
     pub steps: u64,
     pub execution_time_ms: u64,
     pub session_id: String,
@@ -426,6 +628,48 @@ pub enum UiEvent {
         truncated: bool,
     },
     Error(String),
+    /// The transcript was compacted (FR-CTX-13). `tier`: 1 stale results
+    /// removed, 2 old output elided, 3 summarised.
+    Compacted {
+        tier: u8,
+        tokens_before: u64,
+        tokens_after: u64,
+    },
+    /// How full the context is after a provider call (FR-CTX-13), for a
+    /// status display. `window` is `None` for a model the table does not know.
+    Context {
+        live_tokens: u64,
+        window: Option<u64>,
+    },
+    /// Something invalidated the provider's prompt cache (FR-CACHE-08):
+    /// the next request re-writes it.
+    CacheReset {
+        reason: String,
+    },
+}
+
+/// `142.0k`, `980` — compact token counts for one-line notes.
+fn short_tokens(n: u64) -> String {
+    if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+/// One line describing a compaction, shared by every renderer (FR-CTX-13).
+pub fn describe_compaction(tier: u8, tokens_before: u64, tokens_after: u64) -> String {
+    let how = match tier {
+        1 => "stale results removed",
+        2 => "old tool output elided",
+        _ => "older steps summarised",
+    };
+    format!(
+        "context compacted {} → {} tokens ({how}); the prompt cache is rebuilt on the next \
+         request",
+        short_tokens(tokens_before),
+        short_tokens(tokens_after)
+    )
 }
 
 /// Rendering sink for engine events. Implemented by the JSONL writer, the pretty

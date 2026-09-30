@@ -197,6 +197,37 @@ pub struct LspLocation {
     pub range: LspRange,
 }
 
+/// A compiler/linter finding from a language server (FR-LSP-07).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LspDiagnostic {
+    pub uri: String,
+    /// 0-based, wire-level (the tools convert to 1-based).
+    pub range: LspRange,
+    /// 1 error, 2 warning, 3 information, 4 hint (the LSP enumeration).
+    pub severity: u8,
+    pub code: Option<String>,
+    pub message: String,
+}
+
+/// A symbol a language server knows by name (`workspace/symbol`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LspSymbolInfo {
+    pub name: String,
+    /// The LSP `SymbolKind` number.
+    pub kind: u32,
+    /// Enclosing symbol, e.g. the type a method belongs to.
+    pub container: Option<String>,
+    pub location: LspLocation,
+}
+
+/// Whether a server can answer yet (FR-LSP-11).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LspReadiness {
+    Ready,
+    /// Still indexing; the percentage when the server reports one.
+    Indexing(Option<u8>),
+}
+
 /// A single text edit targeted at a document URI (from `textDocument/rename` etc.).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LspTextEdit {

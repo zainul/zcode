@@ -6,8 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-domain = { path = "../../domain", version = "0.6.0" }
+domain = { path = "../../domain", version = "0.7.0" }
 thiserror = { workspace = true }
+log = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3.10"

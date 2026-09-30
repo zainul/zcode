@@ -24,7 +24,8 @@ use app::{AgentLoop, App, AppError, ExecutionRequest, NullEmitter};
 use domain::{AgentMode, CancelFlag, ImageRef, LogLevel, LoggerPort, SessionStorePort};
 use infra_config::{user_config_candidates, which_on_path, Config, LayerKind, Loader, Provider};
 use infra_llm::{
-    AnthropicLlm, DeepSeekLlm, OllamaLlm, OpenAiLlm, OpenRouterLlm, RetryPolicy, VllmLlm,
+    AnthropicLlm, CacheLayout, CacheMarkers, CacheTtl, DeepSeekLlm, OllamaLlm, OpenAiLlm,
+    OpenRouterLlm, RetryPolicy, VllmLlm,
 };
 use infra_session::UuidSessionStore;
 use infra_telemetry::{JsonTelemetry, OpencodeTelemetry};
@@ -109,6 +110,30 @@ pub enum Commands {
         #[command(subcommand)]
         command: ListCmd,
     },
+    /// Explain what discovery (grep, glob, list_dir, the index) skips.
+    Ignore {
+        #[command(subcommand)]
+        command: IgnoreCmd,
+    },
+    // FR-INDEX-10
+    /// Inspect, rebuild or clear the code index under .zcode/index.
+    Index {
+        #[command(subcommand)]
+        command: IndexCmd,
+        /// Config file to use instead of ./zcode.json or ./zcode.toml.
+        #[arg(long, value_name = "FILE", global = true)]
+        config: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand, Clone, Copy)]
+pub enum IndexCmd {
+    /// What the stored index holds, without building it.
+    Status,
+    /// Delete the stored index and build it again in the foreground.
+    Rebuild,
+    /// Delete the stored index; the next run rebuilds it in the background.
+    Clear,
 }
 
 #[derive(clap::Args)]
@@ -151,6 +176,13 @@ pub struct RunArgs {
     /// Give up after this many seconds and checkpoint the session.
     #[arg(long, value_name = "SECS")]
     pub timeout: Option<u64>,
+    /// Do not build or use the code index for this run (FR-INDEX-10).
+    #[arg(long)]
+    pub no_index: bool,
+    /// Never compact the conversation — not even to retry a prompt the
+    /// provider refused as too long (FR-CTX-12).
+    #[arg(long)]
+    pub no_compact: bool,
 }
 
 #[derive(clap::Args)]
@@ -180,6 +212,12 @@ pub struct ReplArgs {
     /// Resume an existing session id.
     #[arg(long)]
     pub session: Option<String>,
+    /// Do not build or use the code index for this session (FR-INDEX-10).
+    #[arg(long)]
+    pub no_index: bool,
+    /// Never compact automatically — `/compact` still works (FR-CTX-12).
+    #[arg(long)]
+    pub no_compact: bool,
 }
 
 impl ReplArgs {
@@ -204,6 +242,12 @@ impl ReplArgs {
         }
         if self.config.is_some() {
             return Some("--config");
+        }
+        if self.no_index {
+            return Some("--no-index");
+        }
+        if self.no_compact {
+            return Some("--no-compact");
         }
         None
     }
@@ -252,6 +296,31 @@ pub enum SessionCmd {
         /// Destination file.
         #[arg(long = "to", value_name = "FILE")]
         to: PathBuf,
+        /// Include the messages compaction replaced (the session's archive),
+        /// so the whole conversation travels with the file.
+        #[arg(long)]
+        full: bool,
+    },
+    // FR-CTX-12
+    /// Compact a session now: stale results dropped, old output elided,
+    /// older steps summarised.
+    Compact {
+        /// The session to compact.
+        id: String,
+        /// What the summary must keep, e.g. "the failing parser test".
+        #[arg(long, value_name = "TEXT")]
+        focus: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum IgnoreCmd {
+    // FR-FILTER-07
+    /// Say whether search, listing and the index see a path, and if not,
+    /// which rule hides it and where that rule is written.
+    Check {
+        /// A file or directory.
+        path: PathBuf,
     },
 }
 
@@ -334,7 +403,73 @@ pub(crate) fn resolve_context_window(cfg: &Config) -> (domain::WindowTable, Path
     (domain::WindowTable::with_overrides(entries), cache_path)
 }
 
+/// `ZCODE_LLM_REPLAY=<dir>` serves a recorded session instead of calling a
+/// provider; `ZCODE_LLM_RECORD=<dir>` records every call made through the
+/// real client (FR-BUDGET-07, CE-DQ23). Testing aids for the evaluation
+/// harness: replay needs no network and no API key.
+pub const ENV_LLM_REPLAY: &str = "ZCODE_LLM_REPLAY";
+pub const ENV_LLM_RECORD: &str = "ZCODE_LLM_RECORD";
+
+/// Where a client will be used — it decides the prompt-cache TTL policy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Surface {
+    /// `zcode run`: requests follow each other within seconds.
+    #[default]
+    Headless,
+    /// The TUI: a person reads and types between requests, often for
+    /// longer than the five-minute cache lives.
+    Interactive,
+}
+
+/// FR-CACHE-07 / CE-DQ7: `auto` keeps the stable head (tools, system) for an
+/// hour in the TUI and uses the five-minute cache everywhere else.
+pub(crate) fn cache_layout(cfg: &Config, surface: Surface) -> CacheLayout {
+    use infra_config::CacheTtlSetting as T;
+    let (head, tail) = match (cfg.cache.ttl, surface) {
+        (T::FiveMinutes, _) | (T::Auto, Surface::Headless) => {
+            (CacheTtl::FiveMinutes, CacheTtl::FiveMinutes)
+        }
+        (T::OneHour, _) => (CacheTtl::OneHour, CacheTtl::OneHour),
+        (T::Auto, Surface::Interactive) => (CacheTtl::OneHour, CacheTtl::FiveMinutes),
+    };
+    CacheLayout { head, tail }
+}
+
+fn cache_markers(cfg: &Config) -> CacheMarkers {
+    match cfg.cache.markers {
+        infra_config::CacheMarkerSetting::Auto => CacheMarkers::Auto,
+        infra_config::CacheMarkerSetting::On => CacheMarkers::On,
+        infra_config::CacheMarkerSetting::Off => CacheMarkers::Off,
+    }
+}
+
 pub(crate) fn build_llm(cfg: &Config) -> Result<Box<dyn domain::LlmPort + Send>, AppError> {
+    build_llm_on(cfg, Surface::Headless)
+}
+
+pub(crate) fn build_llm_on(
+    cfg: &Config,
+    surface: Surface,
+) -> Result<Box<dyn domain::LlmPort + Send>, AppError> {
+    if let Some(dir) = std::env::var_os(ENV_LLM_REPLAY).filter(|d| !d.is_empty()) {
+        return Ok(Box::new(infra_llm::ReplayLlm::new(PathBuf::from(dir))));
+    }
+    let client = build_provider_llm(cfg, surface)?;
+    match std::env::var_os(ENV_LLM_RECORD).filter(|d| !d.is_empty()) {
+        Some(dir) => Ok(Box::new(
+            infra_llm::RecordingLlm::new(client, PathBuf::from(dir))
+                .map_err(|e| AppError::Config(format!("{ENV_LLM_RECORD}: {e}")))?,
+        )),
+        None => Ok(client),
+    }
+}
+
+fn build_provider_llm(
+    cfg: &Config,
+    surface: Surface,
+) -> Result<Box<dyn domain::LlmPort + Send>, AppError> {
+    let layout = cache_layout(cfg, surface);
+    let markers = cache_markers(cfg);
     // Local/self-hosted providers are keyless; hosted ones fail fast so the
     // user learns about a missing key before a request is attempted.
     let api_key = if cfg.provider.requires_api_key() {
@@ -380,6 +515,8 @@ pub(crate) fn build_llm(cfg: &Config) -> Result<Box<dyn domain::LlmPort + Send>,
             );
             client.set_retry_policy(retries);
             client.set_context_window(window_table.clone(), Some(window_cache_path.clone()));
+            client.set_cache_layout(layout);
+            client.set_cache_markers(markers);
             Box::new(client)
         }
         // These three have their own hosts, but `base_url` is documented as an
@@ -401,6 +538,7 @@ pub(crate) fn build_llm(cfg: &Config) -> Result<Box<dyn domain::LlmPort + Send>,
                 timeout,
             );
             client.set_retry_policy(retries);
+            client.set_cache_layout(layout);
             Box::new(client)
         }
         Provider::Openrouter => {
@@ -412,6 +550,8 @@ pub(crate) fn build_llm(cfg: &Config) -> Result<Box<dyn domain::LlmPort + Send>,
             );
             client.set_retry_policy(retries);
             client.set_context_window(window_table.clone(), Some(window_cache_path.clone()));
+            client.set_cache_layout(layout);
+            client.set_cache_markers(markers);
             Box::new(client)
         }
         Provider::Deepseek => {
@@ -423,6 +563,8 @@ pub(crate) fn build_llm(cfg: &Config) -> Result<Box<dyn domain::LlmPort + Send>,
             );
             client.set_retry_policy(retries);
             client.set_context_window(window_table.clone(), Some(window_cache_path.clone()));
+            client.set_cache_layout(layout);
+            client.set_cache_markers(markers);
             Box::new(client)
         }
         Provider::Ollama => {
@@ -432,6 +574,7 @@ pub(crate) fn build_llm(cfg: &Config) -> Result<Box<dyn domain::LlmPort + Send>,
                 timeout,
             );
             client.set_retry_policy(retries);
+            client.set_keep_alive(&cfg.cache.ollama_keep_alive);
             Box::new(client)
         }
         // LM Studio speaks the OpenAI wire format, so it shares the client;
@@ -440,6 +583,8 @@ pub(crate) fn build_llm(cfg: &Config) -> Result<Box<dyn domain::LlmPort + Send>,
             let mut client = VllmLlm::with_timeout(&base_url()?, &api_key, &cfg.model, timeout);
             client.set_retry_policy(retries);
             client.set_context_window(window_table.clone(), Some(window_cache_path.clone()));
+            client.set_cache_layout(layout);
+            client.set_cache_markers(markers);
             Box::new(client)
         }
     };
@@ -464,13 +609,25 @@ pub fn wire_with_format(
     telemetry_out: Box<dyn Write + Send>,
     format: JsonFormat,
 ) -> Result<App, AppError> {
-    let llm = build_llm(cfg)?;
+    wire_on(cfg, telemetry_out, format, Surface::Headless)
+}
+
+/// As [`wire_with_format`], for a given surface (the TUI is interactive).
+pub fn wire_on(
+    cfg: &Config,
+    telemetry_out: Box<dyn Write + Send>,
+    format: JsonFormat,
+    surface: Surface,
+) -> Result<App, AppError> {
+    let llm = build_llm_on(cfg, surface)?;
 
     let registry = ToolRegistry::from_config(cfg).map_err(|e| AppError::Config(e.to_string()))?;
     // MCP/LSP servers that would not start are reported, not fatal (FR-MCP-05).
     for warning in registry.warnings() {
         log::warn!("{warning}");
     }
+    let registry = attach_code_index(cfg, registry);
+    let code_index = registry.code_index().cloned();
 
     let ag_dir = cfg.working_dir.join(".zcode");
     let sessions = UuidSessionStore::new(ag_dir.join("sessions"));
@@ -487,7 +644,7 @@ pub fn wire_with_format(
         }),
     };
 
-    Ok(App::new(
+    let mut app = App::new(
         llm,
         Box::new(registry),
         Box::new(sessions),
@@ -495,7 +652,192 @@ pub fn wire_with_format(
         Box::new(StdLogger::new()),
     )
     .with_pricing(cfg.price_table())
-    .with_context_window(resolve_context_window(cfg).0))
+    .with_context_window(resolve_context_window(cfg).0);
+    // FR-CTX-*: the context manager's settings.
+    app.set_context_config(app::ContextConfig {
+        enabled: cfg.context.compaction,
+        reactive: cfg.context.reactive,
+        compact_at: cfg.context.compact_at,
+        compact_target: cfg.context.compact_target,
+        compact_at_tokens: cfg.context.compact_at_tokens,
+        keep_recent_steps: cfg.context.keep_recent_steps,
+        summary_max_tokens: cfg.context.summary_max_tokens,
+        ..app::ContextConfig::default()
+    });
+    // FR-CTX-08: a cheaper model for Tier 3 summaries, resolved exactly like
+    // `--model` so a bad value fails here, at startup, not mid-session.
+    if !cfg.context.compaction_model.trim().is_empty() {
+        let mut summariser = cfg.clone();
+        summariser
+            .select_model(&cfg.context.compaction_model)
+            .map_err(|e| AppError::Config(format!("context.compaction_model: {e}")))?;
+        app.set_compaction_llm(build_llm(&summariser)?);
+    }
+    // FR-READ-06: per-tool output budgets, configured entries over defaults.
+    app.set_tool_budgets(app::ToolBudgets::default().with_overrides(&cfg.context.tool_budgets));
+    // FR-READ-07: over-budget tool output is kept in full under .zcode/spill.
+    app.set_spill(Box::new(infra_filesystem::SpillStore::new(
+        &cfg.working_dir,
+        cfg.context.spill_ttl_days,
+    )));
+    if let Some(index) = code_index {
+        app.set_code_index(index, cfg.index.repo_map_tokens);
+    }
+    Ok(app)
+}
+
+/// Start the code index in the background (FR-INDEX-01) and hand it to the
+/// registry. Returns at once: the build never delays the first request.
+#[cfg(feature = "code-index")]
+fn attach_code_index(cfg: &Config, registry: ToolRegistry) -> ToolRegistry {
+    if !cfg.index.enabled {
+        return registry;
+    }
+    let Some(search) = registry.search().cloned() else {
+        return registry;
+    };
+    let index = infra_index::spawn(index_options(cfg), search, None);
+    registry.with_code_index(index)
+}
+
+#[cfg(not(feature = "code-index"))]
+fn attach_code_index(_cfg: &Config, registry: ToolRegistry) -> ToolRegistry {
+    registry
+}
+
+#[cfg(feature = "code-index")]
+fn index_options(cfg: &Config) -> infra_index::IndexOptions {
+    infra_index::IndexOptions {
+        max_file_bytes: cfg.index.max_file_bytes,
+        ..infra_index::IndexOptions::new(&cfg.working_dir)
+    }
+}
+
+/// `zcode index status|rebuild|clear` (FR-INDEX-10).
+#[cfg(feature = "code-index")]
+fn cmd_index(command: IndexCmd, config: Option<&Path>) -> CliResult {
+    use domain::{CodeIndexPort, IndexState};
+
+    let cfg = load_config(config, Overrides::default())?;
+    let store = infra_index::default_store_path(&cfg.working_dir);
+    match command {
+        IndexCmd::Status => {
+            if !cfg.index.enabled {
+                outln!("code index: off (index.enabled = false)");
+            }
+            match infra_index::stored_stats(&store) {
+                Some(stats) => {
+                    let meta = std::fs::metadata(&store).ok();
+                    let size = meta.as_ref().map_or(0, |m| m.len());
+                    let age = meta
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|t| t.elapsed().ok())
+                        .map_or_else(|| "unknown".to_string(), |d| render_age(d.as_secs()));
+                    outln!(
+                        "store:     {} ({} KiB, updated {age} ago)",
+                        store.display(),
+                        size / 1024
+                    );
+                    print_index_stats(&stats);
+                }
+                None => outln!(
+                    "no index at {} — it is built in the background on the next run",
+                    store.display()
+                ),
+            }
+        }
+        IndexCmd::Clear => {
+            remove_index_store(&store)?;
+            outln!("cleared {}", store.display());
+        }
+        IndexCmd::Rebuild => {
+            remove_index_store(&store)?;
+            let search: tools::Search = Arc::new(infra_search::RipgrepSearch::new(
+                &cfg.working_dir,
+                &infra_search::FilterConfig {
+                    exclude: cfg.context.exclude.clone(),
+                    include: cfg.context.include.clone(),
+                },
+            )?);
+            let index = infra_index::CodeIndex::open(index_options(&cfg), search);
+            let worker = index.clone();
+            let build = std::thread::spawn(move || worker.build());
+            while !build.is_finished() {
+                if let IndexState::Building { done, total } = index.state() {
+                    eprint!("\rindexing {done}/{total} files");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            let report = build.join().map_err(|_| "index build failed")?;
+            eprintln!(
+                "\rindexed {} files in {}ms          ",
+                report.files, report.elapsed_ms
+            );
+            print_index_stats(&index.stats());
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(not(feature = "code-index"))]
+fn cmd_index(_command: IndexCmd, _config: Option<&Path>) -> CliResult {
+    outln!("this zcode was built without the code index (feature `code-index`)");
+    Ok(ExitCode::from(EXIT_USAGE))
+}
+
+#[cfg(feature = "code-index")]
+fn print_index_stats(stats: &infra_index::IndexStats) {
+    outln!("files:     {}", stats.files);
+    outln!("symbols:   {}", stats.symbols);
+    let langs: Vec<String> = stats
+        .languages
+        .iter()
+        .map(|(l, n)| format!("{l} {n}"))
+        .collect();
+    outln!(
+        "languages: {}",
+        if langs.is_empty() {
+            "none".into()
+        } else {
+            langs.join(", ")
+        }
+    );
+    let skipped: Vec<String> = stats
+        .skipped
+        .iter()
+        .map(|(r, n)| format!("{r} {n}"))
+        .collect();
+    outln!(
+        "skipped:   {}",
+        if skipped.is_empty() {
+            "none".into()
+        } else {
+            skipped.join(", ")
+        }
+    );
+}
+
+/// Remove the store file (and its temporary sibling), not the directory
+/// around it: nothing else lives there today, but nothing says it never will.
+#[cfg(feature = "code-index")]
+fn remove_index_store(store: &Path) -> Result<(), std::io::Error> {
+    for path in [store.to_path_buf(), store.with_extension("zcix.tmp")] {
+        match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "code-index")]
+fn render_age(secs: u64) -> String {
+    match secs {
+        0..=59 => format!("{secs}s"),
+        60..=3599 => format!("{}m", secs / 60),
+        3600..=86_399 => format!("{}h", secs / 3600),
+        _ => format!("{}d", secs / 86_400),
+    }
 }
 
 /// Sends every event to two ports. Only `report` writes the report file, so
@@ -563,6 +905,8 @@ pub fn run() -> CliResult {
         Some(Commands::Config(args)) => cmd_config(args),
         Some(Commands::Tools { command: _ }) => cmd_tools_list(),
         Some(Commands::Skills { command: _ }) => cmd_skills_list(),
+        Some(Commands::Index { command, config }) => cmd_index(command, config.as_deref()),
+        Some(Commands::Ignore { command }) => cmd_ignore(command),
     }
 }
 
@@ -671,7 +1015,7 @@ fn install_signal_handler() -> CancelFlag {
 
 /// The TUI, however it was reached: `zcode`, or `zcode repl`.
 fn cmd_repl(args: ReplArgs) -> CliResult {
-    let cfg = load_config(
+    let mut cfg = load_config(
         args.config.as_deref(),
         Overrides {
             mode: args.mode,
@@ -679,13 +1023,20 @@ fn cmd_repl(args: ReplArgs) -> CliResult {
             model: args.model.as_deref(),
         },
     )?;
+    if args.no_index {
+        cfg.index.enabled = false;
+    }
+    if args.no_compact {
+        cfg.context.compaction = false;
+        cfg.context.reactive = false;
+    }
     let cancel = install_signal_handler();
     tui::run_tui(cfg, cancel, args.session)?;
     Ok(ExitCode::SUCCESS)
 }
 
 fn cmd_run(args: RunArgs) -> CliResult {
-    let cfg = load_config(
+    let mut cfg = load_config(
         args.config.as_deref(),
         Overrides {
             mode: args.mode,
@@ -693,6 +1044,13 @@ fn cmd_run(args: RunArgs) -> CliResult {
             model: args.model.as_deref(),
         },
     )?;
+    if args.no_index {
+        cfg.index.enabled = false;
+    }
+    if args.no_compact {
+        cfg.context.compaction = false;
+        cfg.context.reactive = false;
+    }
     let cancel = install_signal_handler();
 
     let telemetry_out: Box<dyn Write + Send> = if args.json {
@@ -733,7 +1091,7 @@ fn cmd_run(args: RunArgs) -> CliResult {
                     result.steps,
                     result.input_tokens,
                     result.output_tokens,
-                    result.cache_tokens,
+                    result.cache_tokens(),
                     result.cost.render(),
                     result.session_id
                 );
@@ -774,6 +1132,8 @@ fn cmd_session(command: SessionCmd) -> CliResult {
                     json_format,
                     config: None,
                     timeout: None,
+                    no_index: false,
+                    no_compact: false,
                 }),
                 None => {
                     let cancel = install_signal_handler();
@@ -795,12 +1155,147 @@ fn cmd_session(command: SessionCmd) -> CliResult {
         SessionCmd::Import { file } => {
             outln!("{}", store.import_from(&file)?);
         }
-        SessionCmd::Export { id, to } => {
-            store.export_to(&id, &to)?;
+        SessionCmd::Export { id, to, full } => {
+            if full {
+                store.export_full(&id, &to)?;
+            } else {
+                store.export_to(&id, &to)?;
+            }
             outln!("{}", to.display());
+        }
+        SessionCmd::Compact { id, focus } => {
+            // The summariser is a model call; nothing here needs the index.
+            let mut cfg = cfg;
+            cfg.index.enabled = false;
+            let mut app = wire_with_format(&cfg, Box::new(std::io::sink()), JsonFormat::Zcode)?;
+            match app.compact_session(&id, focus.as_deref())? {
+                Some(r) => {
+                    let mut line =
+                        domain::describe_compaction(r.tier, r.tokens_before, r.tokens_after);
+                    // The headless form has no next request to speak of.
+                    if let Some(i) = line.find("; the prompt cache") {
+                        line.truncate(i);
+                    }
+                    outln!("{line}");
+                }
+                None => outln!("nothing to compact in {id}"),
+            }
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// `zcode ignore check <path>` (FR-FILTER-07). Exit 0 either way: it is an
+/// inspection, not a test.
+fn cmd_ignore(command: IgnoreCmd) -> CliResult {
+    let IgnoreCmd::Check { path } = command;
+    let cfg = load_config(None, Overrides::default())?;
+    let root = cfg
+        .working_dir
+        .canonicalize()
+        .unwrap_or_else(|_| cfg.working_dir.clone());
+    let filter = infra_search::DiscoveryFilter::new(
+        &root,
+        &infra_search::FilterConfig {
+            exclude: cfg.context.exclude.clone(),
+            include: cfg.context.include.clone(),
+        },
+    )?;
+    // Relative to where the command was typed, which may be a subdirectory
+    // of the project.
+    let abs = if path.is_absolute() {
+        path.clone()
+    } else {
+        std::env::current_dir()?.join(&path)
+    };
+    let abs = abs.canonicalize().unwrap_or(abs);
+    if !abs.starts_with(&root) {
+        outln!(
+            "{}: outside the project ({})",
+            path.display(),
+            root.display()
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+    // A directory-only rule (`build/`) cannot match a path that does not
+    // exist, so say that the answer is for a file of that name.
+    let missing = if abs.exists() {
+        ""
+    } else {
+        "  (no such path — judged as a file)"
+    };
+    match filter.explain(&abs) {
+        Some(e) => outln!(
+            "{}: excluded by {} ({}){missing}",
+            path.display(),
+            e.rule,
+            e.source
+        ),
+        None => outln!("{}: included{missing}", path.display()),
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The PRD-CTX-EFF-003 settings, grouped the way `zcode.toml` spells them.
+fn print_efficiency(cfg: &Config) {
+    let c = &cfg.context;
+    let on_off = |b: bool| if b { "on" } else { "off" };
+    outln!(
+        "  {:<22} {}  (at {:.0}% of the window → {:.0}%; {} tokens when the window is unknown; keeps the last {} steps)",
+        "context.compaction",
+        on_off(c.compaction),
+        c.compact_at * 100.0,
+        c.compact_target * 100.0,
+        c.compact_at_tokens,
+        c.keep_recent_steps
+    );
+    outln!(
+        "  {:<22} {}",
+        "context.summariser",
+        if c.compaction_model.is_empty() {
+            "(the session's model)".to_string()
+        } else {
+            c.compaction_model.clone()
+        }
+    );
+    let list = |v: &[String]| {
+        if v.is_empty() {
+            "(none)".to_string()
+        } else {
+            v.join(", ")
+        }
+    };
+    outln!(
+        "  {:<22} {}  (added to the built-in excludes)",
+        "context.exclude",
+        list(&c.exclude)
+    );
+    outln!("  {:<22} {}", "context.include", list(&c.include));
+    if !c.tool_budgets.is_empty() {
+        let budgets: Vec<String> = c
+            .tool_budgets
+            .iter()
+            .map(|(t, n)| format!("{t}={n}"))
+            .collect();
+        outln!("  {:<22} {}", "context.tool_budgets", budgets.join(", "));
+    }
+    outln!(
+        "  {:<22} {}  (repo map {} tokens)",
+        "index",
+        on_off(cfg.index.enabled),
+        cfg.index.repo_map_tokens
+    );
+    outln!(
+        "  {:<22} {} lines",
+        "read.default_limit",
+        cfg.read.default_limit
+    );
+    outln!(
+        "  {:<22} ttl {:?}, markers {:?}",
+        "cache",
+        cfg.cache.ttl,
+        cfg.cache.markers
+    );
 }
 
 /// `zcode config` — which files were consulted, and what they add up to.
@@ -949,6 +1444,7 @@ fn cmd_config(args: ConfigArgs) -> CliResult {
     // Whether shell output is being shrunk before it reaches the model is a
     // fact about every future token bill, so it is stated rather than implied.
     outln!("  {:<22} {}", "rtk", describe_rtk(&cfg.rtk));
+    print_efficiency(&cfg);
     outln!("  {:<22} {}", "mcp servers", cfg.mcp_servers.len());
 
     // LSP is on by default, so say which servers that actually resolved to —
@@ -956,9 +1452,11 @@ fn cmd_config(args: ConfigArgs) -> CliResult {
     let lsp = cfg.effective_lsp_servers();
     let detected = cfg.detected_language();
     outln!(
-        "  {:<22} {}{}",
+        "  {:<22} {} — each starts on first use, at most {} at once, stopped after {}s idle{}",
         "lsp servers",
         lsp.len(),
+        cfg.lsp_tuning.max_servers,
+        cfg.lsp_tuning.idle_shutdown_s,
         match &detected {
             Some(language) => format!("  (project looks like {language})"),
             None => String::new(),
@@ -1184,6 +1682,33 @@ fn base64_encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn efficiency_commands_parse() {
+        let cli = Cli::try_parse_from(["zcode", "session", "compact", "abc", "--focus", "the bug"])
+            .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Session {
+                command: SessionCmd::Compact { ref id, focus: Some(ref f) }
+            }) if id == "abc" && f == "the bug"
+        ));
+        let cli = Cli::try_parse_from(["zcode", "ignore", "check", "dist/app.js"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Ignore {
+                command: IgnoreCmd::Check { ref path }
+            }) if path == Path::new("dist/app.js")
+        ));
+        for sub in ["status", "rebuild", "clear"] {
+            assert!(
+                Cli::try_parse_from(["zcode", "index", sub]).is_ok(),
+                "{sub}"
+            );
+        }
+        let cli = Cli::try_parse_from(["zcode", "run", "--no-index", "task"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Run(ref a)) if a.no_index));
+    }
 
     #[test]
     fn version_command_parses() {
@@ -1473,6 +1998,45 @@ mod tests {
 
     /// FR-MODEL-06: every known provider constructs; a missing key is a typed
     /// error rather than a panic.
+    /// FR-CACHE-07: `auto` pays the one-hour write only where a person pauses
+    /// between prompts, and only on the stable head.
+    #[test]
+    fn the_cache_ttl_policy_follows_the_surface() {
+        let mut cfg = Config::default();
+        let five = CacheTtl::FiveMinutes;
+        let hour = CacheTtl::OneHour;
+        assert_eq!(
+            cache_layout(&cfg, Surface::Headless),
+            CacheLayout {
+                head: five,
+                tail: five
+            }
+        );
+        assert_eq!(
+            cache_layout(&cfg, Surface::Interactive),
+            CacheLayout {
+                head: hour,
+                tail: five
+            }
+        );
+        cfg.cache.ttl = infra_config::CacheTtlSetting::OneHour;
+        assert_eq!(
+            cache_layout(&cfg, Surface::Headless),
+            CacheLayout {
+                head: hour,
+                tail: hour
+            }
+        );
+        cfg.cache.ttl = infra_config::CacheTtlSetting::FiveMinutes;
+        assert_eq!(
+            cache_layout(&cfg, Surface::Interactive),
+            CacheLayout {
+                head: five,
+                tail: five
+            }
+        );
+    }
+
     #[test]
     fn wire_dispatches_each_provider() {
         let dir = tempfile::tempdir().unwrap();

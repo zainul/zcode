@@ -46,7 +46,6 @@ use self::input::Input;
 use self::timeline::{EntryKind, NoteLevel, Timeline, ToolStatus};
 use super::emit::sanitize;
 use super::logging::LogRedirect;
-use super::wire;
 
 /// Frame budget. Short enough for a smooth spinner, long enough to idle cheap.
 const TICK: Duration = Duration::from_millis(80);
@@ -148,12 +147,84 @@ impl Phase {
     }
 }
 
+/// The `/context` report (FR-BUDGET-05): each part of the context, the five
+/// largest tool results, and what is left.
+fn context_lines(b: &app::ContextBreakdown) -> Vec<String> {
+    let k = |n: u64| {
+        if n >= 1_000 {
+            format!("{:.1}k", n as f64 / 1_000.0)
+        } else {
+            n.to_string()
+        }
+    };
+    let total = b.total();
+    let mut out = vec![match b.window {
+        Some(w) => format!(
+            "context  ~{} / {} ({:.0}%) — estimated",
+            k(total),
+            k(w),
+            total as f64 / w as f64 * 100.0
+        ),
+        None => format!("context  ~{} — estimated (window unknown)", k(total)),
+    }];
+    for (label, n) in [
+        ("system prompt", b.system),
+        ("tool schemas", b.tool_schemas),
+        ("summaries", b.summaries),
+        ("user / assistant", b.conversation),
+        ("tool results", b.tool_results),
+    ] {
+        out.push(format!("  {label:<18} {:>8}", k(n)));
+    }
+    if !b.largest.is_empty() {
+        let largest: Vec<String> = b
+            .largest
+            .iter()
+            .map(|(what, n)| format!("{what} {}", k(*n)))
+            .collect();
+        out.push(format!("  largest results    {}", largest.join(" · ")));
+    }
+    if let Some(w) = b.window {
+        out.push(format!(
+            "  {:<18} {:>8}",
+            "free",
+            k(w.saturating_sub(total))
+        ));
+    }
+    out
+}
+
+/// `ctx 62%`, or `ctx 84.0k` when the model's window is unknown.
+fn context_label(live: u64, window: Option<u64>) -> String {
+    match window.filter(|w| *w > 0) {
+        Some(w) => format!("ctx {}%", (live as f64 / w as f64 * 100.0).round() as u64),
+        None if live >= 1_000 => format!("ctx {:.1}k", live as f64 / 1_000.0),
+        None => format!("ctx {live}"),
+    }
+}
+
+fn context_span(live: u64, window: Option<u64>) -> Span<'static> {
+    let share = window.filter(|w| *w > 0).map(|w| live as f64 / w as f64);
+    let style = match share {
+        Some(s) if s >= 0.75 => Style::default().fg(Color::Red),
+        Some(s) if s >= 0.60 => Style::default().fg(Color::Yellow),
+        _ => Style::default(),
+    };
+    Span::styled(context_label(live, window), style)
+}
+
 /// Running totals for the whole TUI session, across turns.
 #[derive(Debug, Default, Clone)]
 pub struct Totals {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_tokens: u64,
+    /// Settled at the end of each turn (FR-BUDGET-06).
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub prompt_tokens: u64,
+    /// `None` until a priced turn reports one.
+    pub cache_saving_usd: Option<f64>,
     pub steps: u64,
     pub turns: u64,
     pub cost: Cost,
@@ -179,10 +250,10 @@ impl Totals {
     fn set_turn_usage(&mut self, usage: &domain::LlmFinish) {
         self.input_tokens += usage.input_tokens.saturating_sub(self.turn.input);
         self.output_tokens += usage.output_tokens.saturating_sub(self.turn.output);
-        self.cache_tokens += usage.cache_tokens.saturating_sub(self.turn.cache);
+        self.cache_tokens += usage.cache_tokens().saturating_sub(self.turn.cache);
         self.turn.input = usage.input_tokens;
         self.turn.output = usage.output_tokens;
-        self.turn.cache = usage.cache_tokens;
+        self.turn.cache = usage.cache_tokens();
 
         if let Some(reported) = usage.cost_usd {
             let delta = reported - self.turn.cost_usd;
@@ -199,9 +270,15 @@ impl Totals {
         // same tokens.
         self.input_tokens += result.input_tokens.saturating_sub(self.turn.input);
         self.output_tokens += result.output_tokens.saturating_sub(self.turn.output);
-        self.cache_tokens += result.cache_tokens.saturating_sub(self.turn.cache);
+        self.cache_tokens += result.cache_tokens().saturating_sub(self.turn.cache);
         self.steps += result.steps;
         self.turns += 1;
+        self.cache_read_tokens += result.cache_read_tokens;
+        self.cache_write_tokens += result.cache_write_tokens;
+        self.prompt_tokens += result.prompt_tokens;
+        if let Some(saved) = result.cache_saving_usd {
+            self.cache_saving_usd = Some(self.cache_saving_usd.unwrap_or(0.0) + saved);
+        }
         // A cost the provider reported has already been counted and is exact;
         // the local estimate must not be added on top of it.
         if self.turn.cost_usd <= 0.0 {
@@ -227,6 +304,8 @@ pub struct TuiState {
     pub session_id: Option<String>,
     pub session_dir: String,
     pub totals: Totals,
+    /// The latest live-context report: (tokens, window) — FR-CTX-13.
+    pub context: Option<(u64, Option<u64>)>,
     pub tool_names: Vec<String>,
     /// Names from the config's `providers` array, for `/provider`.
     pub providers: Vec<String>,
@@ -286,6 +365,7 @@ impl Default for TuiState {
             session_id: None,
             session_dir: String::new(),
             totals: Totals::default(),
+            context: None,
             tool_names: Vec::new(),
             providers: Vec::new(),
             run_override: std::collections::HashMap::new(),
@@ -537,6 +617,23 @@ impl TuiState {
                 };
             }
             UiEvent::Notice(message) => self.push_note(&sanitize(&message), NoteLevel::Info),
+            UiEvent::Compacted {
+                tier,
+                tokens_before,
+                tokens_after,
+            } => self.push_note(
+                &domain::describe_compaction(tier, tokens_before, tokens_after),
+                NoteLevel::Info,
+            ),
+            UiEvent::CacheReset { reason } if reason != "compaction" => self.push_note(
+                &format!("prompt cache reset: {reason} — the next request re-writes it"),
+                NoteLevel::Info,
+            ),
+            UiEvent::CacheReset { .. } => {}
+            UiEvent::Context {
+                live_tokens,
+                window,
+            } => self.context = Some((live_tokens, window)),
             UiEvent::LoopStart { step, max_turns } => {
                 self.phase = Phase::Working {
                     since: match &self.phase {
@@ -774,6 +871,15 @@ impl TuiState {
             spans.push(Span::raw(tokens));
         }
 
+        // FR-CTX-13: how full the context is, coloured as it nears the
+        // compaction trigger (75% by default).
+        if detail.shows_tokens() {
+            if let Some((live, window)) = self.context {
+                spans.push(Span::raw(SEP));
+                spans.push(context_span(live, window));
+            }
+        }
+
         // The cost is never dropped: showing it is the point.
         spans.push(Span::raw(SEP));
         spans.push(Span::styled(
@@ -821,6 +927,28 @@ impl TuiState {
                 self.totals.input_tokens, self.totals.output_tokens, self.totals.cache_tokens
             ),
         ];
+        // FR-BUDGET-06: what the prompt cache did.
+        let t = &self.totals;
+        if t.cache_read_tokens + t.cache_write_tokens > 0 {
+            let hit = if t.prompt_tokens > 0 {
+                format!(
+                    " · hit {:.0}%",
+                    t.cache_read_tokens as f64 / t.prompt_tokens as f64 * 100.0
+                )
+            } else {
+                String::new()
+            };
+            out.push(format!(
+                "cache:   read {} · write {}{hit}",
+                t.cache_read_tokens, t.cache_write_tokens
+            ));
+            out.push(match t.cache_saving_usd {
+                Some(saved) => format!(
+                    "saved:   ≈ ${saved:.4} vs sending the cached prompt at the full input rate"
+                ),
+                None => "saved:   n/a — the model is unpriced".to_string(),
+            });
+        }
         if c.priced {
             out.push(format!(
                 "cost:    {} (input {:.4}, output {:.4}, cache {:.4}) — estimated from list \
@@ -971,6 +1099,10 @@ enum Command {
     NewSession,
     /// Point the loop at a different configured provider, by name.
     SwitchProvider(String),
+    /// Report what fills the context (FR-BUDGET-05).
+    Context,
+    /// Compact the session now, with an optional focus (FR-CTX-12).
+    Compact(Option<String>),
 }
 
 /// Everything the engine thread sends back, on one ordered channel.
@@ -983,6 +1115,8 @@ enum EngineMsg {
     Done(Box<Result<ExecutionResult, String>>),
     /// Tool list after a mode change.
     Tools(Vec<String>),
+    /// Lines to show as-is (a `/context` report).
+    Lines(Vec<String>),
     /// The provider actually in use, after a successful switch.
     Provider {
         name: String,
@@ -1035,7 +1169,12 @@ fn engine_thread(
     cmd_rx: Receiver<Command>,
 ) {
     // Telemetry goes to a sink, never stdout: the alternate screen owns it.
-    let mut app = match wire(&cfg, Box::new(io::sink())) {
+    let mut app = match super::wire_on(
+        &cfg,
+        Box::new(io::sink()),
+        super::JsonFormat::Zcode,
+        super::Surface::Interactive,
+    ) {
         Ok(app) => app,
         Err(e) => {
             let _ = msg_tx.send(EngineMsg::Fatal(e.to_string()));
@@ -1060,6 +1199,31 @@ fn engine_thread(
                 let _ = msg_tx.send(EngineMsg::Tools(tool_names(&app, mode)));
             }
             Command::NewSession => session_id = None,
+            Command::Context => {
+                let lines = match &session_id {
+                    None => vec!["context: nothing yet — the conversation has not started".into()],
+                    Some(id) => match app.context_breakdown(id) {
+                        Ok(b) => context_lines(&b),
+                        Err(e) => vec![format!("context: {e}")],
+                    },
+                };
+                let _ = msg_tx.send(EngineMsg::Lines(lines));
+            }
+            Command::Compact(focus) => {
+                let lines = match &session_id {
+                    None => vec!["compact: nothing yet — the conversation has not started".into()],
+                    // The Compacted event carries the numbers; this only
+                    // covers the case where there was nothing to do.
+                    Some(id) => match app.compact_session(id, focus.as_deref()) {
+                        Ok(Some(_)) => Vec::new(),
+                        Ok(None) => vec!["compact: nothing to compact yet".into()],
+                        Err(e) => vec![format!("compact: {e}")],
+                    },
+                };
+                if !lines.is_empty() {
+                    let _ = msg_tx.send(EngineMsg::Lines(lines));
+                }
+            }
             Command::SwitchProvider(name) => {
                 // Build the new client *before* installing it: a typo or a
                 // missing key must leave the working provider in place, not
@@ -1068,7 +1232,7 @@ fn engine_thread(
                     .with_provider(&name)
                     .map_err(|e| e.to_string())
                     .and_then(|next| {
-                        super::build_llm(&next)
+                        super::build_llm_on(&next, super::Surface::Interactive)
                             .map(|llm| (next, llm))
                             .map_err(|e| e.to_string())
                     }) {
@@ -1230,6 +1394,7 @@ fn render_loop(
                 EngineMsg::Event(ev) => state.apply(ev),
                 EngineMsg::Done(outcome) => state.finish_turn(*outcome),
                 EngineMsg::Ready(tools) | EngineMsg::Tools(tools) => state.tool_names = tools,
+                EngineMsg::Lines(lines) => state.push_lines(lines),
                 EngineMsg::Provider {
                     name,
                     kind,
@@ -1540,6 +1705,21 @@ fn run_command(
             state
                 .timeline
                 .push_agent("New session — the model's context is empty.");
+        }
+        SlashCommand::Context => {
+            if state.busy() {
+                state.push_lines(vec!["wait for the turn to finish, or /stop".into()]);
+            } else {
+                let _ = cmd_tx.send(Command::Context);
+            }
+        }
+        SlashCommand::Compact(focus) => {
+            if state.busy() {
+                state.push_lines(vec!["wait for the turn to finish, or /stop".into()]);
+            } else {
+                state.push_lines(vec!["compacting…".into()]);
+                let _ = cmd_tx.send(Command::Compact(focus));
+            }
         }
         SlashCommand::Cost => {
             let lines = state.cost_lines();
@@ -2472,7 +2652,12 @@ mod tests {
             truncated: false,
             input_tokens: 7,
             output_tokens: 3,
-            cache_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            peak_context_tokens: 0,
+            compactions: 0,
+            prompt_tokens: 0,
+            cache_saving_usd: None,
             cost: Cost {
                 output_usd: 0.5,
                 priced: true,
@@ -3186,7 +3371,8 @@ mod tests {
             reason: domain::LlmFinishReason::ToolUse,
             input_tokens: input,
             output_tokens: output,
-            cache_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             cost_usd: cost,
         }
     }
@@ -3857,5 +4043,93 @@ drwxr-xr-x  ..."
         let payload = "fn main() {\n    println!(\"hi\");\n}\n";
         state.input.insert_str(payload);
         assert_eq!(state.input.text(), payload);
+    }
+
+    // ---- FR-CTX-13: context fill and compaction notes --------------------
+
+    #[test]
+    fn context_labels_show_a_share_or_a_size() {
+        assert_eq!(context_label(124_000, Some(200_000)), "ctx 62%");
+        assert_eq!(context_label(84_000, None), "ctx 84.0k");
+        assert_eq!(context_label(900, None), "ctx 900");
+    }
+
+    #[test]
+    fn context_and_compaction_events_update_the_state() {
+        let mut state = TuiState::default();
+        state.apply(UiEvent::Context {
+            live_tokens: 150_000,
+            window: Some(200_000),
+        });
+        assert_eq!(state.context, Some((150_000, Some(200_000))));
+        state.apply(UiEvent::Compacted {
+            tier: 3,
+            tokens_before: 150_000,
+            tokens_after: 61_000,
+        });
+        state.apply(UiEvent::CacheReset {
+            reason: "compaction".into(),
+        });
+        state.apply(UiEvent::CacheReset {
+            reason: "mode changed".into(),
+        });
+        let text = format!("{:?}", state.timeline);
+        assert!(
+            text.contains("context compacted 150.0k → 61.0k tokens (older steps summarised)"),
+            "{text}"
+        );
+        assert!(text.contains("prompt cache reset: mode changed"), "{text}");
+        assert_eq!(
+            text.matches("prompt cache reset").count(),
+            1,
+            "compaction's reset is not repeated"
+        );
+    }
+
+    #[test]
+    fn cost_shows_the_cache_split_hit_ratio_and_saving() {
+        let mut state = TuiState::default();
+        let mut r = result(3, "done");
+        r.cache_read_tokens = 9_000;
+        r.cache_write_tokens = 500;
+        r.prompt_tokens = 10_000;
+        r.cache_saving_usd = Some(0.0243);
+        state.totals.record(&r);
+        let lines = state.cost_lines().join("\n");
+        assert!(
+            lines.contains("cache:   read 9000 · write 500 · hit 90%"),
+            "{lines}"
+        );
+        assert!(lines.contains("saved:   ≈ $0.0243"), "{lines}");
+        let mut unpriced = TuiState::default();
+        let mut r = result(1, "x");
+        r.cache_read_tokens = 10;
+        r.prompt_tokens = 100;
+        unpriced.totals.record(&r);
+        assert!(unpriced.cost_lines().join("\n").contains("saved:   n/a"));
+    }
+
+    #[test]
+    fn the_context_report_lists_parts_largest_and_free_space() {
+        let b = app::ContextBreakdown {
+            window: Some(200_000),
+            system: 2_100,
+            tool_schemas: 3_300,
+            summaries: 1_800,
+            conversation: 9_400,
+            tool_results: 44_600,
+            largest: vec![("read src/app.rs (s12)".into(), 9_800)],
+        };
+        let lines = context_lines(&b).join("\n");
+        assert!(
+            lines.starts_with("context  ~61.2k / 200.0k (31%) — estimated"),
+            "{lines}"
+        );
+        assert!(lines.contains("tool results          44.6k"), "{lines}");
+        assert!(
+            lines.contains("largest results    read src/app.rs (s12) 9.8k"),
+            "{lines}"
+        );
+        assert!(lines.contains("free                 138.8k"), "{lines}");
     }
 }

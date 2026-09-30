@@ -1,4 +1,4 @@
-.PHONY: build test lint fmt fmt-check bench check-deps check-arch secrets-scan ci size clean
+.PHONY: build test lint fmt fmt-check bench check-deps check-arch secrets-scan ci size clean eval-tokens eval-compare
 
 build:
 	cargo build --workspace
@@ -36,6 +36,17 @@ secrets-scan:
 	@echo "secrets-scan OK"
 
 ci: fmt-check lint test build check-deps secrets-scan
+
+# FR-BUDGET-07: token-efficiency evaluation (evals/README.md).
+#   make eval-tokens                       hermetic replay self-test (no network)
+#   make eval-tokens LIVE=1 LABEL=name     live corpus run; needs provider keys, costs money
+#   make eval-compare BASE=a.json NEW=b.json
+eval-tokens:
+	cargo build -q -p zcode
+	cargo run -q -p zcode-evals -- $(if $(LIVE),run --label $(LABEL),self-test) --zcode target/debug/zcode
+
+eval-compare:
+	cargo run -q -p zcode-evals -- compare $(BASE) $(NEW)
 
 clean:
 	cargo clean

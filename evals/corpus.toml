@@ -1,0 +1,215 @@
+# Evaluation corpus (PRD-CTX-EFF-003 §10.1): 4 repositories × 6 categories.
+# Graders live in graders/ and run in the post-run working tree (exit 0 = pass).
+
+# ---------------------------------------------------------------- self-test
+# Deterministic: replayed from replay/selftest, graded without a model.
+[[task]]
+id = "selftest"
+repo = "selftest-lib"
+category = "locate-and-explain"
+mode = "planning"
+prompt = "Which function computes the arithmetic mean, and in which file is it?"
+max_turns = 5
+grader = { kind = "contains", all = ["mean", "pylib/stats.py"] }
+
+# ---------------------------------------------------------------- zcode (Rust)
+[[task]]
+id = "rust-locate"
+repo = "zcode"
+category = "locate-and-explain"
+mode = "planning"
+prompt = "Where is the system prompt for an agent mode chosen, and what happens to the system message when an existing session is resumed?"
+grader = { kind = "rubric", criteria = [
+  "Names `system_prompt` in crates/domain/src/modes.rs (or domain::modes::system_prompt) as where the prompt is chosen per mode",
+  "Says that on resume the first history message is replaced when it is a system message, or a system message is inserted when there is none",
+] }
+
+[[task]]
+id = "rust-fix"
+repo = "zcode"
+category = "single-file-fix"
+prompt = "The test `domain::naming::tests::maps_prd_spellings_to_wire_names` fails. Find the bug and fix it. Do not change the test."
+max_turns = 30
+grader = { kind = "command", script = "rust-fix.sh" }
+
+[[task]]
+id = "rust-refactor"
+repo = "zcode"
+category = "multi-file-refactor"
+prompt = "Replace the free function `reason_str` in crates/app/src/lib.rs with a public method `LlmFinishReason::as_str(self) -> &'static str` defined in the domain crate, and use it everywhere `reason_str` was used. Keep behaviour identical."
+max_turns = 40
+grader = { kind = "command", script = "rust-refactor.sh" }
+
+[[task]]
+id = "rust-rename"
+repo = "zcode"
+category = "rename"
+prompt = "Rename the function `truncate_tool_output` to `cap_tool_output` everywhere in the workspace, including tests and doc comments."
+max_turns = 30
+grader = { kind = "command", script = "rust-rename.sh" }
+
+[[task]]
+id = "rust-add-test"
+repo = "zcode"
+category = "add-test"
+prompt = "Add a unit test to crates/domain/src/model_id.rs covering a model id that has both a vendor namespace and a routing suffix (e.g. `openrouter/anthropic/claude-3.5-haiku:beta`). The test must pass."
+max_turns = 30
+grader = { kind = "command", script = "rust-add-test.sh" }
+
+[[task]]
+id = "rust-long"
+repo = "zcode"
+category = "long-horizon"
+prompt = "Add a `/version` slash command to the TUI that prints zcode's build version as a note. Follow the existing slash-command pattern in crates/cli/src/cli/tui/command.rs (parsing, help text, handling) and add parser tests for `/version` next to the existing ones. `cargo test -p zcode` must pass."
+max_turns = 120
+timeout_s = 1800
+grader = { kind = "command", script = "rust-long.sh" }
+
+# ---------------------------------------------------------------- go-service
+[[task]]
+id = "go-locate"
+repo = "go-service"
+category = "locate-and-explain"
+mode = "planning"
+prompt = "Trace what happens when a client POSTs a new order: which functions run, in which files, until the order is stored?"
+grader = { kind = "rubric", criteria = [
+  "Mentions Handler.ServeHTTP / create in internal/httpapi/handler.go",
+  "Mentions Service.Create in internal/orders/service.go",
+  "Mentions the Store's Put (MemoryStore.Put in internal/orders/store.go)",
+] }
+
+[[task]]
+id = "go-fix"
+repo = "go-service"
+category = "single-file-fix"
+prompt = "`go test ./...` fails in internal/orders (TestTotalAppliesDiscountOnce). Fix the bug without changing the test."
+grader = { kind = "command", script = "go-fix.sh" }
+
+[[task]]
+id = "go-refactor"
+repo = "go-service"
+category = "multi-file-refactor"
+prompt = "Extract the percentage-discount calculation into a new package internal/pricing with an exported function `ApplyDiscount(cents int64, pct int) int64`, and make Order.Total use it. Everything must build and `go vet ./...` must pass."
+grader = { kind = "command", script = "go-refactor.sh" }
+
+[[task]]
+id = "go-rename"
+repo = "go-service"
+category = "rename"
+prompt = "Rename the Store interface method `Get` to `Find` (interface, MemoryStore, and every caller). The build and `go vet` must stay clean."
+grader = { kind = "command", script = "go-rename.sh" }
+
+[[task]]
+id = "go-add-test"
+repo = "go-service"
+category = "add-test"
+prompt = "Add a test to internal/httpapi/handler_test.go asserting that GET /orders/<unknown id> returns 404. It must pass."
+grader = { kind = "command", script = "go-add-test.sh" }
+
+[[task]]
+id = "go-long"
+repo = "go-service"
+category = "long-horizon"
+prompt = "Add order cancellation: a `StatusCancelled` status, `Service.Cancel(id string) (Order, error)` that refuses to cancel a shipped order (return an exported ErrAlreadyShipped), and an HTTP endpoint `POST /orders/{id}/cancel` returning 200 with the order, 404 for an unknown id and 409 for a shipped order. Add tests for the service and the endpoint."
+max_turns = 120
+timeout_s = 1800
+grader = { kind = "command", script = "go-long.sh" }
+
+# ---------------------------------------------------------------- next-app (TypeScript)
+[[task]]
+id = "ts-locate"
+repo = "next-app"
+category = "locate-and-explain"
+mode = "planning"
+prompt = "Where is the cart total computed, and how is tax applied to it?"
+grader = { kind = "rubric", criteria = [
+  "Names Cart.total in lib/cart.ts",
+  "Says tax is computed by taxFor in lib/price.ts at TAX_RATE_PCT (8%) of the subtotal and added to it",
+] }
+
+[[task]]
+id = "ts-fix"
+repo = "next-app"
+category = "single-file-fix"
+prompt = "`node --test` fails on lib/price.test.ts. Fix the bug in the code without changing the test."
+grader = { kind = "command", script = "ts-fix.sh" }
+
+[[task]]
+id = "ts-refactor"
+repo = "next-app"
+category = "multi-file-refactor"
+prompt = "Move the CURRENCY and LOCALE constants from lib/price.ts into a new module lib/config.ts and import them from there wherever they are used. The cart tests must still pass."
+grader = { kind = "command", script = "ts-refactor.sh" }
+
+[[task]]
+id = "ts-rename"
+repo = "next-app"
+category = "rename"
+prompt = "Rename the Cart method `addItem` to `add` everywhere it is defined or called, including tests and components."
+grader = { kind = "command", script = "ts-rename.sh" }
+
+[[task]]
+id = "ts-add-test"
+repo = "next-app"
+category = "add-test"
+prompt = "Add tests for Cart.removeItem to lib/cart.test.ts: removing an existing sku returns true and drops it; removing an unknown sku returns false."
+grader = { kind = "command", script = "ts-add-test.sh" }
+
+[[task]]
+id = "ts-long"
+repo = "next-app"
+category = "long-horizon"
+prompt = "Add discount codes: a new lib/discount.ts exporting `applyDiscount(totalCents: number, code: string): number` where SAVE10 takes 10% off (rounded to the nearest cent), FREESHIP takes 500 cents off totals of at least 5000, and unknown codes change nothing. Let `Cart.total(code?: string)` apply it after tax. Add lib/discount.test.ts covering every rule."
+max_turns = 120
+timeout_s = 1800
+grader = { kind = "command", script = "ts-long.sh" }
+
+# ---------------------------------------------------------------- py-lib
+[[task]]
+id = "py-locate"
+repo = "py-lib"
+category = "locate-and-explain"
+mode = "planning"
+prompt = "How does the LRU cache decide what to evict, and what data structure backs it?"
+grader = { kind = "rubric", criteria = [
+  "Names LRUCache in pylib/cache.py",
+  "Says it is backed by an OrderedDict",
+  "Says accessed keys are moved to the end and the first (least recently used) item is evicted when capacity is exceeded",
+] }
+
+[[task]]
+id = "py-fix"
+repo = "py-lib"
+category = "single-file-fix"
+prompt = "`python3 -m unittest discover -s tests -t .` fails on test_median_even_length. Fix the bug without changing the test."
+grader = { kind = "command", script = "py-fix.sh" }
+
+[[task]]
+id = "py-refactor"
+repo = "py-lib"
+category = "multi-file-refactor"
+prompt = "Move `word_count` from pylib/text.py into a new module pylib/counting.py. Keep `from pylib.text import word_count` and `from pylib import word_count` working, and make tests/test_text.py import it from pylib.counting."
+grader = { kind = "command", script = "py-refactor.sh" }
+
+[[task]]
+id = "py-rename"
+repo = "py-lib"
+category = "rename"
+prompt = "Rename `truncate_words` to `shorten_words` everywhere (definition, exports, tests)."
+grader = { kind = "command", script = "py-rename.sh" }
+
+[[task]]
+id = "py-add-test"
+repo = "py-lib"
+category = "add-test"
+prompt = "Add tests to tests/test_cache.py for an LRUCache of capacity 1 (a second put evicts the first key) and for the ValueError on capacity 0."
+grader = { kind = "command", script = "py-add-test.sh" }
+
+[[task]]
+id = "py-long"
+repo = "py-lib"
+category = "long-horizon"
+prompt = "Add `histogram(values, bins)` to pylib/stats.py: split [min, max] into `bins` equal-width bins and return the list of counts (the maximum value falls into the last bin; raise ValueError for empty input or bins < 1; a single distinct value puts everything in the first bin). Export it from pylib, and add tests in tests/test_stats.py."
+max_turns = 120
+timeout_s = 1800
+grader = { kind = "command", script = "py-long.sh" }

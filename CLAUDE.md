@@ -32,7 +32,7 @@ cargo run -q -p zcode -- version
 ```
 
 Directory → package: `crates/cli` → `zcode`, `crates/infra/<x>` → `infra-<x>`,
-`crates/tools` → `tools`, `benches` → `zcode-benches`.
+`crates/tools` → `tools`, `benches` → `zcode-benches`, `evals` → `zcode-evals`.
 
 The toolchain is pinned to **1.85.0**; the first cargo invocation on a fresh
 machine downloads it (slow, silent for a while).
@@ -42,7 +42,8 @@ machine downloads it (slow, silent for a while).
 ```
 cli ──► app ──► domain            domain is stdlib-only
 cli ──► infra/* ──► domain        cli is the composition root
-cli ──► tools ──► infra/{filesystem,shell,config,mcp,lsp}
+cli ──► tools ──► infra/{filesystem,shell,config,mcp,lsp,search}
+cli ──► infra/index ──► infra/search       tools reach the index only via domain::CodeIndexPort
 ```
 
 Hard rules, enforced by `make check-deps` / `make check-arch` and cited in doc
@@ -257,9 +258,12 @@ history in and out of the `Session` rather than cloning it.
 
 ## Tool namespace
 
-Native: `read`, `write`, `str_replace_editor`, `apply_patch`, `list_dir`,
-`shell`, `zcode_skill`. MCP: `mcp__<server>__<tool>`. LSP: `lsp__goto_definition`,
-`lsp__find_references`, `lsp__hover`, `lsp__rename_symbol`.
+Native, in wire order (pinned by `native_tool_order_is_fixed` — the tool list
+heads every cached prefix): `read`, `list_dir`, `glob`, `grep`, `outline`,
+`symbols`, `related`, `write`, `str_replace_editor`, `apply_patch`, `shell`,
+`edit_symbol` (only with the index on), `zcode_skill`. MCP:
+`mcp__<server>__<tool>`. LSP: `lsp__goto_definition`, `lsp__find_references`,
+`lsp__hover`, `lsp__rename_symbol` (`apply: true` writes), `lsp__diagnostics`.
 
 `__` rather than `::` because provider function-calling APIs only accept
 `[A-Za-z0-9_-]`. `domain::canonical_tool_name` maps the PRD spellings
@@ -358,6 +362,29 @@ Upstream's own installer is `curl … | sh`, which zcode's own denylist refuses,
 so `--git` (compiling the pinned upstream source) is used instead of that. It
 only runs a package manager that is already present.
 
+## Context efficiency (PRD-CTX-EFF-003, `docs/prd/context-efficiency/`)
+
+- **Search** is `infra-search` (ripgrep's own crates, in-process): one
+  `DiscoveryFilter` decides what exists for `grep`, `glob`, `list_dir` and the
+  index. `ignore` is pinned `=0.4.29` (0.4.30 needs let-chains, not 1.85).
+- **Code index** is `infra-index` (tree-sitter 0.26; one feature per grammar).
+  Built on a `zcode-index` thread, stored at `.zcode/index/v1/index.zcix`
+  (custom binary, versioned; any doubt → rebuild). Signatures are *not*
+  stored — they are the name's line, read back for the few results a query
+  returns; storing them was a third of the heap. `edit_symbol` never trusts
+  stored spans: it re-parses the file it edits (`parse_text`).
+- **Repo map**: decided once per session, frozen into the system message
+  (`Session.repo_map`, `Some("")` = decided none) so a resume keeps the prefix.
+- **Compaction**: `app::context::ContextManager`, tiers 1 (supersession) → 2
+  (elision, spilled first) → 3 (summary) → emergency; `/compact` runs all.
+- **LSP** is `infra_lsp::LspPool`: one server per language, started on first
+  use, LRU-capped (`lsp.max_servers`), idled out; file-less queries never
+  start one. While a server indexes, definition/references/hover answer from
+  the index (labelled) instead of waiting out the timeout.
+- **Caching**: Anthropic breakpoints and OpenAI-route markers live in
+  `infra-llm`; content is rendered as part arrays whenever markers are on so
+  the byte prefix is stable between steps.
+
 ## Configuration
 
 Layered, each overriding the previous field by field:
@@ -386,14 +413,16 @@ is not registered when no skills exist.
 
 LSP is on by default. `Config::effective_lsp_servers()` merges configured
 servers with `default_lsp_servers()` (rust-analyzer / gopls /
-typescript-language-server), keeps a default only if `which_on_path` finds its
-binary, and — when `detect_project_language` identifies the directory from its
-marker files — starts **only** a server for that language. No marker means no
-default server. `canonical_language` maps `nextjs`/`node`/`ts`/`golang` onto the
-server they actually resolve to.
+typescript-language-server) and keeps a default only if `which_on_path` finds
+its binary; `detect_project_language` only puts the project's own language
+first. Nothing starts at launch — the pool starts a server when a request
+names a file of its language — so offering every installed default is free.
+`canonical_language` maps `nextjs`/`node`/`ts`/`golang` onto the server they
+actually resolve to.
 
-Runtime state lives under `<working_dir>/.zcode/`: `sessions/<uuidv7>.json`,
-`reports/<ts>-<session>.json`, `skills/`.
+Runtime state lives under `<working_dir>/.zcode/`: `sessions/<uuidv7>.json`
+(+ an archive of compacted messages), `reports/<ts>-<session>.json`,
+`skills/`, `index/v1/`, `spill/`.
 
 Shell safety is three checks in `tools::guard`, in order:
 

@@ -8,11 +8,15 @@
 
 use std::time::Instant;
 
+pub mod context;
+use context::{CompactDeps, ContextManager};
+pub use context::{CompactionRecord, ContextConfig};
+
 use domain::{
     modes, AgentContext, AgentMode, CancelFlag, Emitter, ExtraField, ImageRef, LlmEvent, LlmFinish,
     LlmFinishReason, LlmMessage, LlmPort, LlmRequest, LlmRole, LlmToolCall, LlmToolResult,
-    LogLevel, LoggerPort, Session, SessionStorePort, TelemetryEvent, TelemetryPort,
-    TelemetryTotals, ToolRegistryPort, ToolSpec, UiEvent,
+    LogLevel, LoggerPort, MessageMeta, Session, SessionStorePort, SpillPort, TelemetryEvent,
+    TelemetryPort, TelemetryTotals, ToolRegistryPort, ToolSpec, UiEvent,
 };
 
 #[derive(thiserror::Error, Debug)]
@@ -81,10 +85,97 @@ pub struct ExecutionResult {
     pub truncated: bool,
     pub input_tokens: u64,
     pub output_tokens: u64,
-    pub cache_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
     /// Estimated spend for this run. `priced` is false when the model is not
     /// in the price table, so the UI can say "n/a" rather than "$0.00".
     pub cost: domain::Cost,
+    /// The largest live context seen before any request in this run
+    /// (FR-BUDGET-04, PRD M7), in calibrated tokens.
+    pub peak_context_tokens: u64,
+    /// How many times the transcript was compacted (FR-CTX-13).
+    pub compactions: u32,
+    /// Every prompt token sent, cached or not (FR-BUDGET-06): the
+    /// denominator of the cache hit ratio.
+    pub prompt_tokens: u64,
+    /// What cache reads saved against the full input rate; `None` when the
+    /// model is unpriced (FR-BUDGET-06).
+    pub cache_saving_usd: Option<f64>,
+}
+
+impl ExecutionResult {
+    /// Cache reads and writes together.
+    pub fn cache_tokens(&self) -> u64 {
+        self.cache_read_tokens + self.cache_write_tokens
+    }
+}
+
+/// What fills a session's context, by part (FR-BUDGET-05). Estimated with
+/// the same heuristic the engine uses before a provider reports.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ContextBreakdown {
+    pub window: Option<u64>,
+    pub system: u64,
+    pub tool_schemas: u64,
+    pub summaries: u64,
+    /// User and assistant messages, tool-call arguments included.
+    pub conversation: u64,
+    pub tool_results: u64,
+    /// The largest tool results: (what, tokens), biggest first, at most five.
+    pub largest: Vec<(String, u64)>,
+}
+
+impl ContextBreakdown {
+    pub fn total(&self) -> u64 {
+        self.system + self.tool_schemas + self.summaries + self.conversation + self.tool_results
+    }
+}
+
+/// Running token totals for one run (FR-CACHE-04: reads and writes apart).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RunUsage {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+}
+
+impl RunUsage {
+    /// Every prompt token sent, whichever convention the provider reports in.
+    pub fn prompt_tokens(&self, cache_within_input: bool) -> u64 {
+        if cache_within_input {
+            self.input + self.cache_write
+        } else {
+            self.input + self.cache_read + self.cache_write
+        }
+    }
+
+    /// Cache reads as a share of all prompt tokens sent. `None` when the
+    /// provider reported nothing about caching.
+    pub fn cache_hit_ratio(&self, cache_within_input: bool) -> Option<f64> {
+        if self.cache_read + self.cache_write == 0 {
+            return None;
+        }
+        let prompt = if cache_within_input {
+            self.input + self.cache_write
+        } else {
+            self.input + self.cache_read + self.cache_write
+        };
+        (prompt > 0).then(|| self.cache_read as f64 / prompt as f64)
+    }
+
+    /// For the price table. Writes are priced at the 5-minute rate: the
+    /// provider reports them as one figure, and the 5-minute cache is the
+    /// default TTL.
+    fn token_usage(&self) -> domain::TokenUsage {
+        domain::TokenUsage {
+            input: self.input,
+            output: self.output,
+            cache_read: self.cache_read,
+            cache_write_5m: self.cache_write,
+            cache_write_1h: 0,
+        }
+    }
 }
 
 /// The engine contract both interfaces drive (FR-IFACE-03).
@@ -133,6 +224,89 @@ pub struct App {
     logger: Box<dyn LoggerPort + Send>,
     emitter: Box<dyn Emitter + Send>,
     cancel: CancelFlag,
+    /// Where over-budget tool output is kept in full (FR-READ-07). Optional:
+    /// without it, a cut result says to re-run the call instead.
+    spill: Option<Box<dyn SpillPort + Send>>,
+    /// Compaction settings (`[context]`, FR-CTX-*).
+    context_cfg: ContextConfig,
+    /// The code index (FR-INDEX-*), when one is running. The engine only
+    /// tells it a turn is starting; the tools query it.
+    code_index: Option<std::sync::Arc<dyn domain::CodeIndexPort>>,
+    /// Token budget of the repo map in the system message; 0 = none
+    /// (`index.repo_map_tokens`, FR-INDEX-08).
+    repo_map_tokens: u32,
+    /// A cheaper model for Tier 3 summaries (`context.compaction_model`,
+    /// FR-CTX-08); `None` uses the session's own client.
+    compaction_llm: Option<Box<dyn LlmPort + Send>>,
+    /// Output budgets per tool, in tokens (FR-READ-06).
+    tool_budgets: ToolBudgets,
+    /// The client was replaced since the last run: the next request
+    /// re-writes the provider's prompt cache (FR-CACHE-08).
+    llm_switched: bool,
+}
+
+/// Per-tool output budgets in tokens (FR-READ-06). A tool gets the entry
+/// that names it, else the longest matching prefix (`mcp__`, `lsp__`), else
+/// the default; `max_tool_output_chars` stays a hard ceiling over all.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolBudgets {
+    pub default_tokens: u32,
+    pub per_tool: Vec<(String, u32)>,
+}
+
+impl Default for ToolBudgets {
+    fn default() -> Self {
+        let per_tool = [
+            ("shell", 6_000),
+            ("read", 8_000),
+            ("grep", 3_000),
+            ("glob", 1_500),
+            ("list_dir", 1_500),
+            ("outline", 2_000),
+            ("symbols", 1_500),
+            ("related", 1_500),
+            ("lsp__", 2_000),
+            ("mcp__", 6_000),
+        ]
+        .into_iter()
+        .map(|(t, n)| (t.to_string(), n))
+        .collect();
+        Self {
+            default_tokens: 6_000,
+            per_tool,
+        }
+    }
+}
+
+impl ToolBudgets {
+    /// Layer configured entries over the defaults, key by key.
+    pub fn with_overrides(mut self, overrides: &[(String, u32)]) -> Self {
+        for (tool, tokens) in overrides {
+            self.per_tool.retain(|(t, _)| t != tool);
+            self.per_tool.push((tool.clone(), *tokens));
+        }
+        self
+    }
+
+    pub fn tokens_for(&self, tool: &str) -> u32 {
+        let name = domain::canonical_tool_name(tool);
+        self.per_tool
+            .iter()
+            .filter(|(t, _)| name == *t || (t.ends_with("__") && name.starts_with(t.as_str())))
+            .max_by_key(|(t, _)| t.len())
+            .map_or(self.default_tokens, |(_, n)| *n)
+    }
+
+    /// The character cap for `tool`: its token budget at the code divisor
+    /// (≈3.6 chars/token), never above `ceiling` (0 = no ceiling).
+    pub fn chars_for(&self, tool: &str, ceiling: usize) -> usize {
+        let chars = (f64::from(self.tokens_for(tool)) * 3.6) as usize;
+        if ceiling == 0 {
+            chars
+        } else {
+            chars.min(ceiling)
+        }
+    }
 }
 
 impl App {
@@ -153,7 +327,47 @@ impl App {
             logger,
             emitter: Box::new(NullEmitter),
             cancel: CancelFlag::default(),
+            spill: None,
+            code_index: None,
+            repo_map_tokens: 0,
+            context_cfg: ContextConfig::default(),
+            compaction_llm: None,
+            tool_budgets: ToolBudgets::default(),
+            llm_switched: false,
         }
+    }
+
+    /// Per-tool output budgets (`[context.tool_budgets]`, FR-READ-06).
+    pub fn set_tool_budgets(&mut self, budgets: ToolBudgets) {
+        self.tool_budgets = budgets;
+    }
+
+    /// Summarise with this client instead of the session's (FR-CTX-08).
+    pub fn set_compaction_llm(&mut self, llm: Box<dyn LlmPort + Send>) {
+        self.compaction_llm = Some(llm);
+    }
+
+    /// Compaction settings (`[context]`).
+    pub fn set_context_config(&mut self, cfg: ContextConfig) {
+        self.context_cfg = cfg;
+    }
+
+    /// Keep the full text of over-budget tool output (FR-READ-07).
+    pub fn set_spill(&mut self, spill: Box<dyn SpillPort + Send>) {
+        self.spill = Some(spill);
+    }
+
+    /// The code index, so each turn starts with a cheap freshness check
+    /// for edits made outside zcode (FR-INDEX-04).
+    /// `repo_map_tokens` sizes the repository map a new session carries in
+    /// its system message (FR-INDEX-08); 0 turns the map off.
+    pub fn set_code_index(
+        &mut self,
+        index: std::sync::Arc<dyn domain::CodeIndexPort>,
+        repo_map_tokens: u32,
+    ) {
+        self.code_index = Some(index);
+        self.repo_map_tokens = repo_map_tokens;
     }
 
     /// Point the loop at a different provider client.
@@ -167,6 +381,7 @@ impl App {
     /// switch — which is the point of switching mid-conversation.
     pub fn set_llm(&mut self, llm: Box<dyn LlmPort + Send>) {
         self.llm = llm;
+        self.llm_switched = true;
     }
 
     /// Replace the price table, e.g. with the config's `[[pricing]]`
@@ -204,6 +419,7 @@ impl App {
 
     /// Share the flag the CLI's SIGINT handler flips (FR-IFACE-05).
     pub fn set_cancel(&mut self, cancel: CancelFlag) {
+        self.tools.set_cancel(cancel.clone());
         self.cancel = cancel;
     }
 
@@ -227,6 +443,54 @@ impl App {
             .filter(|spec| !modes::denies(mode, &spec.name))
             .collect::<Vec<_>>()
             .into_boxed_slice()
+    }
+
+    /// What fills `session_id`'s context right now (FR-BUDGET-05).
+    pub fn context_breakdown(&self, session_id: &str) -> Result<ContextBreakdown, AppError> {
+        let session = self
+            .sessions
+            .load(session_id)
+            .map_err(|e| AppError::Session(e.to_string()))?;
+        let est = |m: &LlmMessage| domain::estimate_messages(std::slice::from_ref(m));
+        let mut b = ContextBreakdown {
+            window: self.context_window.lookup(&session.model),
+            tool_schemas: self
+                .tool_specs_for(session.mode)
+                .iter()
+                .map(|t| {
+                    domain::estimate_tokens(&t.name)
+                        + domain::estimate_tokens(&t.description)
+                        + domain::estimate_tokens(&t.params_json)
+                })
+                .sum(),
+            ..ContextBreakdown::default()
+        };
+        let mut results: Vec<(String, u64)> = Vec::new();
+        let messages = &session.messages;
+        for (i, m) in messages.iter().enumerate() {
+            let n = est(m);
+            match (m.role, m.meta.kind) {
+                (LlmRole::System, _) => b.system += n,
+                (_, domain::MessageKind::Summary) => b.summaries += n,
+                (LlmRole::Tool, _) => {
+                    b.tool_results += n;
+                    let tool = domain::context::call_for(messages, i)
+                        .map_or("tool".to_string(), |c| c.name.clone());
+                    let what = match &m.meta.subject {
+                        Some(domain::Subject::FileRange { path, .. })
+                        | Some(domain::Subject::FileWrite { path })
+                        | Some(domain::Subject::Listing { path }) => format!("{tool} {path}"),
+                        _ => tool,
+                    };
+                    results.push((format!("{what} (s{})", m.meta.step), n));
+                }
+                _ => b.conversation += n,
+            }
+        }
+        results.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        results.truncate(5);
+        b.largest = results;
+        Ok(b)
     }
 
     /// Enumerate every tool, unfiltered (`zcode tools list`).
@@ -255,6 +519,15 @@ impl App {
             .sessions
             .load(&id)
             .map_err(|e| AppError::Session(format!("cannot load session {id}: {e}")))?;
+        // A resumed session in another mode gets another system prompt and
+        // tool list — both at the front of every request, so the provider's
+        // prompt cache starts over (FR-CACHE-08). Accepted on purpose:
+        // advertising tools the mode refuses would break the gating rule.
+        if !session.messages.is_empty() && session.mode != req.mode {
+            self.emitter.emit(UiEvent::CacheReset {
+                reason: format!("mode changed to {}", req.mode.as_str()),
+            });
+        }
         // Mode and model are per-run properties recorded on the session
         // (FR-MODE-04, FR-SESSION-07).
         session.mode = req.mode;
@@ -290,12 +563,234 @@ impl App {
             model: session.model.clone(),
             input_tokens: 0,
             output_tokens: 0,
-            cache_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             steps,
             execution_time_ms: 0,
             session_id: session.id.clone(),
             extra: extra.into_boxed_slice(),
         });
+    }
+
+    /// Report and persist a compaction's outcome: archive what was
+    /// replaced, tell the UI and telemetry, and note the prompt-cache reset
+    /// it causes (FR-CTX-11/13, FR-CACHE-08). A failed compaction is a
+    /// warning, never a failed run (FR-CTX-09).
+    /// Run one compaction with every collaborator it needs: the spill store,
+    /// the registry's argument shrinker, and a summariser on the compaction
+    /// model (or the session's model when none is configured). `forced`
+    /// ignores the trigger — a provider already refused the prompt.
+    fn compact_now(
+        &mut self,
+        ctx_mgr: &mut ContextManager,
+        history: &mut Vec<LlmMessage>,
+        session: &Session,
+        trigger: Trigger,
+        focus: Option<&str>,
+    ) -> (Result<Option<CompactionRecord>, String>, Vec<LlmMessage>) {
+        let window = self.context_window.lookup(&session.model);
+        let mut archived = Vec::new();
+        let tools = &self.tools;
+        let elide = |name: &str, args: &str| tools.elide_args(name, args);
+        let llm: &mut (dyn LlmPort + Send) = match self.compaction_llm.as_mut() {
+            Some(l) => l.as_mut(),
+            None => self.llm.as_mut(),
+        };
+        let max_tokens = u64::from(self.context_cfg.summary_max_tokens) * 2;
+        let model = session.model.clone();
+        let focus = focus.map(str::to_string);
+        let mut summarise = move |span: &str| -> Result<(String, LlmFinish), String> {
+            let mut prompt = String::from("Summarise this part of the session.\n\n");
+            prompt.push_str(span);
+            if let Some(f) = &focus {
+                prompt.push_str(&format!("\n\nPay special attention to: {f}"));
+            }
+            let request = LlmRequest {
+                messages: Box::new([
+                    LlmMessage::system(context::SUMMARY_PROMPT),
+                    LlmMessage::user(&prompt),
+                ]),
+                tools: Box::new([]),
+                model: model.clone(),
+                max_tokens,
+                temperature: 0.0,
+                images: Box::new([]),
+            };
+            let (mut text, mut finish) = (String::new(), None);
+            for event in llm.stream(&request) {
+                match event.map_err(|e| e.to_string())? {
+                    LlmEvent::Delta(t) => text.push_str(&t),
+                    LlmEvent::Finish(f) => finish = Some(f),
+                    _ => {}
+                }
+            }
+            let finish = finish.unwrap_or(LlmFinish {
+                reason: LlmFinishReason::Stop,
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                cost_usd: None,
+            });
+            Ok((text, finish))
+        };
+        let mut deps = CompactDeps {
+            session_id: &session.id,
+            spill: self
+                .spill
+                .as_deref_mut()
+                .map(|s| s as &mut (dyn SpillPort + Send)),
+            elide_args: &elide,
+            archived: &mut archived,
+            summarise: Some(&mut summarise),
+        };
+        let result = match trigger {
+            Trigger::Automatic => ctx_mgr.maybe_compact(history, window, &mut deps),
+            Trigger::Rejected => ctx_mgr.force_compact(history, window, &mut deps),
+            Trigger::Manual => ctx_mgr.compact_fully(history, window, &mut deps),
+        };
+        (result, archived)
+    }
+
+    /// FR-CTX-12: compact a saved session now, all tiers, optionally with a
+    /// focus for the summary — `/compact [focus]` and `zcode session
+    /// compact`. Emits the same events as automatic compaction, archives
+    /// what it replaced, and checkpoints. `Ok(None)`: nothing to compact.
+    pub fn compact_session(
+        &mut self,
+        session_id: &str,
+        focus: Option<&str>,
+    ) -> Result<Option<CompactionRecord>, AppError> {
+        let mut session = self
+            .sessions
+            .load(session_id)
+            .map_err(|e| AppError::Session(format!("cannot load session {session_id}: {e}")))?;
+        let mut history: Vec<LlmMessage> =
+            std::mem::replace(&mut session.messages, Box::new([])).into_vec();
+        let step = context::step_base(&history);
+        let mut ctx_mgr = ContextManager::new(ContextConfig {
+            enabled: true,
+            ..self.context_cfg
+        });
+        let outcome =
+            self.compact_now(&mut ctx_mgr, &mut history, &session, Trigger::Manual, focus);
+        let result = match &outcome.0 {
+            Ok(record) => Ok(record.clone()),
+            Err(e) => Err(AppError::Session(format!("compaction failed: {e}"))),
+        };
+        let (mut compactions, mut usage) = (0, RunUsage::default());
+        self.after_compaction(&mut session, step, outcome, &mut compactions, &mut usage);
+        let steps = session.step_count;
+        self.checkpoint(&mut session, &mut history, steps)?;
+        result
+    }
+
+    fn after_compaction(
+        &mut self,
+        session: &mut Session,
+        step: u32,
+        outcome: (Result<Option<CompactionRecord>, String>, Vec<LlmMessage>),
+        compactions: &mut u32,
+        usage: &mut RunUsage,
+    ) {
+        let step_u64 = u64::from(step);
+        let (result, archived) = outcome;
+        let record = match result {
+            Ok(Some(record)) => record,
+            Ok(None) => return,
+            Err(problem) => {
+                self.emitter.emit(UiEvent::Notice(problem.clone()));
+                self.emit_telemetry(
+                    "context_compaction_failed",
+                    session,
+                    step_u64,
+                    vec![("reason".into(), ExtraField::Text(problem))],
+                );
+                return;
+            }
+        };
+        *compactions += 1;
+        // The summariser call was billed like any other.
+        if let Some(u) = &record.summary_usage {
+            usage.input += u.input_tokens;
+            usage.output += u.output_tokens;
+            usage.cache_read += u.cache_read_tokens;
+            usage.cache_write += u.cache_write_tokens;
+            self.emit_telemetry(
+                "llm_finish",
+                session,
+                step_u64,
+                vec![
+                    ("purpose".into(), ExtraField::Text("compaction".into())),
+                    (
+                        "input_tokens".into(),
+                        ExtraField::Number(u.input_tokens as f64),
+                    ),
+                    (
+                        "output_tokens".into(),
+                        ExtraField::Number(u.output_tokens as f64),
+                    ),
+                ],
+            );
+        }
+        if let Some(problem) = &record.summary_error {
+            self.emitter.emit(UiEvent::Notice(format!(
+                "could not summarise older steps ({problem}); kept the other compactions"
+            )));
+        }
+        session.compactions.push(domain::CompactionEntry {
+            step,
+            tier: record.tier,
+            tokens_before: record.tokens_before,
+            tokens_after: record.tokens_after,
+            archived: u32::try_from(archived.len()).unwrap_or(u32::MAX),
+        });
+        if let Err(e) = self.sessions.archive(&session.id, &archived) {
+            self.logger.log(
+                LogLevel::Warn,
+                &format!("could not archive compacted messages: {e}"),
+            );
+        }
+        self.emitter.emit(UiEvent::Compacted {
+            tier: record.tier,
+            tokens_before: record.tokens_before,
+            tokens_after: record.tokens_after,
+        });
+        self.emitter.emit(UiEvent::CacheReset {
+            reason: "compaction".into(),
+        });
+        self.emit_telemetry(
+            "context_compacted",
+            session,
+            step_u64,
+            vec![
+                ("tier".into(), ExtraField::Number(f64::from(record.tier))),
+                (
+                    "tokens_before".into(),
+                    ExtraField::Number(record.tokens_before as f64),
+                ),
+                (
+                    "tokens_after".into(),
+                    ExtraField::Number(record.tokens_after as f64),
+                ),
+                (
+                    "superseded".into(),
+                    ExtraField::Number(record.superseded as f64),
+                ),
+                ("elided".into(), ExtraField::Number(record.elided as f64)),
+                ("emergency".into(), ExtraField::Bool(record.emergency)),
+                (
+                    "archived_messages".into(),
+                    ExtraField::Number(archived.len() as f64),
+                ),
+            ],
+        );
+        self.emit_telemetry(
+            "cache_reset",
+            session,
+            step_u64,
+            vec![("reason".into(), ExtraField::Text("compaction".into()))],
+        );
     }
 
     /// Flush the run report and hand back the result. Called on the happy
@@ -308,28 +803,29 @@ impl App {
         reason: LlmFinishReason,
         truncated: bool,
         stop_cause: Option<&'static str>,
-        totals: (u64, u64, u64),
+        totals: RunUsage,
         reported_cost_usd: Option<f64>,
         started: Instant,
+        peak_context_tokens: u64,
     ) {
-        let (input_tokens, output_tokens, cache_tokens) = totals;
+        let window = self.context_window.lookup(&session.model);
         let elapsed_ms = started.elapsed().as_millis() as u64;
         // What the provider charged beats what the table guesses: it covers
         // models the table has never seen, which is the case that otherwise
         // reports `n/a` while real money is being spent.
         let cost = match reported_cost_usd {
             Some(reported) => domain::Cost::from_reported_usd(reported),
-            None => {
-                self.pricing
-                    .estimate(&session.model, input_tokens, output_tokens, cache_tokens)
-            }
+            None => self
+                .pricing
+                .estimate_usage(&session.model, &totals.token_usage()),
         };
         self.telemetry.emit(TelemetryEvent {
             kind: "finish".into(),
             model: session.model.clone(),
-            input_tokens,
-            output_tokens,
-            cache_tokens,
+            input_tokens: totals.input,
+            output_tokens: totals.output,
+            cache_read_tokens: totals.cache_read,
+            cache_write_tokens: totals.cache_write,
             steps,
             execution_time_ms: elapsed_ms,
             session_id: session.id.clone(),
@@ -361,13 +857,36 @@ impl App {
                         false => ExtraField::Null,
                     },
                 ),
+                // FR-CACHE-04: the share of the prompt served from cache. The
+                // engine computes it because only it knows whether this
+                // provider counts cached tokens inside `input_tokens`.
+                (
+                    "cache_hit_ratio".into(),
+                    match totals.cache_hit_ratio(self.pricing.cache_within_input(&session.model)) {
+                        Some(r) => ExtraField::Number(r),
+                        None => ExtraField::Null,
+                    },
+                ),
+                // FR-BUDGET-04 / PRD M7: how full the context got.
+                (
+                    "peak_context_tokens".into(),
+                    ExtraField::Number(peak_context_tokens as f64),
+                ),
+                (
+                    "context_window".into(),
+                    match window {
+                        Some(w) => ExtraField::Number(w as f64),
+                        None => ExtraField::Null,
+                    },
+                ),
             ]),
         });
         let totals = TelemetryTotals {
             model: session.model.clone(),
-            input_tokens,
-            output_tokens,
-            cache_tokens,
+            input_tokens: totals.input,
+            output_tokens: totals.output,
+            cache_read_tokens: totals.cache_read,
+            cache_write_tokens: totals.cache_write,
             steps,
             execution_time_ms: elapsed_ms,
             session_id: session.id.clone(),
@@ -382,6 +901,27 @@ impl App {
     }
 }
 
+/// Why a compaction runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Trigger {
+    /// The transcript crossed `compact_at` (FR-CTX-01).
+    Automatic,
+    /// The provider refused the prompt as too long (FR-CTX-10).
+    Rejected,
+    /// Someone asked (FR-CTX-12).
+    Manual,
+}
+
+/// The system message: the mode's policy, then the repo map if there is one.
+fn system_text(mode: domain::AgentMode, repo_map: Option<&str>) -> String {
+    match repo_map {
+        Some(map) if !map.is_empty() => {
+            format!("{}\n\n# Repository map\n{map}", modes::system_prompt(mode))
+        }
+        _ => modes::system_prompt(mode).to_string(),
+    }
+}
+
 impl AgentLoop for App {
     fn execute(
         &mut self,
@@ -389,13 +929,37 @@ impl AgentLoop for App {
         req: ExecutionRequest,
     ) -> Result<ExecutionResult, AppError> {
         let started = Instant::now();
+        if let Some(index) = &self.code_index {
+            index.notify_turn_start();
+        }
         let mut session = self.open_session(&req, ctx)?;
+        // FR-CACHE-03: cache routing is per session.
+        self.llm.set_session(&session.id);
+        if std::mem::take(&mut self.llm_switched) && !session.messages.is_empty() {
+            self.emitter.emit(UiEvent::CacheReset {
+                reason: "provider or model switched".into(),
+            });
+        }
         let mut history: Vec<LlmMessage> =
             std::mem::replace(&mut session.messages, Box::new([])).into_vec();
 
         // The system prompt encodes the mode policy (FR-MODE-03). A resumed
         // session gets its prompt rewritten so a mode switch takes effect.
-        let system = LlmMessage::system(modes::system_prompt(req.mode));
+        // FR-INDEX-08, CE-DQ22: the repo map is decided once per session and
+        // frozen — `Some("")` records "decided: none" — so the system
+        // message, the head of every cached prefix, never changes under a
+        // resumed session.
+        if session.repo_map.is_none() {
+            if let Some(index) = &self.code_index {
+                match index.repo_map(&req.prompt, self.repo_map_tokens) {
+                    Ok(map) => session.repo_map = Some(map),
+                    Err(e) => self
+                        .logger
+                        .log(LogLevel::Warn, &format!("repo map skipped: {e}")),
+                }
+            }
+        }
+        let system = LlmMessage::system(&system_text(req.mode, session.repo_map.as_deref()));
         match history.first_mut() {
             Some(first) if first.role == LlmRole::System => *first = system,
             _ => history.insert(0, system),
@@ -404,13 +968,23 @@ impl AgentLoop for App {
 
         let specs = self.tool_specs_for(req.mode);
         let mut steps: u64 = 0;
-        let mut input_tokens: u64 = 0;
-        let mut output_tokens: u64 = 0;
-        let mut cache_tokens: u64 = 0;
+        let mut usage = RunUsage::default();
         // Summed across the turn's calls, when the provider reports it. `None`
         // means no call reported one, so the local price table is the only
         // estimate available.
         let mut reported_cost_usd: Option<f64> = None;
+        // Live-context accounting (FR-BUDGET-02/03, CE-DQ10): anchored on the
+        // provider's last reported prompt size, with only the messages added
+        // since then estimated — and that estimate corrected by what the
+        // provider's reports have taught the calibrator.
+        let cache_within_input = self.pricing.cache_within_input(&session.model);
+        let mut ctx_mgr = ContextManager::new(self.context_cfg);
+        let mut peak_context_tokens: u64 = 0;
+        let mut compactions: u32 = 0;
+        // Step numbers continue across runs of a session (stubs cite them).
+        let step_base = context::step_base(&history);
+        // FR-CTX-10: one reactive compact-and-retry per step, at most.
+        let mut reactive_retry_used = false;
         let mut final_text = String::new();
         let finish_reason;
         let mut truncated = false;
@@ -431,9 +1005,10 @@ impl AgentLoop for App {
                     LlmFinishReason::Stop,
                     true,
                     Some("cancelled"),
-                    (input_tokens, output_tokens, cache_tokens),
+                    usage,
                     reported_cost_usd,
                     started,
+                    peak_context_tokens,
                 );
                 return Err(AppError::Interrupted);
             }
@@ -446,9 +1021,10 @@ impl AgentLoop for App {
                         LlmFinishReason::Length,
                         true,
                         Some("timeout"),
-                        (input_tokens, output_tokens, cache_tokens),
+                        usage,
                         reported_cost_usd,
                         started,
+                        peak_context_tokens,
                     );
                     return Err(AppError::Timeout(limit));
                 }
@@ -481,13 +1057,28 @@ impl AgentLoop for App {
             // ordinary tool result into a 400. Known models get their request
             // clamped to what is actually left; an unknown model is sent
             // exactly what was configured, as before.
-            let estimated_prompt_tokens: u64 = history
-                .iter()
-                .map(|m| domain::tokens::estimate_tokens(&m.content))
-                .sum();
+            // FR-CTX-01: keep the transcript bounded before it is sent.
+            let outcome = self.compact_now(
+                &mut ctx_mgr,
+                &mut history,
+                &session,
+                Trigger::Automatic,
+                None,
+            );
+            self.after_compaction(
+                &mut session,
+                step_base + steps as u32 + 1,
+                outcome,
+                &mut compactions,
+                &mut usage,
+            );
+
+            let estimated_prompt_tokens = ctx_mgr.live_tokens(&history);
+            peak_context_tokens = peak_context_tokens.max(estimated_prompt_tokens);
             let max_tokens =
                 self.context_window
                     .clamp(&session.model, req.max_tokens, estimated_prompt_tokens);
+            let sent_len = history.len();
 
             let llm_request = LlmRequest {
                 messages: history.clone().into_boxed_slice(),
@@ -502,8 +1093,15 @@ impl AgentLoop for App {
             let mut tool_calls: Vec<LlmToolCall> = Vec::new();
             let mut finish: Option<LlmFinish> = None;
 
+            let mut stream_error: Option<String> = None;
             for event in self.llm.stream(&llm_request) {
-                let event = event.map_err(|e| AppError::Llm(e.to_string()))?;
+                let event = match event {
+                    Ok(e) => e,
+                    Err(e) => {
+                        stream_error = Some(e.to_string());
+                        break;
+                    }
+                };
                 match event {
                     LlmEvent::Delta(text) => {
                         assistant.append_content(&text);
@@ -607,6 +1205,48 @@ impl AgentLoop for App {
                 }
             }
 
+            if let Some(error) = stream_error {
+                // FR-CTX-10: the provider refused the prompt for its size before
+                // producing anything. Learn the real window if it named one,
+                // compact to fit, and retry this step once.
+                let nothing_yet = assistant.content.is_empty() && tool_calls.is_empty();
+                if nothing_yet
+                    && !reactive_retry_used
+                    && self.context_cfg.reactive
+                    && context::is_context_length_error(&error)
+                {
+                    reactive_retry_used = true;
+                    if let Some(tokens) = domain::parse_window_from_error(&error) {
+                        self.context_window.learn(&session.model, tokens);
+                    }
+                    let outcome = self.compact_now(
+                        &mut ctx_mgr,
+                        &mut history,
+                        &session,
+                        Trigger::Rejected,
+                        None,
+                    );
+                    let changed = matches!(outcome.0, Ok(Some(_)));
+                    self.after_compaction(
+                        &mut session,
+                        step_base + steps as u32 + 1,
+                        outcome,
+                        &mut compactions,
+                        &mut usage,
+                    );
+                    if changed {
+                        self.emitter.emit(UiEvent::Notice(
+                            "the provider refused the prompt as too long — compacted the \
+                             conversation and retrying this step"
+                                .into(),
+                        ));
+                        continue;
+                    }
+                }
+                return Err(AppError::Llm(error));
+            }
+            reactive_retry_used = false;
+
             steps += 1;
             let finish = finish.unwrap_or(LlmFinish {
                 reason: if tool_calls.is_empty() {
@@ -616,26 +1256,29 @@ impl AgentLoop for App {
                 },
                 input_tokens: 0,
                 output_tokens: 0,
-                cache_tokens: 0,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
                 cost_usd: None,
             });
 
             // Provider-reported usage is authoritative; the heuristic is only
             // a fallback for providers that omit it (DQ2).
-            input_tokens += if finish.input_tokens > 0 {
+            usage.input += if finish.input_tokens > 0 {
                 finish.input_tokens
             } else {
-                history
-                    .iter()
-                    .map(|m| domain::tokens::estimate_tokens(&m.content))
-                    .sum()
+                estimated_prompt_tokens
             };
-            output_tokens += if finish.output_tokens > 0 {
+            ctx_mgr.observe(
+                domain::prompt_size(&finish, cache_within_input),
+                &history[..sent_len.min(history.len())],
+            );
+            usage.output += if finish.output_tokens > 0 {
                 finish.output_tokens
             } else {
                 domain::tokens::estimate_tokens(&assistant.content)
             };
-            cache_tokens += finish.cache_tokens;
+            usage.cache_read += finish.cache_read_tokens;
+            usage.cache_write += finish.cache_write_tokens;
             if let Some(step_cost) = finish.cost_usd {
                 reported_cost_usd = Some(reported_cost_usd.unwrap_or(0.0) + step_cost);
             }
@@ -645,13 +1288,21 @@ impl AgentLoop for App {
             // and each one has already been billed — showing `0 in / 0 out`
             // until it finishes tells the user nothing about a cost they are
             // already incurring.
+            self.emitter.emit(UiEvent::Context {
+                live_tokens: ctx_mgr.live_tokens(&history),
+                window: self.context_window.lookup(&session.model),
+            });
             self.emitter.emit(UiEvent::Usage(LlmFinish {
                 reason: finish.reason,
-                input_tokens,
-                output_tokens,
-                cache_tokens,
+                input_tokens: usage.input,
+                output_tokens: usage.output,
+                cache_read_tokens: usage.cache_read,
+                cache_write_tokens: usage.cache_write,
                 cost_usd: reported_cost_usd,
             }));
+
+            let step_no = step_base + u32::try_from(steps).unwrap_or(u32::MAX);
+            assistant.meta.step = step_no;
 
             // Some providers report `Stop` while still emitting tool calls;
             // trust the calls over the label.
@@ -704,9 +1355,10 @@ impl AgentLoop for App {
                         LlmFinishReason::Stop,
                         false,
                         None,
-                        (input_tokens, output_tokens, cache_tokens),
+                        usage,
                         reported_cost_usd,
                         started,
+                        peak_context_tokens,
                     );
                     return Err(AppError::Tool(message));
                 }
@@ -719,17 +1371,24 @@ impl AgentLoop for App {
                         ("tool".into(), ExtraField::Text(call.name.clone())),
                         ("tool_call_id".into(), ExtraField::Text(call.id.clone())),
                         ("arguments".into(), ExtraField::Text(call.arguments.clone())),
+                        (
+                            "class".into(),
+                            match self.tools.classify_call(&call.name, &call.arguments) {
+                                Some(c) => ExtraField::Text(c.into()),
+                                None => ExtraField::Null,
+                            },
+                        ),
                     ],
                 );
 
                 let call_started = std::time::Instant::now();
                 let outcome = self.tools.call(&call.name, &call.arguments);
                 let elapsed_ms = call_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
-                let (content, error) = match outcome {
-                    Ok(result) => (result.content, result.error),
+                let (content, error, subject) = match outcome {
+                    Ok(result) => (result.content, result.error, result.subject),
                     // A registry-level failure is reported to the model as a
                     // tool error so the loop can continue (NFR-REL-01).
-                    Err(e) => (String::new(), Some(e.to_string())),
+                    Err(e) => (String::new(), Some(e.to_string()), None),
                 };
                 let payload = match &error {
                     Some(message) => format!("error: {message}"),
@@ -737,8 +1396,27 @@ impl AgentLoop for App {
                 };
                 // FR-LOOP-04: cap the result *before* it enters the history so
                 // the transcript can never balloon past the configured budget.
+                // What is cut is spilled first, so it stays reachable
+                // (FR-READ-07); a spill failure costs only that pointer.
+                let budget = self
+                    .tool_budgets
+                    .chars_for(&call.name, req.max_tool_output_chars);
+                let over_budget = payload.chars().count() > budget;
+                let spill_path = match (&mut self.spill, over_budget) {
+                    (Some(store), true) => match store.spill(&session.id, &call.id, &payload) {
+                        Ok(path) => Some(path),
+                        Err(e) => {
+                            self.logger
+                                .log(LogLevel::Warn, &format!("could not spill tool output: {e}"));
+                            None
+                        }
+                    },
+                    _ => None,
+                };
                 let (payload, was_truncated) =
-                    truncate_tool_output(payload, req.max_tool_output_chars);
+                    shape_tool_output(payload, budget, spill_path.as_deref());
+                let payload_tokens = domain::estimate_tokens(&payload);
+                let category = domain::tool_category_for_call(&call.name, &call.arguments);
 
                 self.emitter.emit(UiEvent::ToolResult {
                     tool_call_id: call.id.clone(),
@@ -763,14 +1441,30 @@ impl AgentLoop for App {
                         ),
                         ("truncated".into(), ExtraField::Bool(was_truncated)),
                         ("duration_ms".into(), ExtraField::Number(elapsed_ms as f64)),
+                        // FR-BUDGET-01: what this result costs in context.
+                        (
+                            "tokens_est".into(),
+                            ExtraField::Number(payload_tokens as f64),
+                        ),
+                        ("chars".into(), ExtraField::Number(payload.len() as f64)),
+                        ("category".into(), ExtraField::Text(category.into())),
+                        ("spilled".into(), ExtraField::Bool(spill_path.is_some())),
                         ("output".into(), ExtraField::Text(payload.clone())),
                     ],
                 );
 
-                history.push(LlmMessage::tool_result_message(LlmToolResult {
+                let mut message = LlmMessage::tool_result_message(LlmToolResult {
                     tool_call_id: call.id.clone(),
                     content: payload,
-                }));
+                });
+                message.meta = MessageMeta {
+                    step: step_no,
+                    subject,
+                    tokens_est: u32::try_from(payload_tokens).unwrap_or(u32::MAX),
+                    spill: spill_path,
+                    ..MessageMeta::default()
+                };
+                history.push(message);
             }
 
             // FR-SESSION-06: a crash after this point resumes from here.
@@ -792,17 +1486,17 @@ impl AgentLoop for App {
             finish_reason,
             truncated,
             stop_cause,
-            (input_tokens, output_tokens, cache_tokens),
+            usage,
             reported_cost_usd,
             started,
+            peak_context_tokens,
         );
 
         let cost = match reported_cost_usd {
             Some(reported) => domain::Cost::from_reported_usd(reported),
-            None => {
-                self.pricing
-                    .estimate(&session.model, input_tokens, output_tokens, cache_tokens)
-            }
+            None => self
+                .pricing
+                .estimate_usage(&session.model, &usage.token_usage()),
         };
         Ok(ExecutionResult {
             session_id: session.id,
@@ -810,10 +1504,17 @@ impl AgentLoop for App {
             steps,
             finish_reason,
             truncated,
-            input_tokens,
-            output_tokens,
-            cache_tokens,
+            input_tokens: usage.input,
+            output_tokens: usage.output,
+            cache_read_tokens: usage.cache_read,
+            cache_write_tokens: usage.cache_write,
             cost,
+            peak_context_tokens,
+            compactions,
+            prompt_tokens: usage.prompt_tokens(cache_within_input),
+            cache_saving_usd: self
+                .pricing
+                .cache_saving_usd(&session.model, usage.cache_read),
         })
     }
 }
@@ -826,14 +1527,67 @@ fn reason_str(reason: LlmFinishReason) -> &'static str {
     }
 }
 
-/// Trim a tool result to `max_chars`, respecting UTF-8 boundaries, and say
-/// whether anything was dropped (FR-LOOP-04).
+/// Cap a tool result at `max_chars` characters, keeping the head **and** the
+/// tail (FR-READ-05), and say whether anything was dropped (FR-LOOP-04).
 pub fn truncate_tool_output(content: String, max_chars: usize) -> (String, bool) {
-    if max_chars == 0 || content.chars().count() <= max_chars {
+    shape_tool_output(content, max_chars, None)
+}
+
+/// Byte offset of the `n`th character (or the end).
+fn char_offset(s: &str, n: usize) -> usize {
+    s.char_indices().nth(n).map_or(s.len(), |(i, _)| i)
+}
+
+/// Cap `content` at `max_chars` characters: the first 40% and the last 60%
+/// of the budget, joined by a marker saying what was omitted and — when the
+/// full text was spilled — where it is (FR-READ-05/07).
+///
+/// v0.6 kept only the head. Compiler errors and test summaries come at the
+/// *end* of long output, so the part the model needed was the part cut, and
+/// it re-ran the command to see it. Cuts snap to a nearby line break so no
+/// line is split mid-way.
+pub fn shape_tool_output(
+    content: String,
+    max_chars: usize,
+    spill_path: Option<&str>,
+) -> (String, bool) {
+    let total = content.chars().count();
+    if max_chars == 0 || total <= max_chars {
         return (content, false);
     }
-    let mut out: String = content.chars().take(max_chars).collect();
-    out.push_str("\n...[truncated]");
+    const SNAP: usize = 200;
+    let head_chars = max_chars * 2 / 5;
+    let tail_chars = max_chars - head_chars;
+    let mut head_end = char_offset(&content, head_chars);
+    if let Some(nl) = content[..head_end].rfind('\n') {
+        if head_end - nl <= SNAP {
+            head_end = nl + 1;
+        }
+    }
+    let mut tail_start = char_offset(&content, total - tail_chars);
+    if let Some(nl) = content[tail_start..].find('\n') {
+        if nl < SNAP {
+            tail_start += nl + 1;
+        }
+    }
+    let tail_start = tail_start.max(head_end);
+    let omitted = &content[head_end..tail_start];
+    let where_ = match spill_path {
+        Some(p) => format!("; full output: {p} — grep or read it for the rest"),
+        None => "; re-run the call to see it".to_string(),
+    };
+    let marker = format!(
+        "…[omitted {} lines / {} chars{where_}]…\n",
+        omitted.matches('\n').count(),
+        omitted.chars().count()
+    );
+    let mut out = String::with_capacity(head_end + marker.len() + content.len() - tail_start + 1);
+    out.push_str(&content[..head_end]);
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&marker);
+    out.push_str(&content[tail_start..]);
     (out, true)
 }
 
@@ -895,7 +1649,8 @@ mod tests {
             reason,
             input_tokens: 10,
             output_tokens: 5,
-            cache_tokens: 1,
+            cache_read_tokens: 1,
+            cache_write_tokens: 0,
             cost_usd: None,
         }
     }
@@ -920,6 +1675,7 @@ mod tests {
     struct FakeTools {
         calls: RecordedCalls,
         response: String,
+        subject: Option<domain::Subject>,
     }
 
     impl ToolRegistryPort for FakeTools {
@@ -939,7 +1695,9 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((name.to_string(), args_json.to_string()));
-            Ok(ToolResult::ok(&self.response))
+            let mut result = ToolResult::ok(&self.response);
+            result.subject = self.subject.clone();
+            Ok(result)
         }
         fn is_native(&self, name: &str) -> bool {
             !name.starts_with("mcp__") && !name.starts_with("lsp__")
@@ -968,6 +1726,8 @@ mod tests {
                     last_message_at: "now".into(),
                     step_count: 0,
                     messages: Box::new([]),
+                    compactions: Vec::new(),
+                    repo_map: None,
                 },
             );
             Ok(id)
@@ -1040,6 +1800,7 @@ mod tests {
             Box::new(FakeTools {
                 calls: tool_calls.clone(),
                 response: tool_response.to_string(),
+                subject: None,
             }),
             Box::new(sessions.clone()),
             Box::new(telemetry.clone()),
@@ -1252,15 +2013,137 @@ mod tests {
             .find(|m| m.role == LlmRole::Tool)
             .expect("tool message");
         let content = &tool_msg.tool_result.as_ref().unwrap().content;
-        assert!(content.ends_with("...[truncated]"));
-        assert!(content.chars().count() < 16_100, "cap not applied");
+        assert!(content.contains("…[omitted "), "{}", &content[..200]);
+        assert!(content.chars().count() < 16_200, "cap not applied");
+    }
+
+    #[test]
+    fn shaping_keeps_the_head_and_the_tail_with_a_marker() {
+        let body: String = (1..=5_000).map(|i| format!("line {i}\n")).collect();
+        let (out, cut) = shape_tool_output(body, 2_000, None);
+        assert!(cut);
+        assert!(out.starts_with("line 1\n"));
+        assert!(out.ends_with("line 5000\n"));
+        let marker = out.lines().find(|l| l.starts_with("…[omitted ")).unwrap();
+        assert!(marker.contains(" lines / "), "{marker}");
+        assert!(marker.contains("re-run the call"), "{marker}");
+        // Cuts land on line breaks: every kept line is whole.
+        for l in out.lines().filter(|l| !l.starts_with('…')) {
+            assert!(l.starts_with("line "), "split line: {l:?}");
+        }
+    }
+
+    /// The case that motivated head+tail: the error is at the end.
+    #[test]
+    fn a_compiler_error_at_the_end_of_long_output_survives() {
+        let mut cargo: String = "   Compiling crate-x v0.1.0\n".repeat(3_000);
+        cargo.push_str("error[E0308]: mismatched types\n --> src/lib.rs:4:18\n");
+        let (out, cut) = shape_tool_output(cargo, 32_000, Some(".zcode/spill/s/c.txt"));
+        assert!(cut);
+        assert!(out.contains("error[E0308]: mismatched types"));
+        assert!(out.contains("full output: .zcode/spill/s/c.txt"));
+    }
+
+    #[test]
+    fn shaping_never_splits_a_character() {
+        let s = "日本語のテキスト".repeat(500);
+        for max in [7, 100, 333, 1_001] {
+            let (out, _) = shape_tool_output(s.clone(), max, None);
+            assert!(out.is_char_boundary(out.len()));
+        }
+        assert_eq!(
+            shape_tool_output("short".into(), 100, None),
+            ("short".into(), false)
+        );
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingSpill(Arc<Mutex<Vec<(String, String, usize)>>>, bool);
+    impl SpillPort for RecordingSpill {
+        fn spill(
+            &mut self,
+            session: &str,
+            call_id: &str,
+            content: &str,
+        ) -> Result<String, BoxError> {
+            if self.1 {
+                return Err("disk full".into());
+            }
+            self.0
+                .lock()
+                .unwrap()
+                .push((session.into(), call_id.into(), content.len()));
+            Ok(format!(".zcode/spill/{session}/{call_id}.txt"))
+        }
+    }
+
+    #[test]
+    fn over_budget_output_is_spilled_and_the_marker_names_the_file() {
+        let big = "x\n".repeat(20_000);
+        let mut h = harness(
+            vec![
+                tool_use_turn("c1", "shell", "{}"),
+                vec![LlmEvent::Finish(finish(LlmFinishReason::Stop))],
+            ],
+            &big,
+        );
+        let spill = RecordingSpill::default();
+        h.app.set_spill(Box::new(spill.clone()));
+        let mut req = ExecutionRequest::new("go");
+        req.max_tool_output_chars = 1_000;
+        let result = h.app.execute(&ctx(), req).unwrap();
+        let recorded = spill.0.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].2, big.len(), "the *full* text is spilled");
+        let session = h.sessions.load(&result.session_id).unwrap();
+        let msg = session
+            .messages
+            .iter()
+            .find(|m| m.role == LlmRole::Tool)
+            .unwrap();
+        let content = &msg.tool_result.as_ref().unwrap().content;
+        assert!(content.contains("full output: .zcode/spill/"), "{content}");
+        assert_eq!(
+            msg.meta.spill.as_deref(),
+            Some(&*format!(".zcode/spill/{}/c1.txt", result.session_id))
+        );
+    }
+
+    #[test]
+    fn a_spill_failure_does_not_fail_the_run() {
+        let mut h = harness(
+            vec![
+                tool_use_turn("c1", "shell", "{}"),
+                vec![LlmEvent::Finish(finish(LlmFinishReason::Stop))],
+            ],
+            &"y".repeat(5_000),
+        );
+        h.app
+            .set_spill(Box::new(RecordingSpill(Default::default(), true)));
+        let mut req = ExecutionRequest::new("go");
+        req.max_tool_output_chars = 500;
+        let result = h.app.execute(&ctx(), req).unwrap();
+        let session = h.sessions.load(&result.session_id).unwrap();
+        let msg = session
+            .messages
+            .iter()
+            .find(|m| m.role == LlmRole::Tool)
+            .unwrap();
+        assert!(msg
+            .tool_result
+            .as_ref()
+            .unwrap()
+            .content
+            .contains("re-run the call"));
+        assert_eq!(msg.meta.spill, None);
     }
 
     #[test]
     fn truncate_helper_respects_char_boundaries() {
         let (out, cut) = truncate_tool_output("héllo wörld".into(), 5);
         assert!(cut);
-        assert!(out.starts_with("héllo"));
+        assert!(out.starts_with("hé"), "{out}");
+        assert!(out.ends_with("rld"), "{out}");
         let (out, cut) = truncate_tool_output("short".into(), 100);
         assert!(!cut);
         assert_eq!(out, "short");
@@ -1330,6 +2213,120 @@ mod tests {
         );
     }
 
+    /// An index that answers only the repo map, and counts what it is asked.
+    #[derive(Default)]
+    struct MapIndex {
+        maps: Mutex<Vec<String>>,
+        turn_starts: Mutex<u32>,
+    }
+
+    impl domain::CodeIndexPort for MapIndex {
+        fn state(&self) -> domain::IndexState {
+            domain::IndexState::Ready
+        }
+        fn outline(&self, _: &str) -> Result<Option<Vec<domain::SymbolDef>>, BoxError> {
+            Ok(None)
+        }
+        fn symbols(
+            &self,
+            _: &str,
+            _: Option<domain::SymbolKind>,
+            _: Option<&str>,
+            _: usize,
+        ) -> Result<Vec<domain::SymbolDef>, BoxError> {
+            Ok(Vec::new())
+        }
+        fn locate(&self, _: Option<&str>, _: &str) -> Result<Vec<domain::SymbolDef>, BoxError> {
+            Ok(Vec::new())
+        }
+        fn related(&self, _: &str) -> Result<domain::Related, BoxError> {
+            Ok(domain::Related::default())
+        }
+        fn parse_text(&self, _: &str, _: &str) -> Result<Option<domain::ParsedFile>, BoxError> {
+            Ok(None)
+        }
+        fn repo_map(&self, prompt: &str, budget: u32) -> Result<String, BoxError> {
+            self.maps.lock().unwrap().push(prompt.to_string());
+            Ok(format!(
+                "src/lib.rs\n  fn about_{} ({budget})",
+                prompt.replace(' ', "_")
+            ))
+        }
+        fn notify_changed(&self, _: &str) {}
+        fn notify_turn_start(&self) {
+            *self.turn_starts.lock().unwrap() += 1;
+        }
+    }
+
+    #[test]
+    fn the_repo_map_is_computed_once_and_frozen_across_a_resume() {
+        let mut h = harness(Vec::new(), "ok");
+        let index = Arc::new(MapIndex::default());
+        h.app.set_code_index(index.clone(), 512);
+        let first = h
+            .app
+            .execute(&ctx(), ExecutionRequest::new("checkout page"))
+            .unwrap();
+        let system_after_first = h.sessions.load(&first.session_id).unwrap().messages[0]
+            .content
+            .clone();
+        assert!(system_after_first
+            .contains("# Repository map\nsrc/lib.rs\n  fn about_checkout_page (512)"));
+
+        let mut req = ExecutionRequest::new("something else entirely");
+        req.session_id = Some(first.session_id.clone());
+        h.app.execute(&ctx(), req).unwrap();
+        let session = h.sessions.load(&first.session_id).unwrap();
+        // CE-DQ22: the same bytes at the head of the prefix, one map computed.
+        assert_eq!(session.messages[0].content, system_after_first);
+        assert_eq!(*index.maps.lock().unwrap(), ["checkout page"]);
+        assert_eq!(*index.turn_starts.lock().unwrap(), 2);
+    }
+
+    #[test]
+    fn an_empty_map_is_a_decision_and_leaves_the_system_prompt_plain() {
+        struct NoMap;
+        impl domain::CodeIndexPort for NoMap {
+            fn state(&self) -> domain::IndexState {
+                domain::IndexState::Ready
+            }
+            fn outline(&self, _: &str) -> Result<Option<Vec<domain::SymbolDef>>, BoxError> {
+                Ok(None)
+            }
+            fn symbols(
+                &self,
+                _: &str,
+                _: Option<domain::SymbolKind>,
+                _: Option<&str>,
+                _: usize,
+            ) -> Result<Vec<domain::SymbolDef>, BoxError> {
+                Ok(Vec::new())
+            }
+            fn locate(&self, _: Option<&str>, _: &str) -> Result<Vec<domain::SymbolDef>, BoxError> {
+                Ok(Vec::new())
+            }
+            fn related(&self, _: &str) -> Result<domain::Related, BoxError> {
+                Ok(domain::Related::default())
+            }
+            fn parse_text(&self, _: &str, _: &str) -> Result<Option<domain::ParsedFile>, BoxError> {
+                Ok(None)
+            }
+            fn repo_map(&self, _: &str, _: u32) -> Result<String, BoxError> {
+                Ok(String::new())
+            }
+            fn notify_changed(&self, _: &str) {}
+        }
+        let mut h = harness(Vec::new(), "ok");
+        h.app.set_code_index(Arc::new(NoMap), 512);
+        let r = h.app.execute(&ctx(), ExecutionRequest::new("q")).unwrap();
+        let session = h.sessions.load(&r.session_id).unwrap();
+        assert_eq!(session.repo_map.as_deref(), Some(""));
+        assert_eq!(
+            session.messages[0].content,
+            modes::system_prompt(AgentMode::Auto)
+        );
+    }
+
     #[test]
     fn tool_failures_are_fed_back_instead_of_aborting() {
         struct FailingTools;
@@ -1395,6 +2392,7 @@ mod tests {
             Box::new(FakeTools {
                 calls: RecordedCalls::default(),
                 response: String::new(),
+                subject: None,
             }),
             Box::new(FakeSessions::default()),
             Box::new(FakeTelemetry::default()),
@@ -1424,6 +2422,9 @@ mod tests {
                     UiEvent::Error(_) => "error",
                     UiEvent::Retry(_) => "retry",
                     UiEvent::Notice(_) => "notice",
+                    UiEvent::Compacted { .. } => "compacted",
+                    UiEvent::CacheReset { .. } => "cache_reset",
+                    UiEvent::Context { .. } => "context",
                 };
                 self.0.lock().unwrap().push(label.to_string());
             }
@@ -1481,7 +2482,583 @@ mod tests {
         // Two turns, provider-reported 10/5/1 each (DQ2).
         assert_eq!(result.input_tokens, 20);
         assert_eq!(result.output_tokens, 10);
-        assert_eq!(result.cache_tokens, 2);
+        assert_eq!(result.cache_tokens(), 2);
+    }
+
+    /// The number an extra field carries on the last event of `kind`.
+    fn last_extra_number(telemetry: &FakeTelemetry, kind: &str, key: &str) -> Option<f64> {
+        telemetry
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|e| e.kind == kind)
+            .and_then(|e| {
+                e.extra
+                    .iter()
+                    .find_map(|(k, v)| match (k.as_str() == key, v) {
+                        (true, ExtraField::Number(n)) => Some(*n),
+                        _ => None,
+                    })
+            })
+    }
+
+    #[test]
+    fn tool_result_telemetry_carries_budget_fields() {
+        let mut h = harness(
+            vec![
+                tool_use_turn("c1", "read", r#"{"path":"a.rs"}"#),
+                vec![LlmEvent::Finish(finish(LlmFinishReason::Stop))],
+            ],
+            &"fn a() {}\n".repeat(50),
+        );
+        h.app.execute(&ctx(), ExecutionRequest::new("go")).unwrap();
+        let tokens = last_extra_number(&h.telemetry, "tool_result", "tokens_est").unwrap();
+        assert!(tokens > 50.0, "{tokens}");
+        assert_eq!(
+            last_extra_number(&h.telemetry, "tool_result", "chars"),
+            Some(500.0)
+        );
+        assert_eq!(
+            last_extra_text(&h.telemetry, "tool_result", "category").as_deref(),
+            Some("inspect")
+        );
+    }
+
+    #[test]
+    fn tool_result_message_carries_subject_step_and_size() {
+        let llm = FakeLlm::new(vec![
+            tool_use_turn("c1", "read", r#"{"path":"a.rs"}"#),
+            vec![LlmEvent::Finish(finish(LlmFinishReason::Stop))],
+        ]);
+        let sessions = FakeSessions::default();
+        let subject = domain::Subject::FileRange {
+            path: "a.rs".into(),
+            start: 1,
+            end: 2,
+            hash: 7,
+        };
+        let mut app = App::new(
+            Box::new(llm),
+            Box::new(FakeTools {
+                calls: RecordedCalls::default(),
+                response: "line one\nline two".into(),
+                subject: Some(subject.clone()),
+            }),
+            Box::new(sessions.clone()),
+            Box::new(FakeTelemetry::default()),
+            Box::new(NullLogger),
+        );
+        let result = app.execute(&ctx(), ExecutionRequest::new("go")).unwrap();
+        let session = sessions.load(&result.session_id).unwrap();
+        let tool_msg = session
+            .messages
+            .iter()
+            .find(|m| m.role == LlmRole::Tool)
+            .unwrap();
+        assert_eq!(tool_msg.meta.subject, Some(subject));
+        assert_eq!(tool_msg.meta.step, 1);
+        assert!(tool_msg.meta.tokens_est > 0);
+    }
+
+    #[test]
+    fn live_context_anchors_on_the_reported_prompt_size() {
+        let mut budget = ContextManager::new(ContextConfig::default());
+        let sent = vec![LlmMessage::user(&"word ".repeat(100))];
+        // Before any report: a pure (uncalibrated) estimate.
+        assert_eq!(budget.live_tokens(&sent), domain::estimate_messages(&sent));
+        // The provider says that prompt was 10,000 tokens (a big system prompt
+        // and tool schemas the transcript alone does not show).
+        budget.observe(10_000, &sent);
+        let mut grown = sent.clone();
+        grown.push(LlmMessage::assistant("ok"));
+        let live = budget.live_tokens(&grown);
+        assert!(live >= 10_000, "{live}");
+        assert!(live < 10_100, "only the new message is estimated: {live}");
+    }
+
+    #[test]
+    fn peak_context_is_reported_on_finish_and_in_the_result() {
+        let mut h = harness(
+            vec![
+                tool_use_turn("c1", "read", "{}"),
+                vec![LlmEvent::Finish(finish(LlmFinishReason::Stop))],
+            ],
+            "ok",
+        );
+        let result = h.app.execute(&ctx(), ExecutionRequest::new("go")).unwrap();
+        assert!(result.peak_context_tokens > 0);
+        assert_eq!(
+            last_extra_number(&h.telemetry, "finish", "peak_context_tokens"),
+            Some(result.peak_context_tokens as f64)
+        );
+    }
+
+    /// FR-CACHE-06: the hit ratio needs the provider's convention for
+    /// `input_tokens`; Anthropic reports cached tokens outside it.
+    #[test]
+    fn cache_hit_ratio_respects_the_providers_input_convention() {
+        let anthropic = RunUsage {
+            input: 1_000,
+            output: 0,
+            cache_read: 9_000,
+            cache_write: 0,
+        };
+        assert_eq!(anthropic.cache_hit_ratio(false), Some(0.9));
+        let openai = RunUsage {
+            input: 10_000,
+            output: 0,
+            cache_read: 9_000,
+            cache_write: 0,
+        };
+        assert_eq!(openai.cache_hit_ratio(true), Some(0.9));
+        assert_eq!(RunUsage::default().cache_hit_ratio(true), None);
+    }
+
+    #[test]
+    fn the_llm_client_is_told_the_session_before_the_first_request() {
+        struct SessionAware(Arc<Mutex<Vec<String>>>, FakeLlm);
+        impl LlmPort for SessionAware {
+            fn set_session(&mut self, id: &str) {
+                self.0.lock().unwrap().push(format!("session:{id}"));
+            }
+            fn send(&mut self, req: &LlmRequest) -> Result<LlmResponse, BoxError> {
+                self.1.send(req)
+            }
+            fn stream(
+                &mut self,
+                req: &LlmRequest,
+            ) -> Box<dyn Iterator<Item = Result<LlmEvent, BoxError>> + Send> {
+                self.0.lock().unwrap().push("request".into());
+                self.1.stream(req)
+            }
+        }
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut app = App::new(
+            Box::new(SessionAware(log.clone(), FakeLlm::new(vec![]))),
+            Box::new(FakeTools {
+                calls: RecordedCalls::default(),
+                response: String::new(),
+                subject: None,
+            }),
+            Box::new(FakeSessions::default()),
+            Box::new(FakeTelemetry::default()),
+            Box::new(NullLogger),
+        );
+        app.execute(&ctx(), ExecutionRequest::new("go")).unwrap();
+        let log = log.lock().unwrap();
+        assert!(log[0].starts_with("session:session-"), "{log:?}");
+        assert_eq!(log[1], "request");
+    }
+
+    // ---- context manager in the loop (FR-CTX-01..10) ------------------------
+
+    /// A scripted LLM: each call pops the next entry — events, or an error —
+    /// and records the request's messages. Reports no usage, so the engine
+    /// relies on its own (calibrated) estimate, as with a provider that
+    /// omits `usage`.
+    struct ScriptLlm {
+        script: Vec<Result<Vec<LlmEvent>, String>>,
+        calls: usize,
+        seen: Arc<Mutex<Vec<Vec<String>>>>,
+    }
+
+    impl ScriptLlm {
+        fn new(script: Vec<Result<Vec<LlmEvent>, String>>) -> Self {
+            Self {
+                script,
+                calls: 0,
+                seen: Arc::default(),
+            }
+        }
+    }
+
+    impl LlmPort for ScriptLlm {
+        fn send(&mut self, _req: &LlmRequest) -> Result<LlmResponse, BoxError> {
+            unimplemented!()
+        }
+        fn stream(
+            &mut self,
+            req: &LlmRequest,
+        ) -> Box<dyn Iterator<Item = Result<LlmEvent, BoxError>> + Send> {
+            self.seen.lock().unwrap().push(
+                req.messages
+                    .iter()
+                    .map(|m| {
+                        format!(
+                            "{:?}|{}|{:?}|{:?}",
+                            m.role, m.content, m.tool_calls, m.tool_result
+                        )
+                    })
+                    .collect(),
+            );
+            let next = self
+                .script
+                .get(self.calls)
+                .cloned()
+                .unwrap_or_else(|| Ok(vec![LlmEvent::Finish(no_usage(LlmFinishReason::Stop))]));
+            self.calls += 1;
+            match next {
+                Ok(events) => Box::new(events.into_iter().map(Ok)),
+                Err(e) => Box::new(std::iter::once(Err(e.into()))),
+            }
+        }
+    }
+
+    fn no_usage(reason: LlmFinishReason) -> LlmFinish {
+        LlmFinish {
+            reason,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            cost_usd: None,
+        }
+    }
+
+    fn read_turn(id: &str, path: &str) -> Result<Vec<LlmEvent>, String> {
+        Ok(vec![
+            LlmEvent::ToolCallStart {
+                id: id.into(),
+                name: "read".into(),
+            },
+            LlmEvent::ToolCallArgs {
+                id: id.into(),
+                arguments: format!(r#"{{"path":"{path}"}}"#),
+            },
+            LlmEvent::Finish(no_usage(LlmFinishReason::ToolUse)),
+        ])
+    }
+
+    /// `steps` reads of distinct files, each result ~`words` words, then stop.
+    fn long_session(
+        script_extra: Vec<Result<Vec<LlmEvent>, String>>,
+        steps: usize,
+        words: usize,
+        window: u64,
+    ) -> (
+        App,
+        FakeTelemetry,
+        Arc<Mutex<Vec<Vec<String>>>>,
+        FakeSessions,
+    ) {
+        let mut script: Vec<Result<Vec<LlmEvent>, String>> = (0..steps)
+            .map(|i| read_turn(&format!("c{i}"), &format!("f{i}.rs")))
+            .collect();
+        script.extend(script_extra);
+        let llm = ScriptLlm::new(script);
+        let seen = llm.seen.clone();
+        let telemetry = FakeTelemetry::default();
+        let sessions = FakeSessions::default();
+        let app = App::new(
+            Box::new(llm),
+            Box::new(FakeTools {
+                calls: RecordedCalls::default(),
+                response: "word ".repeat(words),
+                subject: None,
+            }),
+            Box::new(sessions.clone()),
+            Box::new(telemetry.clone()),
+            Box::new(NullLogger),
+        )
+        .with_context_window(domain::WindowTable::with_overrides(vec![
+            domain::WindowEntry::new("fake-model", window),
+        ]));
+        (app, telemetry, seen, sessions)
+    }
+
+    fn long_request() -> ExecutionRequest {
+        let mut req = ExecutionRequest::new("read everything");
+        req.max_turns = 200;
+        req.max_tool_output_chars = 1_000_000;
+        req
+    }
+
+    #[test]
+    fn a_long_run_is_compacted_before_it_outgrows_the_window() {
+        // 40 reads of ~1.2k tokens against a 30k window: without compaction
+        // the transcript would reach ~48k.
+        let (mut app, telemetry, seen, _) = long_session(vec![], 40, 1_000, 30_000);
+        let result = app.execute(&ctx(), long_request()).unwrap();
+        assert!(result.compactions >= 1, "{result:?}");
+        assert!(kinds(&telemetry).contains(&"context_compacted".to_string()));
+        assert!(kinds(&telemetry).contains(&"cache_reset".to_string()));
+        // No request ever carried a transcript past the window.
+        let largest = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|msgs| msgs.iter().map(|m| domain::estimate_tokens(m)).sum::<u64>())
+            .max()
+            .unwrap();
+        assert!(largest < 30_000, "largest request ~{largest} tokens");
+    }
+
+    #[test]
+    fn compaction_can_be_turned_off() {
+        let (mut app, telemetry, _, _) = long_session(vec![], 40, 1_000, 30_000);
+        app.set_context_config(ContextConfig {
+            enabled: false,
+            ..ContextConfig::default()
+        });
+        let result = app.execute(&ctx(), long_request()).unwrap();
+        assert_eq!(result.compactions, 0);
+        assert!(!kinds(&telemetry).contains(&"context_compacted".to_string()));
+    }
+
+    /// FR-CTX-05: history bytes change only at a compaction — between two,
+    /// each request's messages are a prefix of the next one's, which is what
+    /// keeps the prompt cache warm.
+    #[test]
+    fn earlier_messages_never_change_between_compactions() {
+        let (mut app, _, seen, _) = long_session(vec![], 12, 50, 1_000_000);
+        app.execute(&ctx(), long_request()).unwrap();
+        let requests = seen.lock().unwrap().clone();
+        for pair in requests.windows(2) {
+            assert_eq!(&pair[1][..pair[0].len()], pair[0].as_slice());
+        }
+    }
+
+    #[test]
+    fn a_context_length_rejection_compacts_and_retries_the_step_once() {
+        let rejection = "openrouter request failed (400): This endpoint's maximum context \
+                         length is 20000 tokens. However, you requested about 31000 tokens";
+        // 15 big reads fit the (unknown to the table) real window only after
+        // compaction; the provider refuses once, then accepts.
+        let (mut app, telemetry, seen, _) =
+            long_session(vec![Err(rejection.into())], 15, 1_000, 10_000_000);
+        let result = app.execute(&ctx(), long_request()).unwrap();
+        assert!(result.compactions >= 1, "{result:?}");
+        assert!(kinds(&telemetry).contains(&"context_compacted".to_string()));
+        let requests = seen.lock().unwrap();
+        let refused = &requests[15];
+        let retried = &requests[16];
+        assert!(retried.len() <= refused.len());
+        assert_ne!(retried, refused, "the retry sent a compacted transcript");
+    }
+
+    #[test]
+    fn a_second_rejection_in_the_same_step_is_reported() {
+        let rejection =
+            "anthropic request failed (400): prompt is too long: 250000 tokens > 200000 maximum";
+        let (mut app, _, _, _) = long_session(
+            vec![Err(rejection.into()), Err(rejection.into())],
+            15,
+            1_000,
+            10_000_000,
+        );
+        let err = app.execute(&ctx(), long_request()).unwrap_err();
+        assert!(
+            matches!(err, AppError::Llm(ref m) if m.contains("prompt is too long")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_unrelated_provider_error_is_not_retried() {
+        let (mut app, _, seen, _) =
+            long_session(vec![Err("401 invalid api key".into())], 2, 10, 1_000_000);
+        assert!(app.execute(&ctx(), long_request()).is_err());
+        assert_eq!(seen.lock().unwrap().len(), 3, "no retry");
+    }
+
+    /// FR-CTX-07/08/11: when elision cannot reach the target, older steps
+    /// are summarised — through the compaction client when one is set — and
+    /// the compaction is recorded on the session.
+    #[test]
+    fn tier3_runs_through_the_compaction_client_and_is_recorded() {
+        // Tool results under the elision threshold force Tier 3.
+        let (mut app, telemetry, _, sessions) = long_session(vec![], 60, 300, 20_000);
+        app.set_context_config(ContextConfig {
+            elide_over_tokens: u32::MAX,
+            ..ContextConfig::default()
+        });
+        let summariser = ScriptLlm::new(vec![Ok(vec![
+            LlmEvent::Delta("## Goal\n- read the files".into()),
+            LlmEvent::Finish(LlmFinish {
+                reason: LlmFinishReason::Stop,
+                input_tokens: 4_000,
+                output_tokens: 200,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                cost_usd: None,
+            }),
+        ])]);
+        let summariser_calls = summariser.seen.clone();
+        app.set_compaction_llm(Box::new(summariser));
+        let result = app.execute(&ctx(), long_request()).unwrap();
+        assert!(result.compactions >= 1);
+        assert_eq!(
+            summariser_calls.lock().unwrap().len(),
+            1,
+            "one summary call"
+        );
+        assert!(result.input_tokens >= 4_000, "the summary call is billed");
+        let session = sessions.load(&result.session_id).unwrap();
+        assert!(
+            session.compactions.iter().any(|c| c.tier == 3),
+            "{:?}",
+            session.compactions
+        );
+        let summary = session
+            .messages
+            .iter()
+            .find(|m| m.meta.kind == domain::MessageKind::Summary)
+            .expect("a summary message");
+        assert!(summary.content.contains("## Goal"));
+        assert!(summary
+            .content
+            .contains("## Files touched (from the tool ledger)"));
+        assert!(kinds(&telemetry).contains(&"llm_finish".to_string()));
+    }
+
+    #[test]
+    fn a_manual_compaction_runs_every_tier_with_the_focus() {
+        // A small session far below any trigger: automatic compaction
+        // would leave it alone; /compact does not.
+        let (mut app, telemetry, _, sessions) = long_session(vec![], 12, 50, 1_000_000);
+        let result = app.execute(&ctx(), long_request()).unwrap();
+        assert_eq!(result.compactions, 0);
+        let summariser = ScriptLlm::new(vec![Ok(vec![
+            LlmEvent::Delta("## Goal\n- read".into()),
+            LlmEvent::Finish(no_usage(LlmFinishReason::Stop)),
+        ])]);
+        let asked = summariser.seen.clone();
+        app.set_compaction_llm(Box::new(summariser));
+        let record = app
+            .compact_session(&result.session_id, Some("the parser bug"))
+            .unwrap()
+            .expect("compacted");
+        assert_eq!(record.tier, 3);
+        assert!(record.tokens_after < record.tokens_before);
+        let prompt = asked.lock().unwrap()[0].join("\n");
+        assert!(prompt.contains("Pay special attention to: the parser bug"));
+        let session = sessions.load(&result.session_id).unwrap();
+        assert_eq!(session.compactions.len(), 1);
+        assert!(session
+            .messages
+            .iter()
+            .any(|m| m.meta.kind == domain::MessageKind::Summary));
+        assert!(kinds(&telemetry).contains(&"context_compacted".to_string()));
+        assert!(app.compact_session("no-such-session", None).is_err());
+    }
+
+    #[test]
+    fn tool_budgets_match_by_name_then_prefix_under_a_ceiling() {
+        let b = ToolBudgets::default()
+            .with_overrides(&[("shell".into(), 100), ("mcp__db__".into(), 50)]);
+        assert_eq!(b.tokens_for("shell"), 100);
+        assert_eq!(b.tokens_for("lsp__hover"), 2_000);
+        assert_eq!(b.tokens_for("mcp__db__query"), 50, "longest prefix wins");
+        assert_eq!(b.tokens_for("mcp__other__x"), 6_000);
+        assert_eq!(b.tokens_for("zcode_skill"), 6_000, "the default");
+        assert_eq!(b.chars_for("shell", 0), 360);
+        assert_eq!(
+            b.chars_for("read", 1_000),
+            1_000,
+            "the global cap is a ceiling"
+        );
+    }
+
+    #[test]
+    fn a_tools_budget_caps_its_output() {
+        let mut h = harness(
+            vec![
+                tool_use_turn("c1", "shell", "{}"),
+                vec![LlmEvent::Finish(finish(LlmFinishReason::Stop))],
+            ],
+            &"line of shell output\n".repeat(5_000),
+        );
+        h.app
+            .set_tool_budgets(ToolBudgets::default().with_overrides(&[("shell".into(), 100)]));
+        let mut req = ExecutionRequest::new("go");
+        req.max_tool_output_chars = 1_000_000;
+        let result = h.app.execute(&ctx(), req).unwrap();
+        let session = h.sessions.load(&result.session_id).unwrap();
+        let msg = session
+            .messages
+            .iter()
+            .find(|m| m.role == LlmRole::Tool)
+            .unwrap();
+        assert!(msg.tool_result.as_ref().unwrap().content.chars().count() < 600);
+    }
+
+    #[derive(Clone, Default)]
+    struct Resets(Arc<Mutex<Vec<String>>>);
+    impl Emitter for Resets {
+        fn emit(&mut self, ev: UiEvent) {
+            if let UiEvent::CacheReset { reason } = ev {
+                self.0.lock().unwrap().push(reason);
+            }
+        }
+    }
+
+    #[test]
+    fn a_mode_change_or_model_switch_on_a_resumed_session_reports_a_cache_reset() {
+        let mut h = harness(vec![], "ok");
+        let resets = Resets::default();
+        h.app.set_emitter(Box::new(resets.clone()));
+        let first = h.app.execute(&ctx(), ExecutionRequest::new("hi")).unwrap();
+        assert!(
+            resets.0.lock().unwrap().is_empty(),
+            "a new session resets nothing"
+        );
+
+        let mut again = ExecutionRequest::new("more");
+        again.session_id = Some(first.session_id.clone());
+        again.mode = AgentMode::Planning;
+        h.app.execute(&ctx(), again.clone()).unwrap();
+        assert_eq!(
+            resets.0.lock().unwrap().as_slice(),
+            ["mode changed to planning"]
+        );
+
+        h.app.set_llm(Box::new(FakeLlm::new(vec![])));
+        h.app.execute(&ctx(), again).unwrap();
+        assert_eq!(
+            resets.0.lock().unwrap().last().unwrap(),
+            "provider or model switched"
+        );
+    }
+
+    #[test]
+    fn the_context_breakdown_names_its_parts_and_largest_results() {
+        let (mut app, _, _, _) = long_session(vec![], 6, 300, 1_000_000);
+        let result = app.execute(&ctx(), long_request()).unwrap();
+        let b = app.context_breakdown(&result.session_id).unwrap();
+        assert!(b.system > 0 && b.tool_schemas > 0 && b.conversation > 0);
+        assert!(b.tool_results > b.conversation, "{b:?}");
+        assert_eq!(b.largest.len(), 5);
+        assert!(b.largest[0].0.starts_with("read"), "{:?}", b.largest);
+        assert_eq!(b.window, Some(1_000_000));
+        assert_eq!(
+            b.total(),
+            b.system + b.tool_schemas + b.summaries + b.conversation + b.tool_results
+        );
+    }
+
+    #[test]
+    fn step_numbers_continue_across_runs_of_one_session() {
+        let (mut app, _, _, sessions) = long_session(vec![], 2, 10, 1_000_000);
+        let first = app.execute(&ctx(), long_request()).unwrap();
+        let mut again = long_request();
+        again.session_id = Some(first.session_id.clone());
+        app.execute(&ctx(), again).unwrap();
+        let session = sessions.load(&first.session_id).unwrap();
+        let steps: Vec<u32> = session
+            .messages
+            .iter()
+            .filter(|m| m.role == LlmRole::Assistant)
+            .map(|m| m.meta.step)
+            .collect();
+        let mut sorted = steps.clone();
+        sorted.dedup();
+        assert_eq!(
+            steps.len(),
+            sorted.len(),
+            "no step number repeats: {steps:?}"
+        );
     }
 
     #[test]
@@ -1493,7 +3070,8 @@ mod tests {
                     reason: LlmFinishReason::Stop,
                     input_tokens: 0,
                     output_tokens: 0,
-                    cache_tokens: 0,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
                     cost_usd: None,
                 }),
             ]],

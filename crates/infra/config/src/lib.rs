@@ -430,6 +430,13 @@ pub struct Config {
     pub lsp_defaults: bool,
     /// Token-optimised shell output via rtk.
     pub rtk: RtkConfig,
+    pub context: ContextConfig,
+    pub search: SearchConfig,
+    pub index: IndexConfig,
+    pub read: ReadConfig,
+    pub edit: EditConfig,
+    pub lsp_tuning: LspTuning,
+    pub cache: CacheConfig,
 }
 
 /// How zcode uses [rtk](https://github.com/rtk-ai/rtk), if at all.
@@ -444,6 +451,221 @@ pub struct RtkConfig {
     pub auto_install: bool,
     /// An explicit binary, for a machine where rtk is not on `PATH`.
     pub path: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Context efficiency (PRD-CTX-EFF-003 §7)
+// ---------------------------------------------------------------------------
+
+/// `[context]`: compaction, discovery filtering and output budgets.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContextConfig {
+    /// Automatic compaction (FR-CTX-01). Reactive compaction after a
+    /// provider's context-length rejection stays on unless `--no-compact`.
+    pub compaction: bool,
+    /// Compact when the live context reaches this share of the window.
+    pub compact_at: f64,
+    /// …down to this share (hysteresis, FR-CTX-02).
+    pub compact_target: f64,
+    /// Trigger for a model whose window is unknown.
+    pub compact_at_tokens: u64,
+    /// The most recent steps compaction never touches (FR-CTX-03).
+    pub keep_recent_steps: u32,
+    /// Cap on a Tier 3 session summary (FR-CTX-07).
+    pub summary_max_tokens: u32,
+    /// `<provider>/<model>` for the summariser; empty = the session's model.
+    pub compaction_model: String,
+    /// Discovery excludes added to the built-ins (FR-FILTER-01). Accumulate
+    /// across layers, like `shell_denied`.
+    pub exclude: Vec<String>,
+    /// Globs that re-admit excluded paths. Accumulate across layers.
+    pub include: Vec<String>,
+    /// Spill files older than this are pruned (FR-READ-07).
+    pub spill_ttl_days: u32,
+    /// Per-tool output budgets in tokens (FR-READ-06): canonical tool names
+    /// or `mcp__`/`lsp__` prefixes. Merged per key across layers.
+    pub tool_budgets: Vec<(String, u32)>,
+    /// Compact and retry once when a provider rejects the prompt as too
+    /// long (FR-CTX-10). Not a file setting: only `--no-compact` turns it
+    /// off, together with `compaction` (FR-CTX-12).
+    pub reactive: bool,
+}
+
+impl Default for ContextConfig {
+    fn default() -> Self {
+        Self {
+            compaction: true,
+            compact_at: 0.75,
+            compact_target: 0.45,
+            compact_at_tokens: 96_000,
+            keep_recent_steps: 6,
+            summary_max_tokens: 2_000,
+            compaction_model: String::new(),
+            exclude: Vec::new(),
+            include: Vec::new(),
+            spill_ttl_days: 7,
+            tool_budgets: Vec::new(),
+            reactive: true,
+        }
+    }
+}
+
+/// `[search]` (FR-SEARCH-07/08).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchConfig {
+    /// Files larger than this are skipped by `grep` and counted.
+    pub max_file_bytes: u64,
+    pub timeout_ms: u64,
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self {
+            max_file_bytes: 2_000_000,
+            timeout_ms: 10_000,
+        }
+    }
+}
+
+/// `[index]` (FR-INDEX-*).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexConfig {
+    pub enabled: bool,
+    /// Token budget for the repo map; 0 disables it (FR-INDEX-08).
+    pub repo_map_tokens: u32,
+    /// Files larger than this are not parsed (FR-INDEX-11).
+    pub max_file_bytes: u64,
+}
+
+impl Default for IndexConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            repo_map_tokens: 1_024,
+            max_file_bytes: 1_000_000,
+        }
+    }
+}
+
+/// `[read]` (FR-READ-01/02).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadConfig {
+    /// Lines returned by a `read` that names no range.
+    pub default_limit: u32,
+}
+
+impl Default for ReadConfig {
+    fn default() -> Self {
+        Self { default_limit: 400 }
+    }
+}
+
+/// What `edit_symbol` does when an edit adds syntax errors (FR-EDIT-04).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SyntaxCheck {
+    #[default]
+    Reject,
+    Warn,
+    Off,
+}
+
+impl std::str::FromStr for SyntaxCheck {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "reject" => Ok(Self::Reject),
+            "warn" => Ok(Self::Warn),
+            "off" => Ok(Self::Off),
+            other => Err(format!("`{other}` (expected reject, warn or off)")),
+        }
+    }
+}
+
+/// `[edit]`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct EditConfig {
+    pub syntax_check: SyntaxCheck,
+}
+
+/// Language-server pool tuning (FR-LSP-08/10), from `[lsp]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LspTuning {
+    pub max_servers: u32,
+    pub idle_shutdown_s: u64,
+    pub diagnostics_on_edit: bool,
+}
+
+impl Default for LspTuning {
+    fn default() -> Self {
+        Self {
+            max_servers: 3,
+            idle_shutdown_s: 600,
+            diagnostics_on_edit: true,
+        }
+    }
+}
+
+/// Prompt-cache TTL policy (FR-CACHE-07).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CacheTtlSetting {
+    FiveMinutes,
+    OneHour,
+    /// One hour on the stable head in the TUI, five minutes elsewhere.
+    #[default]
+    Auto,
+}
+
+impl std::str::FromStr for CacheTtlSetting {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "5m" => Ok(Self::FiveMinutes),
+            "1h" => Ok(Self::OneHour),
+            "auto" => Ok(Self::Auto),
+            other => Err(format!("`{other}` (expected 5m, 1h or auto)")),
+        }
+    }
+}
+
+/// Whether OpenAI-shaped requests carry cache markers (FR-CACHE-03).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CacheMarkerSetting {
+    #[default]
+    Auto,
+    On,
+    Off,
+}
+
+impl std::str::FromStr for CacheMarkerSetting {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "on" | "true" => Ok(Self::On),
+            "off" | "false" => Ok(Self::Off),
+            other => Err(format!("`{other}` (expected auto, on or off)")),
+        }
+    }
+}
+
+/// `[cache]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheConfig {
+    pub ttl: CacheTtlSetting,
+    pub markers: CacheMarkerSetting,
+    /// Ollama `keep_alive`, so the model and its KV cache stay loaded
+    /// between steps (FR-CACHE-10).
+    pub ollama_keep_alive: String,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            ttl: CacheTtlSetting::Auto,
+            markers: CacheMarkerSetting::Auto,
+            ollama_keep_alive: "30m".into(),
+        }
+    }
 }
 
 impl Default for RtkConfig {
@@ -489,6 +711,13 @@ impl Default for Config {
             context_window: Vec::new(),
             lsp_defaults: true,
             rtk: RtkConfig::default(),
+            context: ContextConfig::default(),
+            search: SearchConfig::default(),
+            index: IndexConfig::default(),
+            read: ReadConfig::default(),
+            edit: EditConfig::default(),
+            lsp_tuning: LspTuning::default(),
+            cache: CacheConfig::default(),
         }
     }
 }
@@ -691,27 +920,13 @@ impl Config {
                 }
             }
         }
-        // Only one server runs per session. When we can tell what the project
-        // is, run *only* a server for that language: a Go repo on a machine
-        // that also has rust-analyzer installed would otherwise start
-        // rust-analyzer, which costs a process and answers nothing. An
-        // explicitly configured server is always kept — the user asked for it.
-        let explicit: Vec<String> = self
-            .lsp_servers
-            .iter()
-            .map(|s| s.language.clone())
-            .collect();
-        match detect_project_language(&self.working_dir) {
-            Some(detected) => {
-                servers.retain(|s| {
-                    canonical_language(&s.language) == detected || explicit.contains(&s.language)
-                });
-                servers.sort_by_key(|s| canonical_language(&s.language) != detected);
-            }
-            // Nothing identifies this directory as a project of any language.
-            // Starting rust-analyzer on the off-chance costs a process and a
-            // startup failure, and can answer nothing.
-            None => servers.retain(|s| explicit.contains(&s.language)),
+        // Servers start lazily, one per language, only when a request names
+        // a file of that language (FR-LSP-10) — so keeping every installed
+        // default costs nothing until it is used, and a monorepo gets a
+        // server for each of its languages. The detected language only goes
+        // first.
+        if let Some(detected) = detect_project_language(&self.working_dir) {
+            servers.sort_by_key(|s| canonical_language(&s.language) != detected);
         }
         servers
     }
@@ -816,6 +1031,9 @@ pub enum ConfigError {
     MissingSecret(String),
     #[error("invalid agent mode: {0}")]
     InvalidMode(String),
+    /// A setting whose value cannot work; names the key.
+    #[error("invalid `{key}`: {reason}")]
+    InvalidSetting { key: String, reason: String },
     #[error(
         "a `providers` entry has neither `name` nor `kind` — one of them must \
          say which provider it is"
@@ -893,6 +1111,65 @@ struct ConfigFile {
     context_window: Option<Vec<ContextWindowEntryFile>>,
     #[serde(default)]
     rtk: RtkSection,
+    #[serde(default)]
+    context: ContextSection,
+    #[serde(default)]
+    search: SearchSection,
+    #[serde(default)]
+    index: IndexSection,
+    #[serde(default)]
+    read: ReadSection,
+    #[serde(default)]
+    edit: EditSection,
+    #[serde(default)]
+    cache: CacheSection,
+}
+
+/// Serde mirror of [`ContextConfig`]; every field optional so a layer names
+/// only what it changes.
+#[derive(Debug, Default, Deserialize)]
+struct ContextSection {
+    compaction: Option<bool>,
+    compact_at: Option<f64>,
+    compact_target: Option<f64>,
+    compact_at_tokens: Option<u64>,
+    keep_recent_steps: Option<u32>,
+    summary_max_tokens: Option<u32>,
+    compaction_model: Option<String>,
+    exclude: Option<Vec<String>>,
+    include: Option<Vec<String>>,
+    spill_ttl_days: Option<u32>,
+    tool_budgets: Option<std::collections::BTreeMap<String, u32>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SearchSection {
+    max_file_bytes: Option<u64>,
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct IndexSection {
+    enabled: Option<bool>,
+    repo_map_tokens: Option<u32>,
+    max_file_bytes: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ReadSection {
+    default_limit: Option<u32>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct EditSection {
+    syntax_check: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct CacheSection {
+    ttl: Option<String>,
+    markers: Option<String>,
+    ollama_keep_alive: Option<String>,
 }
 
 /// Serde mirror of [`RtkConfig`]. Every field is optional so `[rtk]` can name
@@ -1029,6 +1306,12 @@ struct LspSection {
     /// Set false to opt out of the built-in language-server defaults.
     #[serde(default = "default_true")]
     defaults: bool,
+    #[serde(default)]
+    max_servers: Option<u32>,
+    #[serde(default)]
+    idle_shutdown_s: Option<u64>,
+    #[serde(default)]
+    diagnostics_on_edit: Option<bool>,
 }
 
 impl Default for LspSection {
@@ -1036,11 +1319,194 @@ impl Default for LspSection {
         Self {
             servers: Vec::new(),
             defaults: true,
+            max_servers: None,
+            idle_shutdown_s: None,
+            diagnostics_on_edit: None,
         }
     }
 }
 
 /// The spellings of yes and no people actually type in an env var.
+/// Fold one file layer's PRD-CTX-EFF-003 sections into `config`.
+fn merge_efficiency_sections(config: &mut Config, file: &ConfigFile) -> Result<(), ConfigError> {
+    let c = &file.context;
+    let ctx = &mut config.context;
+    if let Some(v) = c.compaction {
+        ctx.compaction = v;
+    }
+    if let Some(v) = c.compact_at {
+        ctx.compact_at = v;
+    }
+    if let Some(v) = c.compact_target {
+        ctx.compact_target = v;
+    }
+    if let Some(v) = c.compact_at_tokens {
+        ctx.compact_at_tokens = v;
+    }
+    if let Some(v) = c.keep_recent_steps {
+        ctx.keep_recent_steps = v;
+    }
+    if let Some(v) = c.summary_max_tokens {
+        ctx.summary_max_tokens = v;
+    }
+    if let Some(v) = &c.compaction_model {
+        ctx.compaction_model = v.clone();
+    }
+    // Filter rules accumulate: a machine-wide exclude (say, a secrets
+    // directory) must not be droppable by a project file.
+    if let Some(v) = &c.exclude {
+        ctx.exclude.extend(v.iter().cloned());
+    }
+    if let Some(v) = &c.include {
+        ctx.include.extend(v.iter().cloned());
+    }
+    if let Some(v) = c.spill_ttl_days {
+        ctx.spill_ttl_days = v;
+    }
+    if let Some(budgets) = &c.tool_budgets {
+        for (tool, tokens) in budgets {
+            ctx.tool_budgets.retain(|(t, _)| t != tool);
+            ctx.tool_budgets.push((tool.clone(), *tokens));
+        }
+        ctx.tool_budgets.sort();
+    }
+    if let Some(v) = file.search.max_file_bytes {
+        config.search.max_file_bytes = v;
+    }
+    if let Some(v) = file.search.timeout_ms {
+        config.search.timeout_ms = v;
+    }
+    if let Some(v) = file.index.enabled {
+        config.index.enabled = v;
+    }
+    if let Some(v) = file.index.repo_map_tokens {
+        config.index.repo_map_tokens = v;
+    }
+    if let Some(v) = file.index.max_file_bytes {
+        config.index.max_file_bytes = v;
+    }
+    if let Some(v) = file.read.default_limit {
+        config.read.default_limit = v;
+    }
+    if let Some(v) = &file.edit.syntax_check {
+        config.edit.syntax_check = v.parse().map_err(|reason| ConfigError::InvalidSetting {
+            key: "edit.syntax_check".into(),
+            reason,
+        })?;
+    }
+    if let Some(v) = file.lsp.max_servers {
+        config.lsp_tuning.max_servers = v;
+    }
+    if let Some(v) = file.lsp.idle_shutdown_s {
+        config.lsp_tuning.idle_shutdown_s = v;
+    }
+    if let Some(v) = file.lsp.diagnostics_on_edit {
+        config.lsp_tuning.diagnostics_on_edit = v;
+    }
+    if let Some(v) = &file.cache.ttl {
+        config.cache.ttl = v.parse().map_err(|reason| ConfigError::InvalidSetting {
+            key: "cache.ttl".into(),
+            reason,
+        })?;
+    }
+    if let Some(v) = &file.cache.markers {
+        config.cache.markers = v.parse().map_err(|reason| ConfigError::InvalidSetting {
+            key: "cache.markers".into(),
+            reason,
+        })?;
+    }
+    if let Some(v) = &file.cache.ollama_keep_alive {
+        config.cache.ollama_keep_alive = v.clone();
+    }
+    Ok(())
+}
+
+/// `ZCODE_*` overrides for the PRD-CTX-EFF-003 settings people most need to
+/// flip without editing a file.
+fn apply_efficiency_env(config: &mut Config) -> Result<(), ConfigError> {
+    let bad = |key: &str, raw: &str| ConfigError::InvalidSetting {
+        key: key.into(),
+        reason: format!("cannot parse `{raw}`"),
+    };
+    if let Ok(v) = std::env::var("ZCODE_CONTEXT_COMPACTION") {
+        config.context.compaction =
+            parse_bool(&v).ok_or_else(|| bad("ZCODE_CONTEXT_COMPACTION", &v))?;
+    }
+    if let Ok(v) = std::env::var("ZCODE_CONTEXT_COMPACT_AT") {
+        config.context.compact_at = v
+            .trim()
+            .parse()
+            .map_err(|_| bad("ZCODE_CONTEXT_COMPACT_AT", &v))?;
+    }
+    if let Ok(v) = std::env::var("ZCODE_INDEX_ENABLED") {
+        config.index.enabled = parse_bool(&v).ok_or_else(|| bad("ZCODE_INDEX_ENABLED", &v))?;
+    }
+    if let Ok(v) = std::env::var("ZCODE_CACHE_TTL") {
+        config.cache.ttl = v.parse().map_err(|reason| ConfigError::InvalidSetting {
+            key: "ZCODE_CACHE_TTL".into(),
+            reason,
+        })?;
+    }
+    if let Ok(v) = std::env::var("ZCODE_READ_DEFAULT_LIMIT") {
+        config.read.default_limit = v
+            .trim()
+            .parse()
+            .map_err(|_| bad("ZCODE_READ_DEFAULT_LIMIT", &v))?;
+    }
+    if let Ok(v) = std::env::var("ZCODE_SEARCH_MAX_FILE_BYTES") {
+        config.search.max_file_bytes = v
+            .trim()
+            .parse()
+            .map_err(|_| bad("ZCODE_SEARCH_MAX_FILE_BYTES", &v))?;
+    }
+    Ok(())
+}
+
+/// Reject combinations that cannot work, naming the key, rather than
+/// discovering them mid-session.
+fn validate_efficiency(config: &Config) -> Result<(), ConfigError> {
+    let invalid = |key: &str, reason: String| {
+        Err(ConfigError::InvalidSetting {
+            key: key.into(),
+            reason,
+        })
+    };
+    let c = &config.context;
+    if !(c.compact_at > 0.0 && c.compact_at < 1.0) {
+        return invalid(
+            "context.compact_at",
+            format!("{} is not between 0 and 1", c.compact_at),
+        );
+    }
+    if !(c.compact_target > 0.0 && c.compact_target < c.compact_at) {
+        return invalid(
+            "context.compact_target",
+            format!(
+                "{} must be above 0 and below compact_at ({})",
+                c.compact_target, c.compact_at
+            ),
+        );
+    }
+    if c.keep_recent_steps == 0 {
+        return invalid(
+            "context.keep_recent_steps",
+            "must be at least 1: the latest step is never compacted".into(),
+        );
+    }
+    if config.read.default_limit == 0 {
+        return invalid("read.default_limit", "must be at least 1".into());
+    }
+    for glob in c.exclude.iter().chain(c.include.iter()) {
+        if glob.trim().is_empty() {
+            return invalid(
+                "context.exclude/include",
+                "an empty glob matches nothing".into(),
+            );
+        }
+    }
+    Ok(())
+}
+
 fn parse_bool(raw: &str) -> Option<bool> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Some(true),
@@ -1169,6 +1635,8 @@ impl Loader {
             }
             let content = std::fs::read_to_string(&layer.path)?;
             let file: ConfigFile = Self::parse(&layer.path, &content)?;
+            // Borrowed before the per-field merge below moves fields out.
+            merge_efficiency_sections(&mut config, &file)?;
 
             if let Some(m) = file.model {
                 top_level.model = Some(m);
@@ -1377,6 +1845,8 @@ impl Loader {
                 .parse::<AgentMode>()
                 .map_err(|_| ConfigError::InvalidMode(m.clone()))?;
         }
+        apply_efficiency_env(&mut config)?;
+        validate_efficiency(&config)?;
 
         // People write `~/...` in config files; expand it before anything
         // tries to open the path.
@@ -1513,6 +1983,11 @@ mod tests {
     /// concurrently. Without this the suite is flaky (NFR-REL-01).
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Serialises every test that touches the process environment — the
+    /// ones that *set* `ZCODE_*` variables and, just as much, the ones that
+    /// *read* them through `Loader::load()`. A reader without the guard picks
+    /// up whatever a concurrent writer set (a `ZCODE_PROVIDER=anthropic`
+    /// silently overriding the file under test) and fails intermittently.
     fn env_guard() -> std::sync::MutexGuard<'static, ()> {
         ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -1560,6 +2035,9 @@ name = "anthropic"
 
     #[test]
     fn the_named_provider_is_the_one_selected() {
+        // Reads the ZCODE_* env layer via `load()`, so it must not run
+        // while another test has that environment modified.
+        let _env = env_guard();
         let dir = tempfile::tempdir().unwrap();
         let cfg = Loader::new(&write_config(&dir, MULTI)).load().unwrap();
 
@@ -1576,6 +2054,9 @@ name = "anthropic"
 
     #[test]
     fn switching_provider_takes_the_whole_profile_with_it() {
+        // Reads the ZCODE_* env layer via `load()`, so it must not run
+        // while another test has that environment modified.
+        let _env = env_guard();
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = Loader::new(&write_config(&dir, MULTI)).load().unwrap();
         cfg.select_provider("local").unwrap();
@@ -1592,6 +2073,9 @@ name = "anthropic"
 
     #[test]
     fn a_profile_that_states_nothing_falls_back_to_its_kind() {
+        // Reads the ZCODE_* env layer via `load()`, so it must not run
+        // while another test has that environment modified.
+        let _env = env_guard();
         // `[[providers]] name = "anthropic"` names a kind and nothing else:
         // every field must come from the built-in defaults for Anthropic, not
         // from the profile that happened to be selected before it.
@@ -1607,6 +2091,9 @@ name = "anthropic"
 
     #[test]
     fn a_builtin_kind_is_selectable_without_a_profile() {
+        // Reads the ZCODE_* env layer via `load()`, so it must not run
+        // while another test has that environment modified.
+        let _env = env_guard();
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = Loader::new(&write_config(&dir, MULTI)).load().unwrap();
         cfg.select_provider("deepseek").unwrap();
@@ -1618,6 +2105,9 @@ name = "anthropic"
 
     #[test]
     fn meridian_is_selectable_without_a_profile_and_needs_no_key() {
+        // Reads the ZCODE_* env layer via `load()`, so it must not run
+        // while another test has that environment modified.
+        let _env = env_guard();
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = Loader::new(&write_config(&dir, MULTI)).load().unwrap();
         cfg.select_provider("meridian").unwrap();
@@ -1634,6 +2124,9 @@ name = "anthropic"
 
     #[test]
     fn a_profile_may_give_a_builtin_provider_its_own_url() {
+        // Reads the ZCODE_* env layer via `load()`, so it must not run
+        // while another test has that environment modified.
+        let _env = env_guard();
         // The short form: one entry, named after the kind it overrides. This
         // is the "let me point OpenRouter somewhere else" case.
         let dir = tempfile::tempdir().unwrap();
@@ -1663,6 +2156,9 @@ base_url = "https://gateway.internal/v1/chat/completions"
 
     #[test]
     fn two_profiles_may_share_one_kind() {
+        // Reads the ZCODE_* env layer via `load()`, so it must not run
+        // while another test has that environment modified.
+        let _env = env_guard();
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = Loader::new(&write_config(
             &dir,
@@ -1691,6 +2187,9 @@ model = "poolside/laguna-s-2.1:free"
 
     #[test]
     fn a_declared_profile_is_complete_in_itself() {
+        // Reads the ZCODE_* env layer via `load()`, so it must not run
+        // while another test has that environment modified.
+        let _env = env_guard();
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = Loader::new(&write_config(
             &dir,
@@ -1727,6 +2226,9 @@ base_url = "https://gateway.internal/v1/chat/completions"
 
     #[test]
     fn top_level_settings_still_serve_a_bare_kind() {
+        // Reads the ZCODE_* env layer via `load()`, so it must not run
+        // while another test has that environment modified.
+        let _env = env_guard();
         // The single-provider form, which is every config written before
         // `providers` existed — and still what `--provider ollama` gets when
         // no profile is declared for it.
@@ -1761,6 +2263,9 @@ kind = "ollama"
 
     #[test]
     fn an_unknown_provider_name_says_what_is_available() {
+        // Reads the ZCODE_* env layer via `load()`, so it must not run
+        // while another test has that environment modified.
+        let _env = env_guard();
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = Loader::new(&write_config(&dir, MULTI)).load().unwrap();
         let err = cfg.select_provider("nope").unwrap_err();
@@ -1772,6 +2277,9 @@ kind = "ollama"
 
     #[test]
     fn selecting_a_provider_that_no_layer_declares_is_an_error() {
+        // Reads the ZCODE_* env layer via `load()`, so it must not run
+        // while another test has that environment modified.
+        let _env = env_guard();
         let dir = tempfile::tempdir().unwrap();
         let path = write_config(&dir, r#"provider = "made-up""#);
         let err = Loader::new(&path).load().unwrap_err();
@@ -1786,6 +2294,9 @@ kind = "ollama"
 
     #[test]
     fn a_top_level_key_written_under_a_provider_table_is_reported() {
+        // Reads the ZCODE_* env layer via `load()`, so it must not run
+        // while another test has that environment modified.
+        let _env = env_guard();
         // The TOML footgun: everything after `[[providers]]` belongs to that
         // entry. Silently ignoring it means the setting appears to be there
         // and does nothing, which is the worst of both.
@@ -1817,6 +2328,9 @@ kind = "ollama"
 
     #[test]
     fn one_unusable_entry_does_not_take_the_whole_config_with_it() {
+        // Reads the ZCODE_* env layer via `load()`, so it must not run
+        // while another test has that environment modified.
+        let _env = env_guard();
         // The reported breakage: a single mistyped `kind` stopped the config
         // loading at all, so `zcode config` — the command you use to find the
         // mistake — failed too, and every other provider went with it.
@@ -1855,6 +2369,9 @@ kind = "not-a-provider"
 
     #[test]
     fn selecting_an_unusable_entry_says_what_is_wrong_with_it() {
+        // Reads the ZCODE_* env layer via `load()`, so it must not run
+        // while another test has that environment modified.
+        let _env = env_guard();
         // "unknown provider `typo`" would be a lie: it is known, and broken.
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = Loader::new(&write_config(
@@ -1879,6 +2396,9 @@ kind = "not-a-provider"
 
     #[test]
     fn a_later_layer_can_repair_a_broken_entry() {
+        // Reads the ZCODE_* env layer via `load()`, so it must not run
+        // while another test has that environment modified.
+        let _env = env_guard();
         // A machine-wide typo must be fixable from the project file, not just
         // reported at it.
         let dir = tempfile::tempdir().unwrap();
@@ -1902,6 +2422,9 @@ kind = "not-a-provider"
 
     #[test]
     fn a_provider_entry_must_say_what_it_is() {
+        // Reads the ZCODE_* env layer via `load()`, so it must not run
+        // while another test has that environment modified.
+        let _env = env_guard();
         // Neither `name` nor `kind`, so it cannot say what it talks to. Like
         // any other unusable entry it is recorded and skipped rather than
         // taking the config down — it is not the one selected.
@@ -1919,6 +2442,9 @@ kind = "not-a-provider"
 
     #[test]
     fn with_provider_leaves_the_original_alone() {
+        // Reads the ZCODE_* env layer via `load()`, so it must not run
+        // while another test has that environment modified.
+        let _env = env_guard();
         // The TUI builds a second client from this without disturbing the one
         // already running.
         let dir = tempfile::tempdir().unwrap();
@@ -1934,6 +2460,9 @@ kind = "not-a-provider"
 
     #[test]
     fn a_model_id_with_no_slash_stays_on_the_selected_provider() {
+        // Reads the ZCODE_* env layer via `load()`, so it must not run
+        // while another test has that environment modified.
+        let _env = env_guard();
         // The one shorthand: "same endpoint, different model".
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = Loader::new(&write_config(&dir, MULTI)).load().unwrap();
@@ -1946,6 +2475,9 @@ kind = "not-a-provider"
 
     #[test]
     fn the_split_is_at_the_first_slash_and_the_rest_is_the_id() {
+        // Reads the ZCODE_* env layer via `load()`, so it must not run
+        // while another test has that environment modified.
+        let _env = env_guard();
         // `openrouter/z-ai/glm-4.6` is the provider `openrouter` and the model
         // `z-ai/glm-4.6` — the id keeps every slash after the first.
         let dir = tempfile::tempdir().unwrap();
@@ -1959,6 +2491,9 @@ kind = "not-a-provider"
 
     #[test]
     fn a_provider_prefix_brings_the_whole_profile_with_it() {
+        // Reads the ZCODE_* env layer via `load()`, so it must not run
+        // while another test has that environment modified.
+        let _env = env_guard();
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = Loader::new(&write_config(&dir, MULTI)).load().unwrap();
         cfg.select_model("local/qwen2.5-coder").unwrap();
@@ -1978,6 +2513,9 @@ kind = "not-a-provider"
 
     #[test]
     fn a_builtin_kind_needs_no_profile_to_be_a_prefix() {
+        // Reads the ZCODE_* env layer via `load()`, so it must not run
+        // while another test has that environment modified.
+        let _env = env_guard();
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = Loader::new(&write_config(&dir, MULTI)).load().unwrap();
         cfg.select_model("deepseek/deepseek-reasoner").unwrap();
@@ -1988,6 +2526,9 @@ kind = "not-a-provider"
 
     #[test]
     fn a_named_profile_shadows_the_builtin_of_the_same_name() {
+        // Reads the ZCODE_* env layer via `load()`, so it must not run
+        // while another test has that environment modified.
+        let _env = env_guard();
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = Loader::new(&write_config(&dir, MULTI)).load().unwrap();
         cfg.select_model("anthropic/claude-haiku-4-5").unwrap();
@@ -2001,6 +2542,9 @@ kind = "not-a-provider"
     /// meaning of an argument would depend on what the config declares.
     #[test]
     fn a_leading_segment_that_names_no_provider_is_refused() {
+        // Reads the ZCODE_* env layer via `load()`, so it must not run
+        // while another test has that environment modified.
+        let _env = env_guard();
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = Loader::new(&write_config(&dir, MULTI)).load().unwrap();
         let before = cfg.model.clone();
@@ -2046,6 +2590,9 @@ kind = "not-a-provider"
 
     #[test]
     fn a_prefix_naming_a_broken_profile_reports_why() {
+        // Reads the ZCODE_* env layer via `load()`, so it must not run
+        // while another test has that environment modified.
+        let _env = env_guard();
         // Reading it as "unknown provider" would send the user hunting for a
         // typo in a name that is right there in their config.
         let dir = tempfile::tempdir().unwrap();
@@ -2071,6 +2618,9 @@ kind = "not-a-provider"
 
     #[test]
     fn the_rtk_section_overrides_only_what_it_names() {
+        // Reads the ZCODE_* env layer via `load()`, so it must not run
+        // while another test has that environment modified.
+        let _env = env_guard();
         let dir = tempfile::tempdir().unwrap();
         let cfg = Loader::new(&write_config(&dir, "[rtk]\nauto_install = false\n"))
             .load()
@@ -2081,6 +2631,9 @@ kind = "not-a-provider"
 
     #[test]
     fn rtk_can_be_turned_off_entirely() {
+        // Reads the ZCODE_* env layer via `load()`, so it must not run
+        // while another test has that environment modified.
+        let _env = env_guard();
         let dir = tempfile::tempdir().unwrap();
         let cfg = Loader::new(&write_config(&dir, "[rtk]\nenabled = false\n"))
             .load()
@@ -2593,21 +3146,19 @@ model = "gpt-3.5-turbo"
     }
 
     #[test]
-    fn a_default_for_another_language_is_not_started() {
-        // Regression: a Go project on a machine with rust-analyzer installed
-        // started rust-analyzer, which can answer nothing about Go.
+    fn the_projects_own_language_goes_first() {
+        // Servers start lazily (FR-LSP-10), so every installed default is
+        // kept — a Go service beside a TS frontend needs both — but the
+        // detected language is preferred.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("go.mod"), "module x").unwrap();
         let cfg = Config {
             working_dir: dir.path().to_path_buf(),
             ..Config::default()
         };
-        for server in cfg.effective_lsp_servers() {
-            assert_eq!(
-                canonical_language(&server.language),
-                "go",
-                "started a server for the wrong language"
-            );
+        let servers = cfg.effective_lsp_servers();
+        if let Some(go) = servers.iter().position(|s| s.language == "go") {
+            assert_eq!(go, 0, "{servers:?}");
         }
     }
 
@@ -2634,15 +3185,17 @@ model = "gpt-3.5-turbo"
     }
 
     #[test]
-    fn no_project_marker_starts_no_default_server() {
-        // A bare directory is not a Rust project just because rust-analyzer
-        // happens to be installed; trying it only produces a startup warning.
+    fn only_installed_defaults_are_offered() {
+        // Nothing starts until used, but a server whose binary is missing
+        // would only ever fail, so it is not offered.
         let dir = tempfile::tempdir().unwrap();
         let cfg = Config {
             working_dir: dir.path().to_path_buf(),
             ..Config::default()
         };
-        assert!(cfg.effective_lsp_servers().is_empty());
+        for server in cfg.effective_lsp_servers() {
+            assert!(which_on_path(&server.command).is_some(), "{server:?}");
+        }
     }
 
     #[test]
@@ -2809,5 +3362,156 @@ shell_allowed = ["git .*", "cargo .*"]
             Some("http://localhost:11434/api/chat")
         );
         assert_eq!(Provider::Vllm.default_endpoint(), None);
+    }
+
+    // ---- context efficiency (PRD-CTX-EFF-003 §7) -------------------------
+
+    #[test]
+    fn efficiency_defaults_match_the_prd() {
+        let c = Config::default();
+        assert!(c.context.compaction);
+        assert_eq!(c.context.compact_at, 0.75);
+        assert_eq!(c.context.compact_target, 0.45);
+        assert_eq!(c.context.compact_at_tokens, 96_000);
+        assert_eq!(c.context.keep_recent_steps, 6);
+        assert_eq!(c.context.summary_max_tokens, 2_000);
+        assert_eq!(c.context.spill_ttl_days, 7);
+        assert_eq!(c.search.max_file_bytes, 2_000_000);
+        assert_eq!(c.index.repo_map_tokens, 1_024);
+        assert_eq!(c.read.default_limit, 400);
+        assert_eq!(c.edit.syntax_check, SyntaxCheck::Reject);
+        assert_eq!(c.lsp_tuning.max_servers, 3);
+        assert_eq!(c.cache.ttl, CacheTtlSetting::Auto);
+        assert_eq!(c.cache.markers, CacheMarkerSetting::Auto);
+    }
+
+    #[test]
+    fn efficiency_sections_parse_from_toml() {
+        let _env = env_guard();
+        let _home = isolated_user_config();
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(
+            &dir,
+            r#"
+[context]
+compact_at = 0.8
+compact_target = 0.5
+exclude = ["fixtures/**"]
+compaction_model = "openrouter/z-ai/glm-4.6"
+
+[context.tool_budgets]
+shell = 9000
+mcp__ = 4000
+
+[index]
+repo_map_tokens = 0
+
+[read]
+default_limit = 250
+
+[edit]
+syntax_check = "warn"
+
+[lsp]
+max_servers = 2
+
+[cache]
+ttl = "1h"
+markers = "off"
+"#,
+        );
+        let c = Loader::new(&path).load().unwrap();
+        assert_eq!(c.context.compact_at, 0.8);
+        assert_eq!(c.context.exclude, ["fixtures/**"]);
+        assert_eq!(c.context.compaction_model, "openrouter/z-ai/glm-4.6");
+        assert_eq!(
+            c.context.tool_budgets,
+            [("mcp__".to_string(), 4000), ("shell".to_string(), 9000)]
+        );
+        assert_eq!(c.index.repo_map_tokens, 0);
+        assert_eq!(c.read.default_limit, 250);
+        assert_eq!(c.edit.syntax_check, SyntaxCheck::Warn);
+        assert_eq!(c.lsp_tuning.max_servers, 2);
+        assert_eq!(c.cache.ttl, CacheTtlSetting::OneHour);
+        assert_eq!(c.cache.markers, CacheMarkerSetting::Off);
+    }
+
+    /// FR-FILTER-01: a machine-wide exclude cannot be dropped by a project.
+    #[test]
+    fn discovery_excludes_accumulate_across_layers() {
+        let _env = env_guard();
+        // The layers that stack are machine-wide then project (the nearest
+        // project file replaces one further up; it does not layer on it).
+        let home = isolated_user_config();
+        fs::create_dir_all(home.path().join("zcode")).unwrap();
+        fs::write(
+            home.path().join("zcode").join("config.toml"),
+            "[context]\nexclude = [\"secrets/**\"]\n",
+        )
+        .unwrap();
+        let project = tempfile::tempdir().unwrap();
+        fs::write(
+            project.path().join("zcode.toml"),
+            "[context]\nexclude = [\"tmp/**\"]\ninclude = [\"vendor/**\"]\n",
+        )
+        .unwrap();
+        let c = Loader::discover_from(project.path()).load().unwrap();
+        assert!(c.context.exclude.contains(&"secrets/**".to_string()));
+        assert!(c.context.exclude.contains(&"tmp/**".to_string()));
+        assert_eq!(c.context.include, ["vendor/**"]);
+    }
+
+    #[test]
+    fn an_invalid_efficiency_setting_names_its_key() {
+        let _env = env_guard();
+        let _home = isolated_user_config();
+        for (toml, key) in [
+            ("[context]\ncompact_at = 1.5\n", "context.compact_at"),
+            (
+                "[context]\ncompact_at = 0.5\ncompact_target = 0.6\n",
+                "context.compact_target",
+            ),
+            (
+                "[context]\nkeep_recent_steps = 0\n",
+                "context.keep_recent_steps",
+            ),
+            ("[edit]\nsyntax_check = \"maybe\"\n", "edit.syntax_check"),
+            ("[cache]\nttl = \"forever\"\n", "cache.ttl"),
+            ("[read]\ndefault_limit = 0\n", "read.default_limit"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let err = Loader::new(write_config(&dir, toml)).load().unwrap_err();
+            assert!(
+                matches!(&err, ConfigError::InvalidSetting { key: k, .. } if k == key),
+                "{toml}: {err}"
+            );
+            assert!(err.to_string().contains(key), "{err}");
+        }
+    }
+
+    #[test]
+    fn efficiency_env_overrides_apply() {
+        let _env = env_guard();
+        let _home = isolated_user_config();
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(&dir, "");
+        std::env::set_var("ZCODE_CONTEXT_COMPACTION", "off");
+        std::env::set_var("ZCODE_INDEX_ENABLED", "false");
+        std::env::set_var("ZCODE_CACHE_TTL", "5m");
+        std::env::set_var("ZCODE_READ_DEFAULT_LIMIT", "120");
+        let loaded = Loader::new(&path).load();
+        for k in [
+            "ZCODE_CONTEXT_COMPACTION",
+            "ZCODE_INDEX_ENABLED",
+            "ZCODE_CACHE_TTL",
+            "ZCODE_READ_DEFAULT_LIMIT",
+        ] {
+            std::env::remove_var(k);
+        }
+        let c = loaded.unwrap();
+        assert!(!c.context.compaction);
+        assert!(!c.index.enabled);
+        assert_eq!(c.cache.ttl, CacheTtlSetting::FiveMinutes);
+        assert_eq!(c.read.default_limit, 120);
     }
 }

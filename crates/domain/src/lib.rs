@@ -11,6 +11,8 @@
 //!  * **Pure helpers** (`tokens::estimate_tokens`, `modes::system_prompt`,
 //!    `pricing::PriceTable`, `context_window::WindowTable`).
 
+pub mod code_index;
+pub mod context;
 pub mod context_window;
 pub mod error;
 pub mod model;
@@ -19,25 +21,34 @@ pub mod modes;
 pub mod naming;
 pub mod ports;
 pub mod pricing;
+pub mod search;
 pub mod tokens;
 
+pub use code_index::{CodeIndexPort, IndexState, ParsedFile, Related, Span, SymbolDef, SymbolKind};
 pub use context_window::{parse_window_from_error, WindowEntry, WindowTable};
 pub use error::DomainError;
 pub use model::{
-    AgentContext, AgentMode, CancelFlag, FileEdit, ImageRef, LspLocation, LspPosition, LspRange,
-    LspTextEdit, LspWorkspaceEdit, Plugin, ShellCommand, Task, TaskStatus,
+    AgentContext, AgentMode, CancelFlag, FileEdit, ImageRef, LspDiagnostic, LspLocation,
+    LspPosition, LspRange, LspReadiness, LspSymbolInfo, LspTextEdit, LspWorkspaceEdit, Plugin,
+    ShellCommand, Task, TaskStatus,
 };
-pub use naming::canonical_tool_name;
+pub use naming::{canonical_tool_name, tool_category, tool_category_for_call};
 #[allow(deprecated)]
 pub use ports::CompletionChunk;
+pub use ports::{describe_compaction, CompactionEntry};
 pub use ports::{
     Emitter, ExtraField, FileSystemPort, LlmEvent, LlmFinish, LlmFinishReason, LlmMessage, LlmPort,
     LlmRequest, LlmResponse, LlmRole, LlmToolCall, LlmToolResult, LogLevel, LoggerPort, LspPort,
-    McpPort, McpToolDef, PluginRegistryPort, RetryNotice, Session, SessionStorePort, ShellPort,
-    TelemetryEvent, TelemetryPort, TelemetryTotals, Tool, ToolRegistryPort, ToolResult, ToolSpec,
-    UiEvent,
+    McpPort, McpToolDef, MessageKind, MessageMeta, PluginRegistryPort, RetryNotice, Session,
+    SessionStorePort, ShellPort, SpillPort, Subject, TelemetryEvent, TelemetryPort,
+    TelemetryTotals, Tool, ToolRegistryPort, ToolResult, ToolSpec, UiEvent,
 };
-pub use pricing::{Cost, PriceEntry, PriceTable};
+pub use pricing::{Cost, PriceEntry, PriceTable, TokenUsage};
+pub use search::{
+    CaseMode, EntryKind, Exclusion, GlobQuery, GrepFileHit, GrepLine, GrepOutcome, GrepQuery,
+    SearchPort, WalkEntry,
+};
+pub use tokens::{estimate_messages, estimate_tokens, prompt_size, TokenCalibrator};
 
 /// Shorthand for the canonical domain error box: `Send + Sync` so it crosses
 /// thread boundaries (the engine runs on a worker thread in the TUI).

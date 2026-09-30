@@ -15,20 +15,27 @@ pub fn system_prompt(mode: AgentMode) -> &'static str {
     match mode {
         AgentMode::Planning => {
             "You are a planning coding agent. Propose edits, ask for confirmation. \
-             Do NOT call write, str_replace_editor, apply_patch, shell, or rename tools.\
-             Only use read-only tools (read, list_dir, hover, find_references, \
-             MCP read tools) to investigate, then describe the plan."
+             Do NOT call write, str_replace_editor, apply_patch, shell, or rename tools. \
+             Only use read-only tools (symbols, outline, related, grep, glob, \
+             list_dir, read, hover, find_references, MCP read tools) to investigate, \
+             then describe the plan. Find code with symbols, grep and glob, outline a \
+             file before reading it, and read only the lines you need."
         }
         AgentMode::Editing => {
             "You are a coding agent working in edit-only mode. Make edits directly \
              with the file tools (write, str_replace_editor, apply_patch). You may \
              NOT run shell commands — the `shell` tool is disabled, so do not call \
              it and do not plan around running builds or tests yourself. When a \
-             change needs verifying, say which command the user should run."
+             change needs verifying, say which command the user should run. \
+             Find code with symbols, grep and glob, outline a file before reading \
+             it, and read only the lines you need."
         }
         AgentMode::Auto => {
             "You are an autonomous coding agent. Make edits directly using the \
-             available tools. Be efficient and iterative: edit, then verify."
+             available tools. Be efficient and iterative: edit, then verify. \
+             Find code with symbols, grep and glob (prefer them to searching \
+             through shell), outline a file before reading it, and read only the \
+             lines you need."
         }
     }
 }
@@ -37,6 +44,7 @@ pub fn system_prompt(mode: AgentMode) -> &'static str {
 pub fn write_tool_names() -> &'static [&'static str] {
     &[
         "write",
+        "edit_symbol",
         "str_replace_editor",
         "apply_patch",
         "lsp__rename_symbol",
@@ -53,6 +61,7 @@ pub fn shell_tool_names() -> &'static [&'static str] {
 pub fn execute_only_tool_names() -> &'static [&'static str] {
     &[
         "write",
+        "edit_symbol",
         "str_replace_editor",
         "apply_patch",
         "shell",
@@ -109,12 +118,29 @@ mod tests {
 
     #[test]
     fn read_only_tools_are_never_gated() {
-        for name in ["read", "list_dir", "zcode_skill", "lsp__hover"] {
+        for name in [
+            "read",
+            "list_dir",
+            "grep",
+            "glob",
+            "outline",
+            "symbols",
+            "related",
+            "zcode_skill",
+            "lsp__hover",
+        ] {
             assert!(!is_execute_only(name), "{name} must stay available");
             for mode in AgentMode::all() {
                 assert!(!denies(*mode, name), "{mode:?} must allow {name}");
             }
         }
+    }
+
+    #[test]
+    fn edit_symbol_is_a_write_tool() {
+        assert!(denies(AgentMode::Planning, "edit_symbol"));
+        assert!(!denies(AgentMode::Editing, "edit_symbol"));
+        assert!(!denies(AgentMode::Auto, "edit_symbol"));
     }
 
     #[test]
@@ -168,5 +194,21 @@ mod tests {
         }
         assert_eq!(seen, AgentMode::all().to_vec());
         assert_eq!(mode.next(), AgentMode::Planning);
+    }
+
+    /// FR-CACHE-02: the system prompt sits at the front of every request, so
+    /// anything volatile in it (a date, a counter, a path) would invalidate
+    /// the whole prompt cache on every change. The prompts must be fixed text.
+    #[test]
+    fn system_prompts_contain_no_volatile_data() {
+        for mode in [AgentMode::Planning, AgentMode::Editing, AgentMode::Auto] {
+            let prompt = system_prompt(mode);
+            assert!(!prompt.contains('{') && !prompt.contains('}'), "{mode:?}");
+            assert!(
+                !prompt.chars().any(|c| c.is_ascii_digit()),
+                "{mode:?} prompt contains digits: {prompt}"
+            );
+            assert_eq!(prompt, system_prompt(mode), "deterministic");
+        }
     }
 }

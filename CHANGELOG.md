@@ -7,6 +7,424 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-09-30
+
+**Context efficiency (PRD-CTX-EFF-003).** The three phases the PRD planned
+as v0.7–v0.9 ship together here: token accounting and prompt caching,
+ripgrep search and discovery filtering, output shaping and safe edits,
+automatic compaction, LSP addressing and diagnostics, the tree-sitter code
+index with its tools and repo map, `edit_symbol`, and the lazy LSP pool.
+What was measured, where the implementation departs from the task
+documents, and what still needs provider keys (the live token evaluation)
+is recorded in `docs/prd/context-efficiency/code-review.md`.
+
+### Added — `/compact`, `zcode session compact`, `--no-compact`, `zcode ignore check` (FR-CTX-12, FR-FILTER-07)
+
+`/compact [focus]` in the TUI and `zcode session compact <id> [--focus
+TEXT]` compact a session now: every tier, down as far as the protected set
+allows, with the focus passed to the summariser. They archive, record and
+report exactly like automatic compaction. `/compact` waits for the running
+turn. `--no-compact` on `run`/`repl` turns off automatic compaction *and*
+the compact-and-retry after a context-length rejection;
+`context.compaction = false` alone leaves the retry on. `zcode ignore check
+<path>` says whether discovery sees a path and, if not, the rule and where
+it is written — `excluded by *.log (.gitignore:2)`, now with the ignore
+file's line.
+
+### Changed — language servers are pooled and started on demand (FR-LSP-08, 10..12)
+
+The "first server that starts wins" rule is gone. `LspPool` holds one server
+per language (JS and TS share `typescript-language-server`), starts it the
+first time a request names a file of that language, keeps at most
+`lsp.max_servers` (3) running — the least recently used makes room — and
+stops one after `lsp.idle_shutdown_s` (600 s) unused, replaying its open
+documents from disk if it is needed again. Nothing starts at launch, so
+every installed default server is now offered (the detected language goes
+first); a monorepo gets one per language. Queries without a file
+(`workspace/symbol`, all-document diagnostics) ask only running servers. A
+server that fails to start is remembered and named in the error.
+
+While a server reports indexing progress, `goto_definition`, `find_references`
+and `hover` answer from the code index, labelled `(from code index —
+language server still indexing: 43%)`, or say to retry — they no longer
+wait out the request timeout. `lsp__rename_symbol` takes `apply: true`:
+the edits are converted from UTF-16 columns to bytes, every file is staged
+to a temporary sibling, and only then are they swapped in; a staging failure
+changes nothing. After any edit (`write`, `str_replace_editor`,
+`apply_patch`, `edit_symbol`, an applied rename) to a file a running server
+covers, the result lists the errors the edit introduced — an error already
+there, moved by the edit, is not repeated — waiting at most 3 s
+(`lsp.diagnostics_on_edit`).
+
+### Added — `edit_symbol` (FR-EDIT-01..05, 09)
+
+Edit a definition by name — `replace` (including its doc comments,
+attributes and decorators), `replace_body` (signature kept; bare statements
+are wrapped in the file's braces), `insert_before`, `insert_after`,
+`delete` — without reading or resending the rest of the file. The target is
+found by parsing the file's current text, never the index's stored spans,
+so an index that missed an outside change cannot misplace the edit. The
+content is re-indented to the file's own style (tabs, or the space width
+detected by GCD) and CRLF files stay CRLF. The edit is re-parsed and refused
+— nothing written — if it adds syntax errors (`edit.syntax_check = "reject"
+| "warn" | "off"`); a file that was already broken can still be edited. An
+unknown name lists the nearest ones; an ambiguous one lists candidates and
+takes `line`. The result is the header and the seams only. Write-class:
+denied in `planning`, and offered only when the index is on.
+
+### Added — `outline`, `symbols`, `related`, and the repo map (FR-INDEX-05..09)
+
+Three read-only tools on the code index, registered after `grep` (the order
+is pinned: it heads every cached prefix). `outline` lists a file's
+definitions — signatures cut at the body, spans right-aligned — or the
+top-level definitions of each file in a directory. Over this workspace's
+larger sources and the eval fixtures an outline costs 12.4% of reading the
+same files. `symbols` finds definitions by name (exact, prefix, substring,
+subsequence; `Type::method` narrows to a container). `related` gives a
+file's imports and importers, or a symbol's definitions and name-based
+references, pointing at `lsp__find_references` for exact ones. Without an
+index (or a grammar) they answer from a labelled regex/grep fallback; while
+the index builds they say so.
+
+The repo map: files ranked by a personalised PageRank over "mentions a name
+defined there" (common names down-weighted, prompt words boosting matching
+paths and definitions), rendered as top-level signatures within
+`index.repo_map_tokens` (1,024; 0 = off). It is decided once per session
+and frozen into the system message — `Some("")` records "none" — so a
+resumed session's prefix never changes. Projects under 200 indexed files get
+no map. A cold first session waits at most 1.5 s for the index and otherwise
+takes a partial map, marked as such.
+
+`read`'s large-file guard now appends an outline of the definitions it did
+not show. LSP tools addressed by `symbol` resolve through the index first,
+preferring a type over its `impl` block, and ask the server only when the
+index does not know the name. The mode prompts mention the new tools.
+
+### Added — code index (FR-INDEX-01..04, 10, 11; FR-FILTER-06)
+
+New crate `infra-index`: a tree-sitter index of definitions, imports and
+identifier occurrences for Rust, Go, TypeScript/TSX (and JS) and Python, each
+grammar behind its own cargo feature. It builds on a `zcode-index` thread
+and never delays the first request; queries answer from partial data while
+`IndexState::Building`. The store is a small versioned binary file at
+`.zcode/index/v1/index.zcix`, written atomically and discarded (then rebuilt)
+on any corruption or extractor change. Rebuilds are incremental — a file is
+re-read only when its mtime or size moved and re-parsed only when its FNV-1a
+hash changed. Freshness: zcode's own writes re-index synchronously, a query
+re-checks the files it is about to return, and each turn starts with a
+stat-only rescan. Generated, minified, binary and oversized files are
+recorded as skipped; a parse is cut off after 500 ms. `zcode index
+status|rebuild|clear`, `--no-index` on `run`/`repl`, `index.enabled = false`.
+
+Measured (release, 10k synthetic Rust files, 80k definitions): cold build
+1.1 s, warm start 0.1 s, heap 20 MB (budget 25 MB), symbol query ≈ 3.5 ms.
+Signatures are not stored — reading the name's line back from the file for
+the few results a query returns took the heap from 30 MB to 20 MB.
+
+The index reaches the tools through `domain::CodeIndexPort`, so `tools` does
+not depend on `infra-index`; the `code-index` feature lives on the CLI,
+which spawns it (a departure from task-32's `tools/code-index` feature).
+
+### Added — prompt-cache TTL policy (FR-CACHE-07, 08, 10)
+
+`[cache] ttl = "auto" | "5m" | "1h"` (default `auto`). In the TUI, where a
+person reads and types between prompts for longer than the five-minute cache
+lives, `auto` keeps the stable head — tools and system prompt — for an hour
+and the moving conversation for five minutes; headless runs, whose requests
+follow each other within seconds, use five minutes throughout (one-hour
+writes cost 2× instead of 1.25×). If a gateway rejects the one-hour `ttl`,
+the client drops it for the rest of the process and retries once, reporting
+the downgrade as a retry. `[cache] markers = "auto" | "on" | "off"`
+overrides the model-family rule for OpenAI-shaped routes. Switching mode on a
+resumed session, or switching provider or model, now says the prompt cache
+starts over. Ollama requests carry `keep_alive` (`[cache] ollama_keep_alive`,
+default `30m`) so the model and its prefix cache stay loaded.
+
+### Added — per-tool output budgets (FR-READ-06)
+
+Each tool's output is capped by its own budget in tokens — `shell` 6k,
+`read` 8k, `grep` 3k, `glob` and `list_dir` 1.5k, `lsp__*` 2k, `mcp__*` 6k,
+6k otherwise — overridable per tool or prefix under `[context.tool_budgets]`.
+`max_tool_output_chars` remains a hard ceiling over all of them.
+
+### Added — `/context`, and cache figures in `/cost` (FR-BUDGET-05, 06)
+
+`/context` breaks the live context down into system prompt, tool schemas,
+summaries, conversation and tool results, names the five largest results and
+the step they came from, and shows how much of the window is free. `/cost`
+now shows cache reads and writes separately, the hit ratio, and what the cache
+saved against sending the cached prompt at the full input rate (`n/a` for an
+unpriced model). The run report counts shell commands that were searches —
+how often search went around the `grep` tool.
+
+### Changed — LSP tools take a symbol name or a 1-based position (FR-LSP-05, 06)
+
+**Behaviour change for the model-facing schema.** `lsp__goto_definition`,
+`lsp__find_references`, `lsp__hover` and `lsp__rename_symbol` now accept
+`symbol: "AgentLoop::execute"` (resolved through `workspace/symbol`, landing
+on the name itself), or `path` + `line` + `column`, both **1-based** — the
+convention every other zcode tool uses; `character` is still accepted, as a
+1-based alias. Asking for 0-based coordinates meant the model had to read the
+file first, so the semantic tools cost *more* than reading and went unused.
+A missing `line` used to default silently to 0; it is now an error saying to
+give the symbol instead. An ambiguous name lists its candidates. Columns are
+converted to and from UTF-16, as the protocol requires, so positions are
+right on lines with non-ASCII text.
+
+Results are compact: paths relative to the project with the source line
+(`src/app.rs:386:8  fn execute(&mut self, …)`), references grouped by file
+and capped at 50, hover text without markdown fences, rename advice as a
+per-file count — instead of `file:///…` URIs.
+
+### Added — `lsp__diagnostics` (FR-LSP-07)
+
+A read-only tool returning the language server's errors (or warnings, or
+all, with `severity`) for one file or every file touched this session, as
+`path:line:col  error[E0308]  message` — much cheaper than a build log after
+an edit. It uses pull diagnostics where the server supports them and
+otherwise waits for published ones to settle, taking only a report newer than
+the file's last change.
+
+### Fixed — the LSP client ignored everything that was not its own response
+
+Server→client requests (`workspace/configuration`, progress creation,
+capability registration) were skipped, which can stall a server that waits
+for the reply; they are now answered. Published diagnostics and `$/progress`
+were discarded; they are now kept. Files the agent reads are opened on the
+server, so references and diagnostics cover them.
+
+### Added — older steps are summarised when eliding is not enough (FR-CTX-07, 08)
+
+The third compaction tier: when superseding and eliding still leave the
+context above target, the oldest unprotected run of steps (at least two, cut
+only at step boundaries) is replaced by one session summary — Goal,
+constraints, decisions, work done, current state, next steps, open questions —
+written by the model from a plain-text rendering of those steps, which the
+prompt tells it to treat as data. Its **Files touched** section is written by
+the engine from the tool ledger, never by the model (a model's own version is
+discarded), so the record of what was read and changed cannot be invented.
+`context.compaction_model = "<provider>/<model>"` sends summaries to a
+cheaper model (resolved like `--model`, so a bad value fails at startup); the
+summary call is billed and reported like any other. A failed summary is a
+note, never a failed run: the other tiers still apply.
+
+### Added — compaction is durable and visible (FR-CTX-11, 13)
+
+Session files move to **schema version 2**: each compaction is recorded
+(step, tier, tokens before and after), and every message compaction replaced
+is appended to `.zcode/sessions/<id>.archive.jsonl` *before* the checkpoint
+that drops it, so a crash leaves the archive a superset. `zcode session
+export --full` inlines the archive and `session import` restores it; a fork
+keeps it. v1 files load unchanged; a file from a newer zcode is refused with
+a message saying to upgrade rather than misread. The TUI status bar shows
+how full the context is (`ctx 62%`, yellow from 60%, red from 75%, or
+`ctx 84.0k` for an unknown window) and each compaction appears as a note.
+
+### Added — the conversation is compacted before it outgrows the window (FR-CTX-01..06, 09, 10)
+
+A transcript used to grow until the turn cap or a context-length error: every
+file ever read stayed in it, re-sent on every step. A context manager now
+runs before each provider call. When the live context reaches 75% of the
+model's window (`context.compact_at`; 96k tokens when the window is unknown)
+it compacts down to 45% (`compact_target`) — hysteresis, so compactions are
+rare and the prompt-cache reset each one causes is paid for over many steps.
+It works cheapest-first:
+
+1. **Supersession** — a file read that was later read again (the same or a
+   wider range), or later modified; a search or listing repeated verbatim;
+   diagnostics followed by newer ones. The newer copy is already in context,
+   so nothing is lost.
+2. **Elision** — large old tool output becomes a one-line stub saying what it
+   was, how big, how it began, and where its full text is (it is spilled to
+   `.zcode/spill/` first); the file content of old `write`/`patch` calls
+   becomes a line count, the arguments staying valid JSON.
+
+The system prompt, the task, the latest message and the last
+`keep_recent_steps` (6) steps are never touched, and every rewritten
+transcript is validated — each tool call answered exactly once, in order —
+before it is sent; a compaction that would break it is undone. When the
+window is nearly full anyway, an emergency pass reaches into the recent steps,
+sparing only the latest.
+
+When a provider still refuses a prompt as too long, the engine learns the
+window it named, compacts, and retries that step once instead of ending the
+run. Compactions are reported (`context_compacted` and `cache_reset`
+telemetry; a note in the TUI and headless output) and archived (the session
+store's new `archive` hook; persisted in the next release step). On a
+161k-token transcript tiers 1–2 take under a millisecond.
+
+Step numbers now continue across runs of one session instead of restarting
+at 1, so a stub that cites a step is unambiguous.
+
+### Changed — `str_replace` refuses an ambiguous match instead of editing the first (FR-EDIT-06)
+
+**Behaviour change.** When `old_str` matched several places, v0.6 edited the
+first and mentioned the count afterwards — so an ambiguous edit could land in
+the wrong place, and the model learned so only after the fact. It is now an
+error listing the matching lines, and nothing is written. Pass
+`replace_all: true` to replace every match, and `expected_replacements: N` to
+refuse the edit unless exactly N matches were found.
+
+### Added — forgiving matching, with disclosure, and a closest-region hint (FR-EDIT-07)
+
+When `old_str` is not found exactly, one retry tolerates indentation and
+trailing-whitespace drift (the same block, uniformly re-indented); the
+replacement is re-indented to the file's and the result says
+`(matched with whitespace normalisation)`. When nothing matches, the error
+shows the most similar region of the file with line numbers, so the model
+can retry without reading the whole file again.
+
+### Changed — edit results never echo files (FR-EDIT-02/08)
+
+`str_replace` returns the lines around each change (at most three seams),
+`write` a line diffstat (`wrote f.rs: 412 → 430 lines (+31 −13)`, with a
+nudge towards `str_replace_editor` when an existing file of more than 200
+lines was rewritten whole), and `apply_patch` a per-file diffstat
+(`M src/a.rs +12 −3`).
+
+### Fixed — `apply_patch` edits were never synced to the language server
+
+Only `write` and `str_replace` pushed new text to the language server, so
+after an `apply_patch` it answered from stale contents. Every write path now
+records what it wrote and the registry syncs each file, every file of a
+multi-file patch included (FR-LSP-09).
+
+### Changed — `read` returns line ranges with line numbers (FR-READ-01..04)
+
+`read` takes `offset` (1-based) and `limit`, and every line it returns
+carries its number (`  42│…`) — the same numbers `grep` reports, so a hit can
+be read with `offset` and no counting. A file longer than `read.default_limit`
+(400 lines) read without a range returns its first 400 lines and a footer
+saying how to get the rest, instead of all of it; a range that stops short of
+the end names the next offset. Binary files are refused with their size, lines
+over 2 000 characters are clipped, and `str_replace_editor view` accepts
+`view_range: [start, end]` (`-1` = end of file) through the same reader.
+
+### Changed — long tool output keeps its end, and is kept in full on disk (FR-READ-05/07)
+
+Output over `max_tool_output_chars` used to keep only its head — but compiler
+errors and test summaries come *last*, so the part the model needed was the
+part cut, and it re-ran the command to see it. Now the first 40% and last 60%
+of the budget are kept, cut at line breaks, with a marker counting what was
+omitted. The full output is written to `.zcode/spill/<session>/<call>.txt`
+and the marker names that path, so the model can `grep` or `read` the rest;
+spill directories are pruned after `context.spill_ttl_days` (7). A failed
+spill never fails the run.
+
+### Added — `grep` and `glob` tools on ripgrep's engine, in every mode (FR-SEARCH, FR-GLOB)
+
+Until now the only way to search was `shell` — refused in `planning` and
+`editing` mode, so two of the three modes could only find code by reading
+files whole. `grep` and `glob` are native, read-only tools built on
+ripgrep's own crates (`ignore`, `grep-searcher`, `grep-regex`, `globset`),
+embedded rather than shelled out to: no install, not subject to the shell
+allowlist, and deterministic output. `grep` starts cheap (`output: files` —
+paths and counts) and pages (`offset`), shows matches with a 1-based line
+gutter that `read` can address, windows minified lines around the match,
+skips binary and oversized files and says so, and is interrupted by Ctrl-C.
+On a 20 000-file tree it runs at 1.04× the `rg` binary's time.
+
+### Changed — discovery never shows `node_modules`, build output or secrets (FR-FILTER)
+
+`grep`, `glob`, `list_dir` and (later) the code index share one discovery
+filter: built-in excludes (dependency trees, VCS metadata, build output,
+caches, lockfiles, binaries), `.gitignore`/`.ignore`/global excludes — even
+outside a git repository — `.zcodeignore`, and new `[context] exclude` /
+`include` config (both accumulate across config layers). Secret-shaped files
+(`.env`, `*.pem`, `id_rsa*`, …) are excluded from discovery; `.env.example`
+is not. Filters shape discovery, never explicit access: naming a path inside
+`node_modules` still works. A `glob` argument narrows a search and cannot
+re-admit a gitignored file.
+
+`list_dir` now renders a filtered tree (`depth` 1–4), shows excluded
+directories collapsed as `node_modules/  (excluded)` so the model knows they
+exist, summarises directories with more than 50 entries, and caps output at
+200 lines. `str_replace_editor`'s `list_dir` command shares it.
+
+### Added — configuration for the context-efficiency milestone
+
+New `[context]`, `[search]`, `[index]`, `[read]`, `[edit]` and `[cache]`
+sections and `[lsp] max_servers / idle_shutdown_s / diagnostics_on_edit`,
+with `ZCODE_*` overrides and validation that names the offending key. `zcode
+config` prints the effective values.
+
+### Fixed — config tests raced on the process environment
+
+Twenty-six `infra-config` tests read the `ZCODE_*` layer through `load()`
+without taking the environment lock, and failed intermittently when a
+concurrent test had set `ZCODE_PROVIDER`.
+
+### Added — the whole conversation is now prompt-cached, not just the system prompt (FR-CACHE-01..06)
+
+On Anthropic routes v0.6 placed `cache_control` on the system prompt and the
+last tool only, so every step re-billed the *entire* transcript at the full
+input rate — the part of the request that grows. Requests now carry four
+breakpoints: tools, system, the end of this request, and exactly where the
+previous request ended. A breakpoint on a position already written is a
+guaranteed read, so the API's 20-block lookback can never miss however many
+blocks a step appended (technical plan CE-DQ6). A golden test builds a
+growing session through every request builder and asserts that, markers
+aside, each request is a byte prefix of the next — the property caching
+depends on and the one a later change is most likely to break silently.
+
+OpenAI-shaped routes now decide whether to send markers from the model id
+(`claude`/`anthropic/`/`gemini` need them; OpenAI and DeepSeek cache
+automatically) instead of a flag hardwired on for OpenRouter. Markers now sit
+on content parts, where OpenRouter documents them — v0.6 attached them to the
+message object. On a marked route every message is rendered as a part array
+from the start: converting only the marked one made the same message change
+shape as the breakpoint moved on, which is itself a cache miss (caught by the
+prefix test). OpenAI requests carry `prompt_cache_key` set to the session id.
+MCP tools are listed sorted by name, so a server's discovery order cannot
+change the cached prefix.
+
+### Changed — cache reads and writes are reported separately (FR-CACHE-04/05)
+
+`LlmFinish`, telemetry events and the run report split `cache_tokens` into
+`cache_read_tokens` and `cache_write_tokens`. Reads bill at the model's cache
+rate, writes at 1.25× the input rate (2× for the one-hour cache); the single
+v0.6 figure made both the cost estimate and the hit rate unknowable. The
+JSONL keeps a `cache_tokens` field (their sum) for one release; it is
+deprecated. The `opencode` translation now fills `tokens.cache.write`
+instead of hardcoding 0. DeepSeek's `prompt_cache_hit_tokens` is read.
+
+### Fixed — Anthropic cache usage was double-counted
+
+Anthropic's `message_delta` usage is cumulative and, on current API
+versions, repeats the input-side fields `message_start` already reported.
+v0.6 *added* the two, doubling every cache token (and adding one to the
+output count). Each field is now the maximum of the two reports. The decoder
+no longer reads `cache_creation_output_tokens`, which is not a documented
+field.
+
+### Added — a token ledger (FR-BUDGET-01..04)
+
+Every `tool_result` event carries `tokens_est`, `chars`, `category` (which
+stage of discover → locate → inspect → change → verify it belongs to) and
+`spilled`. The run report gains `ledger` (tokens by tool and by category),
+`context` (peak live context and its share of the window) and `cache` (reads,
+writes, hit ratio) sections; every existing key is unchanged.
+
+### Fixed — tool results were invisible to the context-window estimate
+
+The prompt-size estimate summed each message's `content` — but tool results
+live in `tool_result.content` and tool-call arguments in `tool_calls`, so the
+one kind of message most likely to be large counted as zero. The window
+clamp could therefore reserve output room the prompt had already used. The
+estimate now covers all three, and is anchored on the provider's own report
+of the last prompt's size with only newer messages estimated. The estimator
+itself changed from `words × 4` to a character heuristic calibrated per
+session against provider reports (MAPE ~15% against cl100k on the committed
+fixtures, down from an undercount on code).
+
+### Added — `zcode-evals`, a token-efficiency evaluation harness (FR-BUDGET-07)
+
+`evals/` runs the built binary over a 24-task corpus (four repositories × six
+task categories), grades each run, and compares result files against the
+milestone's targets and guardrails; `make eval-tokens` is a hermetic replay
+self-test. `ZCODE_LLM_RECORD=<dir>` / `ZCODE_LLM_REPLAY=<dir>` record and
+replay provider traffic by call sequence. See `evals/README.md`.
+
 ## [0.6.0] - 2026-09-11
 
 ### Added — `meridian` provider: bridge a Claude Max/Team/Enterprise subscription

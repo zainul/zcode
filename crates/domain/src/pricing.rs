@@ -173,9 +173,41 @@ impl PriceTable {
         self.estimate(model, 0, 0, 0).priced
     }
 
-    /// Estimate the cost of one run. Unknown models yield `priced: false`
-    /// rather than a misleading zero.
+    /// Whether `model`'s provider counts cached tokens inside `input_tokens`
+    /// (see [`PriceEntry::cache_within_input`]). An unknown model answers
+    /// `false`, the Anthropic convention: adding the cache figure to the
+    /// prompt size can over-count, never under-count, which is the safe
+    /// direction for anything guarding a context window.
+    pub fn cache_within_input(&self, model: &str) -> bool {
+        self.lookup(model).is_some_and(|e| e.cache_within_input)
+    }
+
+    /// Estimate the cost of one run, treating `cache` as cache *reads*.
+    /// Unknown models yield `priced: false` rather than a misleading zero.
     pub fn estimate(&self, model: &str, input: u64, output: u64, cache: u64) -> Cost {
+        self.estimate_usage(
+            model,
+            &TokenUsage {
+                input,
+                output,
+                cache_read: cache,
+                ..TokenUsage::default()
+            },
+        )
+    }
+
+    /// Estimate with cache reads and writes priced separately (FR-CACHE-05,
+    /// CE-DQ9). Reads bill at the entry's cache rate; writes at the input
+    /// rate times the TTL's premium — 1.25× for the 5-minute cache, 2× for
+    /// the 1-hour one. Unknown models yield `priced: false`.
+    pub fn estimate_usage(&self, model: &str, usage: &TokenUsage) -> Cost {
+        let TokenUsage {
+            input,
+            output,
+            cache_read: cache,
+            cache_write_5m,
+            cache_write_1h,
+        } = *usage;
         let entry = match self.lookup(model) {
             Some(entry) => entry,
             None if is_free_route(model) => {
@@ -193,13 +225,37 @@ impl PriceTable {
         } else {
             input
         };
+        let write_usd = per_mtok(cache_write_5m, entry.input_per_mtok * CACHE_WRITE_5M)
+            + per_mtok(cache_write_1h, entry.input_per_mtok * CACHE_WRITE_1H);
         Cost {
             input_usd: per_mtok(billable_input, entry.input_per_mtok),
             output_usd: per_mtok(output, entry.output_per_mtok),
-            cache_usd: per_mtok(cache, entry.cache_per_mtok),
+            cache_usd: per_mtok(cache, entry.cache_per_mtok) + write_usd,
             priced: true,
         }
     }
+
+    /// What `usage`'s cache reads saved against billing them as ordinary
+    /// input. `None` for an unpriced model: a guessed saving is not one.
+    pub fn cache_saving_usd(&self, model: &str, cache_read: u64) -> Option<f64> {
+        let entry = self.lookup(model)?;
+        Some(per_mtok(cache_read, entry.input_per_mtok - entry.cache_per_mtok).max(0.0))
+    }
+}
+
+/// Premium over the input rate for a 5-minute cache write.
+pub const CACHE_WRITE_5M: f64 = 1.25;
+/// Premium over the input rate for a 1-hour cache write.
+pub const CACHE_WRITE_1H: f64 = 2.0;
+
+/// Token counts for one estimate, cache reads and writes kept apart.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TokenUsage {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write_5m: u64,
+    pub cache_write_1h: u64,
 }
 
 fn per_mtok(tokens: u64, rate: f64) -> f64 {
@@ -355,6 +411,36 @@ mod tests {
         let cost = table.estimate("claude-sonnet-4-5", 10_000, 0, 8_000);
         let expected = 10_000.0 * 3.00 / 1e6 + 8_000.0 * 0.30 / 1e6;
         assert!((cost.total_usd() - expected).abs() < 1e-12, "{cost:?}");
+    }
+
+    #[test]
+    fn cache_writes_cost_a_premium_over_input_and_reads_a_fraction() {
+        let table = PriceTable::builtin();
+        let usage = |read, w5, w1| TokenUsage {
+            cache_read: read,
+            cache_write_5m: w5,
+            cache_write_1h: w1,
+            ..TokenUsage::default()
+        };
+        let write_5m = table.estimate_usage("claude-sonnet-4-5", &usage(0, 1_000_000, 0));
+        assert!(
+            (write_5m.cache_usd - 3.00 * 1.25).abs() < 1e-9,
+            "{write_5m:?}"
+        );
+        let write_1h = table.estimate_usage("claude-sonnet-4-5", &usage(0, 0, 1_000_000));
+        assert!((write_1h.cache_usd - 6.00).abs() < 1e-9, "{write_1h:?}");
+        let read = table.estimate_usage("claude-sonnet-4-5", &usage(1_000_000, 0, 0));
+        assert!((read.cache_usd - 0.30).abs() < 1e-9, "{read:?}");
+    }
+
+    #[test]
+    fn a_cache_saving_is_reads_times_the_rate_difference() {
+        let table = PriceTable::builtin();
+        let saved = table
+            .cache_saving_usd("claude-sonnet-4-5", 1_000_000)
+            .unwrap();
+        assert!((saved - 2.70).abs() < 1e-9);
+        assert_eq!(table.cache_saving_usd("mystery-model", 1_000_000), None);
     }
 
     #[test]

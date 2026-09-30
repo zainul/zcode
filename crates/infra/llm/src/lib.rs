@@ -17,9 +17,13 @@
 //!
 //! Direct deps: domain, serde, serde_json, reqwest, thiserror (L3).
 
+pub mod record;
+pub use record::{RecordingLlm, ReplayLlm};
+
 use std::collections::{HashSet, VecDeque};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -727,7 +731,8 @@ fn aggregate(
         reason: LlmFinishReason::Stop,
         input_tokens: 0,
         output_tokens: 0,
-        cache_tokens: 0,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
         cost_usd: None,
     };
     for ev in events.into_iter().flatten() {
@@ -759,13 +764,15 @@ pub struct OpenAiShapeLlm {
     retry: RetryPolicy,
     /// Extra headers a specific provider requires (e.g. OpenRouter attribution).
     extra_headers: Vec<(&'static str, String)>,
-    /// When set, the stable prefix (system prompt + tools + history) is marked
-    /// with `cache_control` breakpoints so repeated calls hit the provider's
-    /// prompt cache instead of re-billing the full prompt every turn. Required
-    /// for Anthropic models routed through the OpenAI shape (OpenRouter), and
-    /// ignored by providers that do not understand it — which is why it is a
-    /// per-adapter flag rather than always-on.
-    cache_control: bool,
+    /// Whether requests carry `cache_control` markers (CE-DQ8).
+    markers: CacheMarkers,
+    /// TTLs for the markers, when they are sent (FR-CACHE-07).
+    cache_layout: CacheLayout,
+    /// Sent as `prompt_cache_key` to OpenAI so a session's requests land on
+    /// the same cache shard (FR-CACHE-03). Set through `LlmPort::set_session`.
+    session_id: Option<String>,
+    /// Set once a gateway rejected the one-hour TTL (CE-DQ7).
+    ttl_downgraded: Arc<AtomicBool>,
     /// Known context-window sizes, consulted before every request and
     /// updated in place the moment a provider's own rejection reveals a real
     /// figure. `Arc<Mutex<_>>` because a stream reconnect
@@ -795,7 +802,10 @@ impl OpenAiShapeLlm {
             provider: "openai",
             retry: RetryPolicy::default(),
             extra_headers: Vec::new(),
-            cache_control: false,
+            markers: CacheMarkers::Auto,
+            cache_layout: CacheLayout::default(),
+            session_id: None,
+            ttl_downgraded: Arc::new(AtomicBool::new(false)),
             window_table: Arc::new(Mutex::new(WindowTable::builtin())),
             window_cache_path: None,
         }
@@ -814,11 +824,34 @@ impl OpenAiShapeLlm {
         self.window_cache_path = cache_path;
     }
 
-    /// Enable provider prompt caching by marking the request prefix with
-    /// `cache_control` breakpoints (FR-COST-01).
-    pub fn with_cache_control(mut self, on: bool) -> Self {
-        self.cache_control = on;
-        self
+    /// Override whether requests carry `cache_control` markers.
+    pub fn set_cache_markers(&mut self, markers: CacheMarkers) {
+        self.markers = markers;
+    }
+
+    /// TTLs for the markers, when sent (FR-CACHE-07).
+    pub fn set_cache_layout(&mut self, layout: CacheLayout) {
+        self.cache_layout = layout;
+    }
+
+    fn markers_on(&self) -> bool {
+        match self.markers {
+            CacheMarkers::On => true,
+            CacheMarkers::Off => false,
+            CacheMarkers::Auto => model_needs_cache_markers(&self.model),
+        }
+    }
+
+    /// Request-shaping options derived from the adapter's cache settings.
+    fn cache_options(&self) -> OpenAiCacheOptions {
+        OpenAiCacheOptions {
+            markers: self.markers_on().then_some(self.cache_layout),
+            // Only OpenAI documents `prompt_cache_key`; an unknown field can
+            // make a strict OpenAI-compatible server reject the request.
+            cache_key: (self.provider == "openai")
+                .then(|| self.session_id.clone())
+                .flatten(),
+        }
     }
 
     fn labelled(mut self, provider: &'static str) -> Self {
@@ -850,7 +883,7 @@ impl OpenAiShapeLlm {
     }
 
     fn open_stream(&self, req: &LlmRequest) -> Result<RetriedResponse, BoxError> {
-        let base_payload = build_openai_request(req, &self.model, self.cache_control);
+        let base_payload = build_openai_request(req, &self.model, &self.cache_options());
         let estimated_prompt_tokens = estimate_prompt_tokens(req);
         let (retried, _learned) = send_chat_with_correction(
             self.provider,
@@ -877,7 +910,7 @@ impl OpenAiShapeLlm {
         &self,
         req: &LlmRequest,
     ) -> Box<dyn Iterator<Item = Result<LlmEvent, BoxError>> + Send> {
-        let base_payload = build_openai_request(req, &self.model, self.cache_control);
+        let base_payload = build_openai_request(req, &self.model, &self.cache_options());
         let estimated_prompt_tokens = estimate_prompt_tokens(req);
         let client = self.client.clone();
         let endpoint = self.endpoint.clone();
@@ -889,34 +922,223 @@ impl OpenAiShapeLlm {
         let window_table = self.window_table.clone();
         let cache_path = self.window_cache_path.clone();
         let requested_max_tokens = req.max_tokens;
+        let downgraded = self.ttl_downgraded.clone();
         let open = move || -> Result<Attempt, BoxError> {
-            let (RetriedResponse { response, retries }, learned) = send_chat_with_correction(
-                provider,
-                policy,
-                &model,
-                &window_table,
-                cache_path.as_deref(),
-                requested_max_tokens,
-                estimated_prompt_tokens,
-                |max_tokens| {
-                    build_openai_shape_request(
-                        &client,
-                        &endpoint,
-                        &api_key,
-                        &headers,
-                        &with_max_tokens(&base_payload, max_tokens),
-                    )
-                },
-            )?;
-            let mut events: Box<dyn Iterator<Item = Result<LlmEvent, BoxError>> + Send> = Box::new(
-                EventStream::from_response(response, OpenAiDecoder::default()),
-            );
-            if let Some(event) = learned {
-                events = Box::new(std::iter::once(Ok(event)).chain(events));
-            }
-            Ok((events, retries))
+            open_with_ttl_fallback(&base_payload, &downgraded, |payload| {
+                let (RetriedResponse { response, retries }, learned) = send_chat_with_correction(
+                    provider,
+                    policy,
+                    &model,
+                    &window_table,
+                    cache_path.as_deref(),
+                    requested_max_tokens,
+                    estimated_prompt_tokens,
+                    |max_tokens| {
+                        build_openai_shape_request(
+                            &client,
+                            &endpoint,
+                            &api_key,
+                            &headers,
+                            &with_max_tokens(payload, max_tokens),
+                        )
+                    },
+                )?;
+                let mut events: Box<dyn Iterator<Item = Result<LlmEvent, BoxError>> + Send> =
+                    Box::new(EventStream::from_response(
+                        response,
+                        OpenAiDecoder::default(),
+                    ));
+                if let Some(event) = learned {
+                    events = Box::new(std::iter::once(Ok(event)).chain(events));
+                }
+                Ok((events, retries))
+            })
         };
         ResilientStream::start(open, policy)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Prompt caching (FR-CACHE-01..07, CE-DQ6..8)
+// ---------------------------------------------------------------------------
+
+/// How long a provider keeps a cache entry alive after its last use.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CacheTtl {
+    /// The default ephemeral cache. Writes cost 1.25× the input rate.
+    #[default]
+    FiveMinutes,
+    /// Survives human think-time between prompts. Writes cost 2×.
+    OneHour,
+}
+
+impl CacheTtl {
+    fn marker(self) -> serde_json::Value {
+        match self {
+            CacheTtl::FiveMinutes => serde_json::json!({ "type": "ephemeral" }),
+            CacheTtl::OneHour => serde_json::json!({ "type": "ephemeral", "ttl": "1h" }),
+        }
+    }
+}
+
+/// TTLs for the stable head of a request (tools, system) and its moving tail
+/// (the conversation). A longer TTL must come before a shorter one, which
+/// this split respects by construction.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CacheLayout {
+    pub head: CacheTtl,
+    pub tail: CacheTtl,
+}
+
+/// Whether an OpenAI-shaped request carries `cache_control` markers.
+///
+/// OpenAI and DeepSeek cache a stable prefix automatically and ignore the
+/// field; Anthropic and Gemini models behind OpenRouter only cache what is
+/// marked. `Auto` decides by the model id (CE-DQ8), so a route switched in
+/// mid-session is marked correctly without anyone remembering a flag.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CacheMarkers {
+    #[default]
+    Auto,
+    On,
+    Off,
+}
+
+/// Model families that only cache prefixes explicitly marked.
+fn model_needs_cache_markers(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    m.contains("claude") || m.starts_with("anthropic/") || m.contains("gemini")
+}
+
+/// Block types Anthropic accepts a `cache_control` on.
+fn is_markable_block(block: &serde_json::Value) -> bool {
+    matches!(
+        block.get("type").and_then(|t| t.as_str()),
+        Some("text" | "tool_use" | "tool_result" | "image")
+    )
+}
+
+/// Mark the last markable block of a message. Returns whether one was found.
+fn mark_last_block(message: &mut serde_json::Value, ttl: CacheTtl) -> bool {
+    let Some(blocks) = message.get_mut("content").and_then(|c| c.as_array_mut()) else {
+        return false;
+    };
+    match blocks.iter_mut().rev().find(|b| is_markable_block(b)) {
+        Some(block) => {
+            block["cache_control"] = ttl.marker();
+            true
+        }
+        None => false,
+    }
+}
+
+/// The index of the message that ended the *previous* request: the one
+/// immediately before the most recent assistant message. Every engine step
+/// appends exactly `[assistant, tool results…]`, so this is computable from
+/// the message list alone — no adapter state.
+fn previous_request_end(messages: &[serde_json::Value]) -> Option<usize> {
+    messages
+        .iter()
+        .rposition(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"))
+        .and_then(|i| i.checked_sub(1))
+}
+
+/// Conversation breakpoints (CE-DQ6): one on the end of this request — where
+/// the next request will read from — and one exactly where the previous
+/// request wrote its entry. A breakpoint on a position already written is a
+/// guaranteed read, so the 20-block lookback can never miss however many
+/// blocks a step appended.
+fn place_conversation_breakpoints(
+    messages: &mut [serde_json::Value],
+    ttl: CacheTtl,
+    mark: impl Fn(&mut serde_json::Value, CacheTtl) -> bool,
+) {
+    let last = messages.len().checked_sub(1);
+    let prev = previous_request_end(messages);
+    let targets: std::collections::BTreeSet<usize> = [prev, last].into_iter().flatten().collect();
+    for idx in targets {
+        mark(&mut messages[idx], ttl);
+    }
+}
+
+/// OpenAI-shaped marking: `cache_control` lives on a *content part*, so a
+/// string `content` becomes a one-part array. Assistant turns that only
+/// carry tool calls have no text to mark and are skipped.
+fn mark_openai_message(message: &mut serde_json::Value, ttl: CacheTtl) -> bool {
+    match message.get("content").cloned() {
+        Some(serde_json::Value::String(text)) if !text.is_empty() => {
+            message["content"] = serde_json::json!([
+                { "type": "text", "text": text, "cache_control": ttl.marker() }
+            ]);
+            true
+        }
+        Some(serde_json::Value::Array(_)) => {
+            let Some(parts) = message["content"].as_array_mut() else {
+                return false;
+            };
+            match parts.iter_mut().rev().find(|p| p["type"] == "text") {
+                Some(part) => {
+                    part["cache_control"] = ttl.marker();
+                    true
+                }
+                None => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Remove every `"ttl"` from `cache_control` markers, leaving the default
+/// five-minute cache.
+fn strip_cache_ttl(v: &mut serde_json::Value) {
+    match v {
+        serde_json::Value::Object(map) => {
+            if let Some(serde_json::Value::Object(marker)) = map.get_mut("cache_control") {
+                marker.remove("ttl");
+            }
+            map.values_mut().for_each(strip_cache_ttl);
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(strip_cache_ttl),
+        _ => {}
+    }
+}
+
+/// CE-DQ7: open a request, and when a gateway rejects the one-hour cache
+/// TTL — some proxies and older API versions do — fall back to the default
+/// TTL for the rest of the process and retry once, reporting it as a retry
+/// so the downgrade is visible rather than silent.
+fn open_with_ttl_fallback(
+    payload: &serde_json::Value,
+    downgraded: &AtomicBool,
+    mut attempt: impl FnMut(&serde_json::Value) -> Result<Attempt, BoxError>,
+) -> Result<Attempt, BoxError> {
+    let carries_ttl = payload.to_string().contains("\"ttl\"");
+    if !carries_ttl {
+        return attempt(payload);
+    }
+    let mut stripped = payload.clone();
+    strip_cache_ttl(&mut stripped);
+    if downgraded.load(Ordering::Relaxed) {
+        return attempt(&stripped);
+    }
+    match attempt(payload) {
+        Err(e) if e.to_string().to_ascii_lowercase().contains("ttl") => {
+            downgraded.store(true, Ordering::Relaxed);
+            let (events, mut retries) = attempt(&stripped)?;
+            retries.insert(
+                0,
+                RetryNotice {
+                    attempt: 1,
+                    max_attempts: 1,
+                    delay_ms: 0,
+                    status: Some(400),
+                    reason: "one-hour prompt cache not supported here; using the 5-minute cache"
+                        .into(),
+                },
+            );
+            Ok((events, retries))
+        }
+        other => other,
     }
 }
 
@@ -925,10 +1147,7 @@ impl OpenAiShapeLlm {
 /// (e.g. right after `/provider` in the TUI) has not been through `app`'s own
 /// pre-flight clamp yet on its very first call.
 fn estimate_prompt_tokens(req: &LlmRequest) -> u64 {
-    req.messages
-        .iter()
-        .map(|m| domain::tokens::estimate_tokens(&m.content))
-        .sum()
+    domain::tokens::estimate_messages(&req.messages)
 }
 
 /// A payload with `max_tokens` overridden — cloned rather than rebuilt so a
@@ -973,8 +1192,21 @@ macro_rules! openai_shaped_port {
             pub fn set_context_window(&mut self, table: WindowTable, cache_path: Option<PathBuf>) {
                 self.0.set_context_window(table, cache_path);
             }
+
+            /// Override whether requests carry `cache_control` markers.
+            pub fn set_cache_markers(&mut self, markers: CacheMarkers) {
+                self.0.set_cache_markers(markers);
+            }
+
+            /// TTLs for the markers, when sent (FR-CACHE-07).
+            pub fn set_cache_layout(&mut self, layout: CacheLayout) {
+                self.0.set_cache_layout(layout);
+            }
         }
         impl domain::LlmPort for $ty {
+            fn set_session(&mut self, session_id: &str) {
+                self.0.session_id = Some(session_id.to_string());
+            }
             fn send(&mut self, req: &LlmRequest) -> Result<LlmResponse, BoxError> {
                 let body = self.0.http_body(req)?;
                 let events = parse_openai_events(&body);
@@ -1027,8 +1259,7 @@ impl OpenRouterLlm {
                     "HTTP-Referer",
                     "https://github.com/zainul/zcode".to_string(),
                 )
-                .with_header("X-Title", "zcode".to_string())
-                .with_cache_control(true),
+                .with_header("X-Title", "zcode".to_string()),
         )
     }
     pub fn endpoint() -> &'static str {
@@ -1091,7 +1322,20 @@ fn chat_completions_url(base_url: &str) -> String {
 }
 openai_shaped_port!(VllmLlm);
 
-fn build_openai_request(req: &LlmRequest, model: &str, cache_control: bool) -> serde_json::Value {
+/// Cache-related shaping of an OpenAI-shaped request.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct OpenAiCacheOptions {
+    /// `Some` when `cache_control` markers are sent, with their TTLs.
+    markers: Option<CacheLayout>,
+    /// `prompt_cache_key`, when the endpoint accepts one.
+    cache_key: Option<String>,
+}
+
+fn build_openai_request(
+    req: &LlmRequest,
+    model: &str,
+    cache: &OpenAiCacheOptions,
+) -> serde_json::Value {
     let messages: Vec<serde_json::Value> = req
         .messages
         .iter()
@@ -1112,19 +1356,35 @@ fn build_openai_request(req: &LlmRequest, model: &str, cache_control: bool) -> s
         payload["tools"] = serde_json::Value::Array(tools);
         payload["tool_choice"] = serde_json::json!("auto");
     }
-    // Mark the whole stable prefix — system prompt, tools and the conversation
-    // so far — as a cache breakpoint. On a provider that honours
-    // `cache_control` (e.g. OpenRouter routing Anthropic models, or any
-    // OpenAI-compatible server that implements prompt caching) the next turn's
-    // identical prefix is served from cache instead of being re-billed. The
-    // breakpoint sits on the last message so it folds in everything before it.
-    if cache_control {
-        if let Some(last) = payload["messages"]
-            .as_array_mut()
-            .and_then(|m| m.last_mut())
-        {
-            last["cache_control"] = serde_json::json!({ "type": "ephemeral" });
+    // Explicit breakpoints for model families that only cache what is marked
+    // (FR-CACHE-03): the system message, then the two conversation
+    // breakpoints (CE-DQ6). Markers go on content *parts*, where OpenRouter
+    // documents them — v0.6 put one on the message object itself.
+    if let Some(layout) = cache.markers {
+        if let Some(messages) = payload["messages"].as_array_mut() {
+            // Every text content becomes a part array, marked or not. Were only
+            // the marked messages converted, a message would render as an array
+            // while it carried the moving breakpoint and as a string once the
+            // breakpoint moved on — different bytes for the same message, which
+            // is exactly the invalidation this layout exists to prevent.
+            for message in messages.iter_mut() {
+                if let Some(text) = message
+                    .get("content")
+                    .and_then(|c| c.as_str())
+                    .filter(|t| !t.is_empty())
+                    .map(str::to_string)
+                {
+                    message["content"] = serde_json::json!([{ "type": "text", "text": text }]);
+                }
+            }
+            if let Some(system) = messages.iter_mut().find(|m| m["role"] == "system") {
+                mark_openai_message(system, layout.head);
+            }
+            place_conversation_breakpoints(messages, layout.tail, mark_openai_message);
         }
+    }
+    if let Some(key) = &cache.cache_key {
+        payload["prompt_cache_key"] = serde_json::json!(key);
     }
     payload
 }
@@ -1225,10 +1485,15 @@ impl SseDecode for OpenAiDecoder {
                 .get("completion_tokens")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
+            // Cache reads: OpenAI and OpenRouter report
+            // `prompt_tokens_details.cached_tokens`; DeepSeek reports
+            // `prompt_cache_hit_tokens` at the top level (FR-CACHE-04). Both
+            // count *inside* `prompt_tokens`. Neither reports cache writes.
             let cache = u
                 .get("prompt_tokens_details")
                 .and_then(|d| d.get("cached_tokens"))
                 .and_then(|v| v.as_u64())
+                .or_else(|| u.get("prompt_cache_hit_tokens").and_then(|v| v.as_u64()))
                 .unwrap_or(0);
             // What the provider says it charged. OpenRouter reports this on
             // every response; it is exact, per-model, and does not depend on a
@@ -1240,7 +1505,7 @@ impl SseDecode for OpenAiDecoder {
             if let Some(finish) = self.pending_finish.as_mut() {
                 finish.input_tokens = in_tok;
                 finish.output_tokens = out_tok;
-                finish.cache_tokens = cache;
+                finish.cache_read_tokens = cache;
                 finish.cost_usd = cost.or(finish.cost_usd);
             }
         }
@@ -1293,7 +1558,8 @@ impl SseDecode for OpenAiDecoder {
                 reason,
                 input_tokens: i,
                 output_tokens: o,
-                cache_tokens: c,
+                cache_read_tokens: c,
+                cache_write_tokens: 0,
                 cost_usd: self.cost_usd,
             });
             self.pending.clear();
@@ -1379,6 +1645,10 @@ pub struct AnthropicLlm {
     model: String,
     retry: RetryPolicy,
     endpoint: String,
+    /// Breakpoint TTLs (FR-CACHE-07).
+    cache_layout: CacheLayout,
+    /// Set once a gateway rejected the one-hour TTL (CE-DQ7).
+    ttl_downgraded: Arc<AtomicBool>,
 }
 
 impl AnthropicLlm {
@@ -1400,7 +1670,14 @@ impl AnthropicLlm {
             model: model.to_string(),
             retry: RetryPolicy::default(),
             endpoint: endpoint.to_string(),
+            cache_layout: CacheLayout::default(),
+            ttl_downgraded: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// TTLs for the cache breakpoints (FR-CACHE-07).
+    pub fn set_cache_layout(&mut self, layout: CacheLayout) {
+        self.cache_layout = layout;
     }
 
     pub fn model(&self) -> &str {
@@ -1417,7 +1694,7 @@ impl AnthropicLlm {
     }
 
     fn open_stream(&self, req: &LlmRequest) -> Result<RetriedResponse, BoxError> {
-        let payload = build_anthropic_request(req, &self.model);
+        let payload = build_anthropic_request_with(req, &self.model, self.cache_layout);
         send_with_retry("anthropic", self.retry, || {
             build_anthropic_request_builder(&self.client, &self.endpoint, &self.api_key, &payload)
         })
@@ -1457,26 +1734,38 @@ impl domain::LlmPort for AnthropicLlm {
         &mut self,
         req: &LlmRequest,
     ) -> Box<dyn Iterator<Item = Result<LlmEvent, BoxError>> + Send> {
-        let payload = build_anthropic_request(req, &self.model);
+        let payload = build_anthropic_request_with(req, &self.model, self.cache_layout);
         let client = self.client.clone();
         let endpoint = self.endpoint.clone();
         let api_key = self.api_key.clone();
         let policy = self.retry;
+        let downgraded = self.ttl_downgraded.clone();
         let open = move || -> Result<Attempt, BoxError> {
-            let RetriedResponse { response, retries } =
-                send_with_retry("anthropic", policy, || {
-                    build_anthropic_request_builder(&client, &endpoint, &api_key, &payload)
-                })?;
-            let events: Box<dyn Iterator<Item = Result<LlmEvent, BoxError>> + Send> = Box::new(
-                EventStream::from_response(response, AnthropicDecoder::default()),
-            );
-            Ok((events, retries))
+            open_with_ttl_fallback(&payload, &downgraded, |payload| {
+                let RetriedResponse { response, retries } =
+                    send_with_retry("anthropic", policy, || {
+                        build_anthropic_request_builder(&client, &endpoint, &api_key, payload)
+                    })?;
+                let events: Box<dyn Iterator<Item = Result<LlmEvent, BoxError>> + Send> = Box::new(
+                    EventStream::from_response(response, AnthropicDecoder::default()),
+                );
+                Ok((events, retries))
+            })
         };
         ResilientStream::start(open, policy)
     }
 }
 
+#[cfg(test)]
 fn build_anthropic_request(req: &LlmRequest, model: &str) -> serde_json::Value {
+    build_anthropic_request_with(req, model, CacheLayout::default())
+}
+
+fn build_anthropic_request_with(
+    req: &LlmRequest,
+    model: &str,
+    layout: CacheLayout,
+) -> serde_json::Value {
     // Anthropic takes the system prompt as a top-level field, not a message.
     let system: String = req
         .messages
@@ -1554,6 +1843,11 @@ fn build_anthropic_request(req: &LlmRequest, model: &str) -> serde_json::Value {
         }
     }
 
+    // BP3/BP4 (CE-DQ6): the conversation itself is cached. v0.6 marked only
+    // the system prompt and tools, so every step re-billed the whole
+    // transcript at the full input rate (PRD B6).
+    place_conversation_breakpoints(&mut messages, layout.tail, mark_last_block);
+
     let tools: Vec<serde_json::Value> = req.tools.iter().map(anthropic_tool_spec).collect();
     let model = if model.is_empty() { &req.model } else { model };
     let mut payload = serde_json::json!({
@@ -1566,37 +1860,48 @@ fn build_anthropic_request(req: &LlmRequest, model: &str) -> serde_json::Value {
     if !system.is_empty() {
         // Anthropic accepts the system prompt as an array of text blocks, and
         // only blocks carry `cache_control`. Marking it caches the (large,
-        // turn-stable) system instructions so every turn after the first reads
-        // them from the prompt cache (FR-COST-01).
+        // turn-stable) system instructions — BP2 (FR-CACHE-01).
         payload["system"] = serde_json::json!([
-            { "type": "text", "text": system, "cache_control": { "type": "ephemeral" } }
+            { "type": "text", "text": system, "cache_control": layout.head.marker() }
         ]);
     }
     if !tools.is_empty() {
         let mut tools = tools;
-        // The tool schemas are equally stable; a cache breakpoint on the last
-        // tool folds the whole tool list into the cached prefix.
+        // The tool schemas are equally stable; a breakpoint on the last tool
+        // folds the whole list into the cached prefix — BP1 (FR-CACHE-01).
         if let Some(last) = tools.last_mut() {
-            last["cache_control"] = serde_json::json!({ "type": "ephemeral" });
+            last["cache_control"] = layout.head.marker();
         }
         payload["tools"] = serde_json::Value::Array(tools);
     }
     payload
 }
 
-/// Anthropic splits cache accounting across several fields — writes
-/// (`cache_creation_*`) and reads (`cache_read_*`). They are separate token
-/// buckets, so the run's cache total is their **sum**; picking one would
-/// under-report whenever both are present.
-fn anthropic_cache_tokens(usage: &serde_json::Value) -> u64 {
-    [
-        "cache_creation_input_tokens",
-        "cache_read_input_tokens",
-        "cache_creation_output_tokens",
-    ]
-    .iter()
-    .filter_map(|k| usage.get(*k).and_then(|v| v.as_u64()))
-    .sum()
+/// Merge one Anthropic `usage` object into the running figures.
+///
+/// `message_delta` usage is **cumulative** and, on current API versions,
+/// repeats the input-side fields `message_start` already reported. Adding the
+/// two — as v0.6 did — double-counted every cache token (and added the one
+/// output token `message_start` reports to the final total). Taking the
+/// maximum of each field is correct for both old and new shapes.
+///
+/// `cache_creation_input_tokens` are writes, `cache_read_input_tokens` reads
+/// (FR-CACHE-04). `cache_creation_output_tokens` is not a documented field
+/// and is ignored.
+fn merge_anthropic_usage(into: &mut LlmFinish, usage: &serde_json::Value) {
+    let field = |k: &str| usage.get(k).and_then(|v| v.as_u64());
+    if let Some(v) = field("input_tokens") {
+        into.input_tokens = into.input_tokens.max(v);
+    }
+    if let Some(v) = field("output_tokens") {
+        into.output_tokens = into.output_tokens.max(v);
+    }
+    if let Some(v) = field("cache_read_input_tokens") {
+        into.cache_read_tokens = into.cache_read_tokens.max(v);
+    }
+    if let Some(v) = field("cache_creation_input_tokens") {
+        into.cache_write_tokens = into.cache_write_tokens.max(v);
+    }
 }
 
 fn anthropic_tool_spec(t: &domain::ToolSpec) -> serde_json::Value {
@@ -1625,7 +1930,8 @@ impl Default for AnthropicDecoder {
                 reason: LlmFinishReason::Stop,
                 input_tokens: 0,
                 output_tokens: 0,
-                cache_tokens: 0,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
                 cost_usd: None,
             },
             last_event: String::new(),
@@ -1692,10 +1998,7 @@ impl SseDecode for AnthropicDecoder {
                     .get("usage")
                     .or_else(|| parsed.get("message").and_then(|m| m.get("usage")));
                 if let Some(u) = u {
-                    if let Some(o) = u.get("output_tokens").and_then(|v| v.as_u64()) {
-                        self.usage.output_tokens += o;
-                    }
-                    self.usage.cache_tokens += anthropic_cache_tokens(u);
+                    merge_anthropic_usage(&mut self.usage, u);
                 }
                 if let Some(stop) = parsed["delta"].get("stop_reason").and_then(|v| v.as_str()) {
                     self.usage.reason = match stop {
@@ -1711,10 +2014,7 @@ impl SseDecode for AnthropicDecoder {
                     .and_then(|m| m.get("usage"))
                     .or_else(|| parsed.get("usage"));
                 if let Some(u) = u {
-                    if let Some(i) = u.get("input_tokens").and_then(|v| v.as_u64()) {
-                        self.usage.input_tokens = i;
-                    }
-                    self.usage.cache_tokens += anthropic_cache_tokens(u);
+                    merge_anthropic_usage(&mut self.usage, u);
                 }
             }
             "message_stop" => {
@@ -1750,6 +2050,9 @@ pub struct OllamaLlm {
     endpoint: String,
     model: String,
     retry: RetryPolicy,
+    /// How long Ollama keeps the model — and its KV cache for the stable
+    /// prefix — loaded between steps (FR-CACHE-10). `None`: Ollama's default.
+    keep_alive: Option<String>,
 }
 
 impl OllamaLlm {
@@ -1763,7 +2066,13 @@ impl OllamaLlm {
             endpoint: endpoint.to_string(),
             model: model.to_string(),
             retry: RetryPolicy::default(),
+            keep_alive: None,
         }
+    }
+
+    /// FR-CACHE-10: e.g. `"30m"`; empty leaves Ollama's default.
+    pub fn set_keep_alive(&mut self, keep_alive: &str) {
+        self.keep_alive = (!keep_alive.trim().is_empty()).then(|| keep_alive.trim().to_string());
     }
 
     pub fn model(&self) -> &str {
@@ -1776,7 +2085,10 @@ impl OllamaLlm {
     }
 
     fn open_stream(&self, req: &LlmRequest) -> Result<RetriedResponse, BoxError> {
-        let payload = build_ollama_request(req, &self.model);
+        let mut payload = build_ollama_request(req, &self.model);
+        if let Some(keep_alive) = &self.keep_alive {
+            payload["keep_alive"] = serde_json::json!(keep_alive);
+        }
         send_with_retry("ollama", self.retry, || {
             build_ollama_request_builder(&self.client, &self.endpoint, &payload)
         })
@@ -1825,7 +2137,10 @@ impl domain::LlmPort for OllamaLlm {
         req: &LlmRequest,
     ) -> Box<dyn Iterator<Item = Result<LlmEvent, BoxError>> + Send> {
         let warn = !req.images.is_empty();
-        let payload = build_ollama_request(req, &self.model);
+        let mut payload = build_ollama_request(req, &self.model);
+        if let Some(keep_alive) = &self.keep_alive {
+            payload["keep_alive"] = serde_json::json!(keep_alive);
+        }
         let client = self.client.clone();
         let endpoint = self.endpoint.clone();
         let policy = self.retry;
@@ -1923,7 +2238,8 @@ impl SseDecode for OllamaDecoder {
                     .get("eval_count")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0),
-                cache_tokens: 0,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
                 cost_usd: None,
             };
             if !self.seen_ids.is_empty() {
@@ -1980,7 +2296,8 @@ impl SseDecode for OllamaDecoder {
                 reason: LlmFinishReason::Stop,
                 input_tokens: 0,
                 output_tokens: 0,
-                cache_tokens: 0,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
                 cost_usd: None,
             })));
             self.done = true;
@@ -2390,7 +2707,8 @@ mod tests {
                         reason: LlmFinishReason::Stop,
                         input_tokens: 0,
                         output_tokens: 0,
-                        cache_tokens: 0,
+                        cache_read_tokens: 0,
+                        cache_write_tokens: 0,
                         cost_usd: None,
                     })),
                 ]
@@ -2499,7 +2817,7 @@ mod tests {
     #[test]
     fn openai_omits_empty_tool_arrays() {
         // An empty `tools: []` is rejected by several OpenAI-compatible servers.
-        let payload = build_openai_request(&req(), "gpt-4o-mini", false);
+        let payload = build_openai_request(&req(), "gpt-4o-mini", &OpenAiCacheOptions::default());
         assert!(payload.get("tools").is_none());
         assert!(payload["stream"].as_bool().unwrap());
         assert!(payload["stream_options"]["include_usage"]
@@ -2515,7 +2833,7 @@ mod tests {
             description: "read a file".into(),
             params_json: r#"{"type":"object"}"#.into(),
         }]);
-        let payload = build_openai_request(&r, "gpt-4o-mini", false);
+        let payload = build_openai_request(&r, "gpt-4o-mini", &OpenAiCacheOptions::default());
         assert_eq!(payload["tools"][0]["function"]["name"], "read");
         assert_eq!(payload["tool_choice"], "auto");
     }
@@ -2669,7 +2987,8 @@ mod tests {
             .expect("finish event");
         assert_eq!(finish.input_tokens, 11);
         assert_eq!(finish.output_tokens, 7);
-        assert_eq!(finish.cache_tokens, 3);
+        assert_eq!(finish.cache_read_tokens, 3);
+        assert_eq!(finish.cache_write_tokens, 0);
         assert_eq!(finish.reason, LlmFinishReason::Stop);
     }
 
@@ -2696,49 +3015,467 @@ mod tests {
     /// OpenRouter (and any cache-aware OpenAI-shaped server) must get a
     /// `cache_control` breakpoint on the request prefix, or every turn re-pays
     /// for the full system prompt + tools.
+    /// CE-DQ3: `MessageMeta` is engine bookkeeping. If it ever reached a
+    /// request body, two transcripts differing only in metadata would render
+    /// different bytes and silently defeat the prompt cache (FR-CACHE-02).
     #[test]
-    fn openai_cache_control_marks_the_last_message() {
-        let payload = build_openai_request(&req(), "gpt-4o-mini", true);
-        let messages = payload["messages"].as_array().unwrap();
-        assert!(
-            messages
-                .last()
-                .unwrap()
-                .get("cache_control")
-                .is_some_and(|c| c["type"] == "ephemeral"),
-            "last message must carry the cache breakpoint: {messages:?}"
-        );
-        // A provider that ignores it must not receive the field at all.
-        let off = build_openai_request(&req(), "gpt-4o-mini", false);
-        assert!(off["messages"]
-            .as_array()
-            .unwrap()
+    fn request_payload_ignores_message_meta() {
+        let plain = req();
+        let mut tagged = req();
+        let messages: Vec<LlmMessage> = tagged
+            .messages
             .iter()
-            .all(|m| m.get("cache_control").is_none()));
+            .cloned()
+            .map(|mut m| {
+                m.meta = domain::MessageMeta {
+                    step: 9,
+                    kind: domain::MessageKind::Summary,
+                    subject: Some(domain::Subject::FileWrite { path: "x".into() }),
+                    tokens_est: 42,
+                    spill: Some("s".into()),
+                };
+                m
+            })
+            .collect();
+        tagged.messages = messages.into_boxed_slice();
+        assert_eq!(
+            build_openai_request(&plain, "gpt-4o", &marked()),
+            build_openai_request(&tagged, "gpt-4o", &marked())
+        );
+        assert_eq!(
+            build_anthropic_request(&plain, "claude-sonnet-4-5"),
+            build_anthropic_request(&tagged, "claude-sonnet-4-5")
+        );
     }
 
-    /// Anthropic caches only what is explicitly marked; without the breakpoint
-    /// the large system prompt and tool schemas are re-billed every turn.
+    fn marked() -> OpenAiCacheOptions {
+        OpenAiCacheOptions {
+            markers: Some(CacheLayout::default()),
+            cache_key: None,
+        }
+    }
+
+    /// A growing agent session: system, prompt, then `steps` rounds of
+    /// [assistant tool call, tool result] — the exact shape the engine sends.
+    fn session_req(steps: usize) -> LlmRequest {
+        let mut messages = vec![
+            LlmMessage::system("you are helpful"),
+            LlmMessage::user("rename foo to bar"),
+        ];
+        for i in 0..steps {
+            let mut call = LlmMessage::assistant(if i % 2 == 0 { "" } else { "checking" });
+            call.tool_calls = Box::new([LlmToolCall {
+                id: format!("c{i}"),
+                name: "read".into(),
+                arguments: format!(r#"{{"path":"f{i}.rs"}}"#),
+            }]);
+            messages.push(call);
+            messages.push(LlmMessage::tool_result_message(domain::LlmToolResult {
+                tool_call_id: format!("c{i}"),
+                content: format!("contents of f{i}"),
+            }));
+        }
+        LlmRequest {
+            messages: messages.into_boxed_slice(),
+            tools: Box::new([domain::ToolSpec {
+                name: "read".into(),
+                description: "read a file".into(),
+                params_json: r#"{"type":"object"}"#.into(),
+            }]),
+            model: "claude-sonnet-4-5".into(),
+            max_tokens: 1024,
+            temperature: 0.0,
+            images: Box::new([]),
+        }
+    }
+
+    /// Every `cache_control` in a payload, as (path, marker) pairs.
+    fn markers(v: &serde_json::Value, path: String, out: &mut Vec<(String, serde_json::Value)>) {
+        match v {
+            serde_json::Value::Object(map) => {
+                for (k, child) in map {
+                    if k == "cache_control" {
+                        out.push((path.clone(), child.clone()));
+                    } else {
+                        markers(child, format!("{path}.{k}"), out);
+                    }
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for (i, child) in items.iter().enumerate() {
+                    markers(child, format!("{path}[{i}]"), out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn marker_paths(payload: &serde_json::Value) -> Vec<String> {
+        let mut out = Vec::new();
+        markers(payload, String::new(), &mut out);
+        out.into_iter().map(|(p, _)| p).collect()
+    }
+
+    /// Remove every `cache_control` so payloads can be compared byte-for-byte:
+    /// the moving marker legitimately differs between steps; nothing else may.
+    fn strip_markers(v: &mut serde_json::Value) {
+        match v {
+            serde_json::Value::Object(map) => {
+                map.remove("cache_control");
+                map.values_mut().for_each(strip_markers);
+            }
+            serde_json::Value::Array(items) => items.iter_mut().for_each(strip_markers),
+            _ => {}
+        }
+    }
+
+    /// FR-CACHE-01 / CE-DQ6: tools, system, the end of the previous request
+    /// and the end of this one — at every step of a growing session.
     #[test]
-    fn anthropic_cache_control_marks_system_and_tools() {
-        let mut r = req();
-        r.tools = Box::new([domain::ToolSpec {
-            name: "read".into(),
-            description: "read a file".into(),
-            params_json: r#"{"type":"object"}"#.into(),
-        }]);
-        let payload = build_anthropic_request(&r, "claude-sonnet-4");
-        let sys = payload["system"]
-            .as_array()
-            .expect("system must be an array of blocks");
-        assert_eq!(sys[0]["type"], "text");
-        assert_eq!(sys[0]["cache_control"]["type"], "ephemeral");
-        let tools = payload["tools"].as_array().unwrap();
+    fn anthropic_layout_marks_tools_system_previous_end_and_last() {
+        for steps in 1..6 {
+            let payload = build_anthropic_request(&session_req(steps), "claude-sonnet-4-5");
+            let paths = marker_paths(&payload);
+            let messages = payload["messages"].as_array().unwrap();
+            let last = messages.len() - 1;
+            let prev = last - 2; // [.., user(results), assistant, user(results)]
+            assert!(paths.contains(&".tools[0]".to_string()), "{paths:?}");
+            assert!(paths.contains(&".system[0]".to_string()), "{paths:?}");
+            assert!(
+                paths
+                    .iter()
+                    .any(|p| p.starts_with(&format!(".messages[{last}]"))),
+                "step {steps}: last message unmarked: {paths:?}"
+            );
+            assert!(
+                paths
+                    .iter()
+                    .any(|p| p.starts_with(&format!(".messages[{prev}]"))),
+                "step {steps}: previous request's end unmarked: {paths:?}"
+            );
+            assert_eq!(paths.len(), 4, "step {steps}: {paths:?}");
+        }
+    }
+
+    /// The API rejects more than four breakpoints; the first request (no
+    /// assistant turn yet) must use fewer, not more.
+    #[test]
+    fn anthropic_layout_never_exceeds_four_markers() {
+        let mut first = session_req(0);
+        first.tools = Box::new([]);
         assert_eq!(
-            tools.last().unwrap()["cache_control"]["type"],
-            "ephemeral",
-            "last tool must carry the cache breakpoint"
+            marker_paths(&build_anthropic_request(&first, "claude")).len(),
+            2
         );
+        for steps in 0..30 {
+            let n = marker_paths(&build_anthropic_request(&session_req(steps), "claude")).len();
+            assert!(n <= 4, "{steps} steps: {n} markers");
+        }
+    }
+
+    /// FR-CACHE-02: with markers stripped, request N is a byte prefix of
+    /// request N+1 in its messages, and tools/system are byte-identical —
+    /// for every builder. Anything else silently defeats the cache.
+    #[test]
+    fn prefix_bytes_are_stable_across_steps() {
+        let builders: Vec<(&str, Box<dyn Fn(&LlmRequest) -> serde_json::Value>)> = vec![
+            (
+                "anthropic",
+                Box::new(|r| build_anthropic_request(r, "claude-sonnet-4-5")),
+            ),
+            (
+                "openai",
+                Box::new(|r| build_openai_request(r, "gpt-4o", &OpenAiCacheOptions::default())),
+            ),
+            (
+                "openrouter-claude",
+                Box::new(|r| build_openai_request(r, "anthropic/claude-sonnet-4.5", &marked())),
+            ),
+        ];
+        for (name, build) in builders {
+            let mut prev: Option<serde_json::Value> = None;
+            for steps in 0..6 {
+                let mut payload = build(&session_req(steps));
+                strip_markers(&mut payload);
+                if let Some(p) = &prev {
+                    assert_eq!(p["tools"], payload["tools"], "{name}: tools changed");
+                    assert_eq!(p["system"], payload["system"], "{name}: system changed");
+                    let before = p["messages"].as_array().unwrap();
+                    let after = payload["messages"].as_array().unwrap();
+                    assert_eq!(
+                        &after[..before.len()],
+                        before.as_slice(),
+                        "{name}: step {steps} rewrote an earlier message"
+                    );
+                }
+                prev = Some(payload);
+            }
+        }
+    }
+
+    #[test]
+    fn anthropic_marker_walks_back_to_a_markable_block() {
+        let mut message = serde_json::json!({
+            "role": "user",
+            "content": [{ "type": "text", "text": "x" }, { "type": "thinking", "thinking": "" }]
+        });
+        assert!(mark_last_block(&mut message, CacheTtl::FiveMinutes));
+        assert!(message["content"][0].get("cache_control").is_some());
+        assert!(message["content"][1].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn one_hour_ttl_renders_the_ttl_field() {
+        let layout = CacheLayout {
+            head: CacheTtl::OneHour,
+            tail: CacheTtl::FiveMinutes,
+        };
+        let payload = build_anthropic_request_with(&session_req(2), "claude", layout);
+        assert_eq!(payload["system"][0]["cache_control"]["ttl"], "1h");
+        let last = payload["messages"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone();
+        let mut found = Vec::new();
+        markers(&last, String::new(), &mut found);
+        assert!(
+            found.iter().all(|(_, m)| m.get("ttl").is_none()),
+            "{found:?}"
+        );
+    }
+
+    /// CE-DQ8: markers follow the model family, not a hand-set flag.
+    #[test]
+    fn openai_markers_follow_the_model_family() {
+        for (model, on) in [
+            ("anthropic/claude-sonnet-4.5", true),
+            ("claude-3-5-haiku", true),
+            ("google/gemini-2.5-pro", true),
+            ("gpt-4o", false),
+            ("deepseek-chat", false),
+            ("z-ai/glm-4.6", false),
+        ] {
+            assert_eq!(model_needs_cache_markers(model), on, "{model}");
+        }
+        let mut or = OpenRouterLlm::new("k", "anthropic/claude-sonnet-4.5");
+        assert!(or.0.markers_on());
+        or.set_cache_markers(CacheMarkers::Off);
+        assert!(!or.0.markers_on());
+    }
+
+    /// OpenRouter documents markers on content parts; a string content is
+    /// turned into a one-part array to carry one.
+    #[test]
+    fn openai_markers_sit_on_content_parts() {
+        let payload =
+            build_openai_request(&session_req(3), "anthropic/claude-sonnet-4.5", &marked());
+        let paths = marker_paths(&payload);
+        assert!(paths.iter().all(|p| p.contains(".content[")), "{paths:?}");
+        let messages = payload["messages"].as_array().unwrap();
+        assert_eq!(
+            messages[0]["content"][0]["type"], "text",
+            "system is a part array"
+        );
+        assert!(paths.len() <= 4, "{paths:?}");
+        // Unmarked requests keep plain string content.
+        let off = build_openai_request(&session_req(3), "gpt-4o", &OpenAiCacheOptions::default());
+        assert!(marker_paths(&off).is_empty());
+        assert!(off["messages"][0]["content"].is_string());
+    }
+
+    fn empty_attempt() -> Attempt {
+        (Box::new(std::iter::empty()), Vec::new())
+    }
+
+    /// CE-DQ7: a gateway that rejects `ttl` gets one retry without it, and
+    /// every later request goes without it from the start.
+    #[test]
+    fn a_rejected_one_hour_ttl_falls_back_once_and_is_remembered() {
+        let layout = CacheLayout {
+            head: CacheTtl::OneHour,
+            tail: CacheTtl::FiveMinutes,
+        };
+        let payload = build_anthropic_request_with(&session_req(2), "claude", layout);
+        let downgraded = AtomicBool::new(false);
+        let mut sent: Vec<bool> = Vec::new();
+        let (_, retries) = open_with_ttl_fallback(&payload, &downgraded, |p| {
+            let has_ttl = p.to_string().contains("\"ttl\"");
+            sent.push(has_ttl);
+            if has_ttl {
+                Err("anthropic request failed (400): cache_control.ttl: extra inputs are not permitted".into())
+            } else {
+                Ok(empty_attempt())
+            }
+        })
+        .unwrap();
+        assert_eq!(sent, [true, false]);
+        assert!(retries[0].reason.contains("5-minute cache"));
+        assert!(downgraded.load(Ordering::Relaxed));
+        let mut later = Vec::new();
+        let _ = open_with_ttl_fallback(&payload, &downgraded, |p| {
+            later.push(p.to_string().contains("\"ttl\""));
+            Ok(empty_attempt())
+        })
+        .map(|_| ())
+        .unwrap();
+        assert_eq!(later, [false], "the downgrade sticks");
+    }
+
+    #[test]
+    fn an_unrelated_error_is_not_retried_without_ttl() {
+        let layout = CacheLayout {
+            head: CacheTtl::OneHour,
+            tail: CacheTtl::OneHour,
+        };
+        let payload = build_anthropic_request_with(&session_req(1), "claude", layout);
+        let downgraded = AtomicBool::new(false);
+        let mut calls = 0;
+        let Err(err) = open_with_ttl_fallback(&payload, &downgraded, |_| {
+            calls += 1;
+            Err("401 invalid x-api-key".into())
+        }) else {
+            panic!("expected the error to surface");
+        };
+        assert_eq!(calls, 1);
+        assert!(err.to_string().contains("401"));
+        assert!(!downgraded.load(Ordering::Relaxed));
+    }
+
+    /// FR-CACHE-03: `prompt_cache_key` only where OpenAI documents it.
+    #[test]
+    fn prompt_cache_key_is_sent_only_to_openai() {
+        use domain::LlmPort;
+        let mut openai =
+            OpenAiLlm::new("https://api.openai.com/v1/chat/completions", "k", "gpt-4o");
+        openai.set_session("sess-1");
+        assert_eq!(
+            openai.0.cache_options().cache_key.as_deref(),
+            Some("sess-1")
+        );
+        let payload = build_openai_request(&req(), "gpt-4o", &openai.0.cache_options());
+        assert_eq!(payload["prompt_cache_key"], "sess-1");
+
+        let mut deepseek = DeepSeekLlm::new("k", "deepseek-chat");
+        deepseek.set_session("sess-1");
+        assert_eq!(deepseek.0.cache_options().cache_key, None);
+    }
+
+    #[test]
+    fn deepseek_cache_hits_are_reads() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":2,\"prompt_cache_hit_tokens\":64,\"prompt_cache_miss_tokens\":36}}\n",
+            "data: [DONE]\n"
+        );
+        let finish = parse_openai_events(body)
+            .into_iter()
+            .flatten()
+            .find_map(|e| match e {
+                LlmEvent::Finish(f) => Some(f),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(finish.cache_read_tokens, 64);
+        assert_eq!(finish.input_tokens, 100);
+    }
+
+    /// `message_delta` usage is cumulative and repeats the input-side fields;
+    /// v0.6 added it to `message_start` and double-counted every cache token.
+    #[test]
+    fn anthropic_usage_is_merged_not_summed() {
+        let body = "\
+event: message_start
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"usage\":{\"input_tokens\":1200,\"output_tokens\":1,\"cache_creation_input_tokens\":300,\"cache_read_input_tokens\":48000}}}
+
+event: message_delta
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":1200,\"output_tokens\":57,\"cache_creation_input_tokens\":300,\"cache_read_input_tokens\":48000}}
+
+event: message_stop
+data: {\"type\":\"message_stop\"}
+
+";
+        let finish = parse_anthropic_events(body)
+            .into_iter()
+            .flatten()
+            .find_map(|e| match e {
+                LlmEvent::Finish(f) => Some(f),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(finish.input_tokens, 1200);
+        assert_eq!(finish.output_tokens, 57);
+        assert_eq!(finish.cache_read_tokens, 48_000);
+        assert_eq!(finish.cache_write_tokens, 300);
+    }
+
+    /// A request whose system prompt is well above every model's minimum
+    /// cacheable prefix (512–4,096 tokens), so a miss means a real problem.
+    fn cacheable_request(model: &str) -> LlmRequest {
+        let rule = "Rule: prefer small, reviewable edits and explain each change briefly. ";
+        LlmRequest {
+            messages: Box::new([
+                LlmMessage::system(&rule.repeat(400)),
+                LlmMessage::user("Reply with the single word: ok"),
+            ]),
+            tools: Box::new([]),
+            model: model.into(),
+            max_tokens: 16,
+            temperature: 0.0,
+            images: Box::new([]),
+        }
+    }
+
+    fn finish_of(mut client: impl domain::LlmPort, req: &LlmRequest) -> LlmFinish {
+        client
+            .stream(req)
+            .filter_map(Result::ok)
+            .find_map(|e| match e {
+                LlmEvent::Finish(f) => Some(f),
+                _ => None,
+            })
+            .expect("a finish event")
+    }
+
+    /// FR-CACHE-09: the second of two identical requests must read from the
+    /// cache. Needs a real key; skipped (passes) without one.
+    #[test]
+    #[ignore = "network: needs ZCODE_ANTHROPIC_API_KEY"]
+    fn anthropic_second_identical_request_reads_cache() {
+        let Ok(key) = std::env::var("ZCODE_ANTHROPIC_API_KEY") else {
+            eprintln!("skipped: ZCODE_ANTHROPIC_API_KEY not set");
+            return;
+        };
+        let model =
+            std::env::var("ZCODE_CACHE_TEST_MODEL").unwrap_or_else(|_| "claude-haiku-4-5".into());
+        let req = cacheable_request(&model);
+        let first = finish_of(AnthropicLlm::new(&key, &model), &req);
+        let second = finish_of(AnthropicLlm::new(&key, &model), &req);
+        assert!(
+            first.cache_write_tokens > 0 || first.cache_read_tokens > 0,
+            "first request neither wrote nor read the cache: {first:?}"
+        );
+        assert!(second.cache_read_tokens > 0, "no cache read: {second:?}");
+    }
+
+    #[test]
+    #[ignore = "network: needs ZCODE_OPENAI_API_KEY"]
+    fn openai_second_identical_request_reads_cache() {
+        let Ok(key) = std::env::var("ZCODE_OPENAI_API_KEY") else {
+            eprintln!("skipped: ZCODE_OPENAI_API_KEY not set");
+            return;
+        };
+        let model = "gpt-4o-mini";
+        let req = cacheable_request(model);
+        let endpoint = "https://api.openai.com/v1/chat/completions";
+        let mut a = OpenAiLlm::new(endpoint, &key, model);
+        domain::LlmPort::set_session(&mut a, "zcode-cache-test");
+        let _ = finish_of(a, &req);
+        let mut b = OpenAiLlm::new(endpoint, &key, model);
+        domain::LlmPort::set_session(&mut b, "zcode-cache-test");
+        let second = finish_of(b, &req);
+        assert!(second.cache_read_tokens > 0, "no cache read: {second:?}");
     }
 
     fn req() -> LlmRequest {
@@ -2780,7 +3517,7 @@ data: [DONE]
                 assert_eq!(f.reason, LlmFinishReason::ToolUse);
                 assert_eq!(f.input_tokens, 10);
                 assert_eq!(f.output_tokens, 12);
-                assert_eq!(f.cache_tokens, 4);
+                assert_eq!(f.cache_read_tokens, 4);
             }
             other => panic!("expected Finish, got {other:?}"),
         }
@@ -2811,13 +3548,13 @@ data: [DONE]
     fn anthropic_parses_usage() {
         let body = "\
 event: message_start
-data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":5,\"output_tokens\":0,\"cache_creation_output_tokens\":2,\"cache_read_input_tokens\":0}}}
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":5,\"output_tokens\":0,\"cache_creation_input_tokens\":2,\"cache_read_input_tokens\":0}}}
 
 event: content_block_delta
 data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}
 
 event: message_delta
-data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":8,\"cache_creation_output_tokens\":0}}
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":8}}
 
 event: message_stop
 data: {\"type\":\"message_stop\"}
@@ -2832,7 +3569,8 @@ data: {\"type\":\"message_stop\"}
                 assert_eq!(f.reason, LlmFinishReason::Stop);
                 assert_eq!(f.input_tokens, 5);
                 assert_eq!(f.output_tokens, 8);
-                assert_eq!(f.cache_tokens, 2);
+                assert_eq!(f.cache_write_tokens, 2);
+                assert_eq!(f.cache_read_tokens, 0);
             }
             other => panic!("expected Finish, got {other:?}"),
         }
@@ -3176,5 +3914,15 @@ data: {\"type\":\"message_stop\"}
             second_sent["max_tokens"].as_u64().unwrap() < 50_000,
             "{second_sent}"
         );
+    }
+
+    #[test]
+    fn ollama_sends_keep_alive_only_when_set() {
+        let mut client = OllamaLlm::new("http://localhost:11434/api/chat", "llama3.2");
+        assert!(client.keep_alive.is_none());
+        client.set_keep_alive("30m");
+        assert_eq!(client.keep_alive.as_deref(), Some("30m"));
+        client.set_keep_alive("  ");
+        assert!(client.keep_alive.is_none());
     }
 }

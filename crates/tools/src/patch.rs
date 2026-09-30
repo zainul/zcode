@@ -268,6 +268,11 @@ pub struct AppliedFile {
     pub path: PathBuf,
     pub action: PatchAction,
     pub hunks: usize,
+    /// Lines the hunks added and removed.
+    pub added: usize,
+    pub removed: usize,
+    /// The file's new text (`None` for a deletion), for the write log.
+    pub content: Option<String>,
 }
 
 /// Apply a whole unified diff beneath `root`.
@@ -277,41 +282,69 @@ pub struct AppliedFile {
 /// files it has not reached yet.
 pub fn apply_patch(root: &Path, patch_text: &str) -> Result<Vec<AppliedFile>, PatchError> {
     let patches = parse_unified_diff(patch_text)?;
-    let mut planned: Vec<(PathBuf, PatchAction, usize, Option<String>)> =
+    let mut planned: Vec<(PathBuf, PatchAction, usize, Option<String>, usize, usize)> =
         Vec::with_capacity(patches.len());
 
     // Pass 1: compute every result before writing anything, so a patch that
     // fails on its third file does not leave the first two rewritten.
     for file in &patches {
         let path = resolve_under(root, &file.path);
+        let (added, removed) =
+            file.hunks
+                .iter()
+                .flat_map(|h| &h.lines)
+                .fold((0, 0), |(a, r), line| match line {
+                    HunkLine::Added(_) => (a + 1, r),
+                    HunkLine::Removed(_) => (a, r + 1),
+                    HunkLine::Context(_) => (a, r),
+                });
         match file.action {
-            PatchAction::Delete => {
-                planned.push((path, PatchAction::Delete, file.hunks.len(), None))
-            }
+            PatchAction::Delete => planned.push((
+                path,
+                PatchAction::Delete,
+                file.hunks.len(),
+                None,
+                added,
+                removed,
+            )),
             PatchAction::Create => {
                 let created = apply_hunks("", &file.hunks, &file.path)?;
-                planned.push((path, PatchAction::Create, file.hunks.len(), Some(created)));
+                planned.push((
+                    path,
+                    PatchAction::Create,
+                    file.hunks.len(),
+                    Some(created),
+                    added,
+                    removed,
+                ));
             }
             PatchAction::Modify => {
                 let current = std::fs::read_to_string(&path)
                     .map_err(|_| PatchError::MissingFile(file.path.clone()))?;
                 let patched = apply_hunks(&current, &file.hunks, &file.path)?;
-                planned.push((path, PatchAction::Modify, file.hunks.len(), Some(patched)));
+                planned.push((
+                    path,
+                    PatchAction::Modify,
+                    file.hunks.len(),
+                    Some(patched),
+                    added,
+                    removed,
+                ));
             }
         }
     }
 
     // Pass 2: write.
     let mut applied = Vec::with_capacity(planned.len());
-    for (path, action, hunks, content) in planned {
-        match (&action, content) {
+    for (path, action, hunks, content, added, removed) in planned {
+        match (&action, &content) {
             (PatchAction::Delete, _) => {
                 std::fs::remove_file(&path).map_err(|e| {
                     PatchError::Malformed(format!("cannot delete {}: {e}", path.display()))
                 })?;
             }
             (_, Some(text)) => {
-                write_atomic(&path, &text).map_err(|e| {
+                write_atomic(&path, text).map_err(|e| {
                     PatchError::Malformed(format!("cannot write {}: {e}", path.display()))
                 })?;
             }
@@ -321,6 +354,9 @@ pub fn apply_patch(root: &Path, patch_text: &str) -> Result<Vec<AppliedFile>, Pa
             path,
             action,
             hunks,
+            added,
+            removed,
+            content,
         });
     }
     Ok(applied)

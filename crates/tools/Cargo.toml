@@ -6,10 +6,11 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-domain = { path = "../domain", version = "0.6.0" }
-infra-shell = { path = "../infra/shell", version = "0.6.0" }
-infra-filesystem = { path = "../infra/filesystem", version = "0.6.0" }
-infra-config = { path = "../infra/config", version = "0.6.0" }
+infra-search = { path = "../infra/search", version = "0.7.0" }
+domain = { path = "../domain", version = "0.7.0" }
+infra-shell = { path = "../infra/shell", version = "0.7.0" }
+infra-filesystem = { path = "../infra/filesystem", version = "0.7.0" }
+infra-config = { path = "../infra/config", version = "0.7.0" }
 log = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true }
@@ -23,13 +24,16 @@ lsp = ["dep:infra-lsp"]
 
 [dependencies.infra-mcp]
 path = "../infra/mcp"
-version = "0.6.0"
+version = "0.7.0"
 optional = true
 
 [dependencies.infra-lsp]
 path = "../infra/lsp"
-version = "0.6.0"
+version = "0.7.0"
 optional = true
 
 [dev-dependencies]
 tempfile = "3.10"
+# The index tools are tested against the real index; the dependency is a
+# test-only one, so `tools` itself still reaches the index through the port.
+infra-index = { path = "../infra/index" }

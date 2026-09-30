@@ -80,11 +80,28 @@ impl<W: Write> Emitter for PrettyEmitter<W> {
                 self.break_line();
                 let _ = writeln!(self.out, "· {}", sanitize(&message));
             }
+            UiEvent::Compacted {
+                tier,
+                tokens_before,
+                tokens_after,
+            } => {
+                self.break_line();
+                let _ = writeln!(
+                    self.out,
+                    "· {}",
+                    domain::describe_compaction(tier, tokens_before, tokens_after)
+                );
+            }
+            // The compaction line already says the cache is rebuilt; other
+            // resets (a mode switch) are shown by the TUI, which has the
+            // context for them.
+            UiEvent::CacheReset { .. } => {}
             // Headless output is a transcript, not a live display: the totals
             // are printed once at the end, so per-step usage has no reader.
             UiEvent::ToolCallArgs { .. }
             | UiEvent::Finish(_)
             | UiEvent::Usage(_)
+            | UiEvent::Context { .. }
             | UiEvent::LoopStart { .. } => {}
         }
         let _ = self.out.flush();
@@ -198,7 +215,8 @@ mod tests {
                 reason: LlmFinishReason::Stop,
                 input_tokens: 1,
                 output_tokens: 1,
-                cache_tokens: 0,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
                 cost_usd: None,
             }),
         ]);

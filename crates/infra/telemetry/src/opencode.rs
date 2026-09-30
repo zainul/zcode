@@ -99,12 +99,12 @@ impl OpencodeTelemetry {
     /// report usage once for the whole run, so intermediate steps carry zeros
     /// and the final one carries the totals. The alternative — one opencode
     /// step per zcode *run* — would lose the step structure entirely.
-    fn close_step(&mut self, finish: &str, cost: Option<f64>, tokens: (u64, u64, u64)) {
+    fn close_step(&mut self, finish: &str, cost: Option<f64>, tokens: (u64, u64, u64, u64)) {
         if !self.step_open {
             return;
         }
         self.step_open = false;
-        let (input, output, cache) = tokens;
+        let (input, output, cache_read, cache_write) = tokens;
         let mut data = self.base_message();
         data.insert("finish".into(), finish.into());
         data.insert("cost".into(), cost.unwrap_or(0.0).into());
@@ -114,10 +114,9 @@ impl OpencodeTelemetry {
                 "input": input,
                 "output": output,
                 "reasoning": 0,
-                // zcode reports one cache figure; opencode splits read from
-                // write. Attributing it all to `read` is the honest placement —
-                // a write would imply a cost we did not measure.
-                "cache": { "read": cache, "write": 0 },
+                // opencode splits cache reads from writes, and so does zcode
+                // since v0.7 (FR-CACHE-04).
+                "cache": { "read": cache_read, "write": cache_write },
             }),
         );
         self.emit_event("session.next.step.ended", data);
@@ -233,7 +232,7 @@ impl TelemetryPort for OpencodeTelemetry {
                 // `step.started` with `step.ended`; leaving them unbalanced
                 // would strand every intermediate step open in a consumer.
                 self.close_text();
-                self.close_step("tool_use", None, (0, 0, 0));
+                self.close_step("tool_use", None, (0, 0, 0, 0));
                 let mut data = self.base_message();
                 data.insert(
                     "agent".into(),
@@ -376,7 +375,12 @@ impl TelemetryPort for OpencodeTelemetry {
                 self.close_step(
                     &reason,
                     cost,
-                    (ev.input_tokens, ev.output_tokens, ev.cache_tokens),
+                    (
+                        ev.input_tokens,
+                        ev.output_tokens,
+                        ev.cache_read_tokens,
+                        ev.cache_write_tokens,
+                    ),
                 );
 
                 if truncated {
@@ -437,7 +441,8 @@ mod tests {
             model: "anthropic/claude-haiku-4.5".into(),
             input_tokens: 0,
             output_tokens: 0,
-            cache_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             steps: 1,
             execution_time_ms: 0,
             session_id: "01a03d78-8a60-7d00-853b-21ad80af5fd2".into(),
@@ -627,7 +632,7 @@ mod tests {
         let mut ev = event("finish", vec![("reason", ExtraField::Text("stop".into()))]);
         ev.input_tokens = 7078;
         ev.output_tokens = 154;
-        ev.cache_tokens = 2496;
+        ev.cache_read_tokens = 2496;
         // A real run opens a step first; `step.ended` closes that step.
         let out = render(vec![event("loop_start", vec![]), ev]);
         let ended = &out[1];
@@ -832,5 +837,42 @@ mod tests {
             ));
         }
         assert!(t.calls.len() <= 64, "{} entries retained", t.calls.len());
+    }
+
+    /// opencode's `session-event.ts` defines no compaction event, so the
+    /// translation carries none (translation, not emulation — CLAUDE.md).
+    #[test]
+    fn compaction_events_have_no_opencode_translation() {
+        let cap = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        struct W(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for W {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut tel = OpencodeTelemetry::new(Box::new(W(cap.clone())));
+        for kind in [
+            "context_compacted",
+            "cache_reset",
+            "context_compaction_failed",
+        ] {
+            tel.emit(TelemetryEvent {
+                kind: kind.into(),
+                model: "m".into(),
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                steps: 1,
+                execution_time_ms: 1,
+                session_id: "s".into(),
+                extra: Box::new([]),
+            });
+        }
+        assert!(cap.lock().unwrap().is_empty());
     }
 }

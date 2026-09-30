@@ -12,13 +12,16 @@ members = [
     "crates/infra/lsp",
     "crates/infra/session",
     "crates/infra/telemetry",
+    "crates/infra/search",
+    "crates/infra/index",
     "crates/cli",
     "benches",
+    "evals",
 ]
 exclude = ["target"]
 
 [workspace.package]
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
@@ -31,6 +34,8 @@ tokio = { version = "1.39", default-features = false, features = ["rt", "macros"
 clap = { version = "4.5", features = ["derive"] }
 toml = "0.8"
 serde = { version = "1.0", features = ["derive"] }
+# Keep `preserve_order` OFF: maps must serialise with sorted keys so request
+# payloads are byte-identical across steps (FR-CACHE-02, prompt caching).
 serde_json = "1.0"
 thiserror = "1.0"
 log = "0.4"
@@ -43,9 +48,21 @@ crossterm = "0.28"
 regex = "1.10"
 signal-hook = "0.3"
 tempfile = "3.10"
+# ripgrep's own engine, embedded (PRD-CTX-EFF-003 D-1, technical plan CE-DQ1).
+# `ignore` 0.4.30 uses let-chains (E0658 on the pinned 1.85 toolchain) without
+# declaring a rust-version, so the MSRV-aware resolver cannot skip it; 0.4.31+
+# declare 1.88. Revisit when rust-toolchain.toml moves to >= 1.88.
+ignore = "=0.4.29"
+globset = "0.4"
+grep-searcher = "0.1"
+grep-regex = "0.1"
+grep-matcher = "0.1"
 
 [profile.release]
-lto = "thin"
+# Fat LTO: -0.7 MB over thin with the tree-sitter grammars in, which keeps
+# the release inside NFR-CTX-SIZE-01 (≤ v0.6.0 + 6 MB). Costs ~1 min of
+# release build time.
+lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = "symbols"

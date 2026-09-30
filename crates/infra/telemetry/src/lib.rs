@@ -8,6 +8,7 @@
 //! Direct deps: domain, serde, serde_json.
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -26,6 +27,100 @@ pub struct JsonTelemetry {
     report_dir: PathBuf,
     totals: TelemetryTotals,
     start: Instant,
+    /// Token attribution by tool and by pipeline stage (FR-BUDGET-04).
+    ledger: Ledger,
+    /// Peak live context and the model window it was measured against.
+    context: Option<ContextReport>,
+    /// Computed by the engine, which knows whether the provider counts
+    /// cached tokens inside `input_tokens`.
+    cache_hit_ratio: Option<f64>,
+}
+
+/// Aggregate cost of one tool's (or one category's) results.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Agg {
+    pub calls: u64,
+    pub tokens_est: u64,
+    pub chars: u64,
+    pub truncated: u64,
+    pub errors: u64,
+}
+
+/// Where the run's tool-result tokens went (FR-BUDGET-04). `BTreeMap` so the
+/// report's key order is deterministic.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Ledger {
+    pub by_tool: BTreeMap<String, Agg>,
+    pub by_category: BTreeMap<String, Agg>,
+    /// Shell commands that were searches (`grep`, `rg`, `find`…) — the
+    /// leading indicator for search going around the `grep` tool
+    /// (FR-SEARCH-09).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub shell_search_calls: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+impl Ledger {
+    fn is_empty(&self) -> bool {
+        self.by_tool.is_empty() && self.shell_search_calls == 0
+    }
+
+    /// Fold one `tool_result` event's extras in.
+    fn record(&mut self, extra: &[(String, ExtraField)]) {
+        let mut tool = None;
+        let mut category = None;
+        let mut agg = Agg {
+            calls: 1,
+            ..Agg::default()
+        };
+        for (k, v) in extra {
+            match (k.as_str(), v) {
+                ("tool", ExtraField::Text(t)) => tool = Some(t.clone()),
+                ("category", ExtraField::Text(c)) => category = Some(c.clone()),
+                ("tokens_est", ExtraField::Number(n)) => agg.tokens_est = *n as u64,
+                ("chars", ExtraField::Number(n)) => agg.chars = *n as u64,
+                ("truncated", ExtraField::Bool(true)) => agg.truncated = 1,
+                ("error", ExtraField::Text(_)) => agg.errors = 1,
+                _ => {}
+            }
+        }
+        let Some(tool) = tool else { return };
+        let category = category.unwrap_or_else(|| domain::tool_category(&tool).to_string());
+        add(self.by_tool.entry(tool).or_default(), &agg);
+        add(self.by_category.entry(category).or_default(), &agg);
+    }
+}
+
+fn add(into: &mut Agg, from: &Agg) {
+    into.calls += from.calls;
+    into.tokens_est += from.tokens_est;
+    into.chars += from.chars;
+    into.truncated += from.truncated;
+    into.errors += from.errors;
+}
+
+/// The report's `cache` section (FR-CACHE-04).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct CacheReport {
+    pub read: u64,
+    pub write: u64,
+    /// Share of the run's prompt tokens served from cache, as computed by
+    /// the engine. Absent when nothing about caching was reported.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub hit_ratio: Option<f64>,
+}
+
+/// The report's `context` section (PRD M7).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ContextReport {
+    pub peak_tokens: u64,
+    /// Peak as a fraction of the model's window; absent when the window is
+    /// unknown rather than guessed.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub peak_pct: Option<f64>,
 }
 
 impl JsonTelemetry {
@@ -40,7 +135,8 @@ impl JsonTelemetry {
                 model: String::new(),
                 input_tokens: 0,
                 output_tokens: 0,
-                cache_tokens: 0,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
                 steps: 0,
                 execution_time_ms: 0,
                 session_id: String::new(),
@@ -49,6 +145,9 @@ impl JsonTelemetry {
                 cost_usd: None,
             },
             start: Instant::now(),
+            ledger: Ledger::default(),
+            context: None,
+            cache_hit_ratio: None,
         }
     }
 
@@ -99,7 +198,8 @@ impl TelemetryPort for JsonTelemetry {
         // engine-supplied counts; see DQ2 — provider-reported usage wins).
         self.totals.input_tokens = self.totals.input_tokens.max(ev.input_tokens);
         self.totals.output_tokens = self.totals.output_tokens.max(ev.output_tokens);
-        self.totals.cache_tokens = self.totals.cache_tokens.max(ev.cache_tokens);
+        self.totals.cache_read_tokens = self.totals.cache_read_tokens.max(ev.cache_read_tokens);
+        self.totals.cache_write_tokens = self.totals.cache_write_tokens.max(ev.cache_write_tokens);
         self.totals.steps = self.totals.steps.max(ev.steps);
         self.totals.execution_time_ms = self.totals.execution_time_ms.max(elapsed_ms);
         if !ev.model.is_empty() {
@@ -115,13 +215,52 @@ impl TelemetryPort for JsonTelemetry {
             }
         }
 
+        match ev.kind.as_str() {
+            "tool_result" => self.ledger.record(&ev.extra),
+            "tool_call" => {
+                let search = ev.extra.iter().any(|(k, v)| {
+                    k == "class" && matches!(v, ExtraField::Text(c) if c == "shell_search")
+                });
+                if search {
+                    self.ledger.shell_search_calls += 1;
+                }
+            }
+            "finish" => {
+                let number = |key: &str| {
+                    ev.extra
+                        .iter()
+                        .find_map(|(k, v)| match (k.as_str() == key, v) {
+                            (true, ExtraField::Number(n)) => Some(*n),
+                            _ => None,
+                        })
+                };
+                if let Some(ratio) = number("cache_hit_ratio") {
+                    self.cache_hit_ratio = Some(ratio);
+                }
+                if let Some(peak) = number("peak_context_tokens") {
+                    let peak = peak as u64;
+                    self.context = Some(ContextReport {
+                        peak_tokens: peak,
+                        peak_pct: number("context_window")
+                            .filter(|w| *w > 0.0)
+                            .map(|w| peak as f64 / w),
+                    });
+                }
+            }
+            _ => {}
+        }
+
         // Build one JSON object: base fields + flattened extra (FR-OUTPUT-01).
         let mut obj = serde_json::json!({
             "kind": ev.kind,
             "model": ev.model,
             "input_tokens": ev.input_tokens,
             "output_tokens": ev.output_tokens,
-            "cache_tokens": ev.cache_tokens,
+            "cache_read_tokens": ev.cache_read_tokens,
+            "cache_write_tokens": ev.cache_write_tokens,
+            // Deprecated (v0.7): reads + writes, kept one release for
+            // consumers of the v0.6 stream.
+            "cache_tokens": ev.cache_read_tokens + ev.cache_write_tokens,
             "steps": ev.steps,
             "execution_time_ms": elapsed_ms,
             "session_id": ev.session_id,
@@ -148,7 +287,8 @@ impl TelemetryPort for JsonTelemetry {
             },
             input_tokens: self.totals.input_tokens.max(total.input_tokens),
             output_tokens: self.totals.output_tokens.max(total.output_tokens),
-            cache_tokens: self.totals.cache_tokens.max(total.cache_tokens),
+            cache_read_tokens: self.totals.cache_read_tokens.max(total.cache_read_tokens),
+            cache_write_tokens: self.totals.cache_write_tokens.max(total.cache_write_tokens),
             steps: self.totals.steps.max(total.steps),
             execution_time_ms: self.totals.execution_time_ms.max(total.execution_time_ms),
             session_id: session_id.to_string(),
@@ -169,12 +309,19 @@ impl TelemetryPort for JsonTelemetry {
             model: merged.model,
             input_tokens: merged.input_tokens,
             output_tokens: merged.output_tokens,
-            cache_tokens: merged.cache_tokens,
+            cache_tokens: merged.cache_read_tokens + merged.cache_write_tokens,
+            cache: CacheReport {
+                read: merged.cache_read_tokens,
+                write: merged.cache_write_tokens,
+                hit_ratio: self.cache_hit_ratio,
+            },
             steps: merged.steps,
             execution_time_ms: merged.execution_time_ms,
             finish_reason: merged.finish_reason,
             truncated: merged.truncated,
             cost_usd: merged.cost_usd,
+            ledger: self.ledger.clone(),
+            context: self.context.clone(),
         };
         let json = serde_json::to_string_pretty(&report)?;
         let path = self
@@ -190,6 +337,11 @@ impl JsonTelemetry {
     pub fn totals(&self) -> &TelemetryTotals {
         &self.totals
     }
+
+    /// Token attribution accumulated so far (FR-BUDGET-04).
+    pub fn ledger(&self) -> &Ledger {
+        &self.ledger
+    }
 }
 
 /// The on-disk report schema (M1.7). Exactly the documented keys.
@@ -200,7 +352,11 @@ struct ReportFile {
     model: String,
     input_tokens: u64,
     output_tokens: u64,
+    /// Deprecated (v0.7): reads + writes; see `cache`.
     cache_tokens: u64,
+    /// Cache reads and writes kept apart (FR-CACHE-04).
+    #[serde(default)]
+    cache: CacheReport,
     steps: u64,
     execution_time_ms: u64,
     finish_reason: String,
@@ -208,6 +364,12 @@ struct ReportFile {
     /// Estimated USD spend. Absent — not zero — when the model is unpriced.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     cost_usd: Option<f64>,
+    /// Token attribution by tool and category (FR-BUDGET-04). Additive: a
+    /// consumer of the v0.6 report sees the same keys it always did.
+    #[serde(skip_serializing_if = "Ledger::is_empty", default)]
+    ledger: Ledger,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    context: Option<ContextReport>,
 }
 
 /// Atomic write: `<path>.tmp` then `fs::rename` (same-filesystem rename is
@@ -284,7 +446,8 @@ mod tests {
             model: model.to_string(),
             input_tokens: 0,
             output_tokens: 0,
-            cache_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             steps: 0,
             execution_time_ms: 0,
             session_id: String::new(),
@@ -304,7 +467,8 @@ mod tests {
             model: "openai/gpt-4o-mini".into(),
             input_tokens: 0,
             output_tokens: 3,
-            cache_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             steps: 1,
             execution_time_ms: 42,
             session_id: "s".into(),
@@ -315,7 +479,8 @@ mod tests {
             model: "openai/gpt-4o-mini".into(),
             input_tokens: 0,
             output_tokens: 2,
-            cache_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             steps: 1,
             execution_time_ms: 50,
             session_id: "s".into(),
@@ -326,7 +491,8 @@ mod tests {
             model: "openai/gpt-4o-mini".into(),
             input_tokens: 128,
             output_tokens: 64,
-            cache_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             steps: 3,
             execution_time_ms: 1200,
             session_id: "s".into(),
@@ -349,6 +515,108 @@ mod tests {
         assert_eq!(finish["reason"], "stop");
         // Flattened extra merged.
         assert_eq!(finish["delta"], serde_json::Value::Null);
+    }
+
+    fn event(kind: &str, extra: Vec<(&str, ExtraField)>) -> TelemetryEvent {
+        TelemetryEvent {
+            kind: kind.into(),
+            model: "m".into(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            steps: 1,
+            execution_time_ms: 1,
+            session_id: "s".into(),
+            extra: extra.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
+        }
+    }
+
+    fn tool_result(tool: &str, category: &str, tokens: f64, error: bool) -> TelemetryEvent {
+        event(
+            "tool_result",
+            vec![
+                ("tool", ExtraField::Text(tool.into())),
+                ("category", ExtraField::Text(category.into())),
+                ("tokens_est", ExtraField::Number(tokens)),
+                ("chars", ExtraField::Number(tokens * 4.0)),
+                ("truncated", ExtraField::Bool(false)),
+                (
+                    "error",
+                    if error {
+                        ExtraField::Text("boom".into())
+                    } else {
+                        ExtraField::Null
+                    },
+                ),
+            ],
+        )
+    }
+
+    #[test]
+    fn report_contains_the_ledger_and_context_sections() {
+        let dir = tempfile::tempdir().unwrap();
+        let out: Box<dyn Write + Send> = Box::new(CapturingWriter::default());
+        let mut tel = JsonTelemetry::new(out, dir.path().to_path_buf());
+        tel.emit(tool_result("read", "inspect", 900.0, false));
+        tel.emit(tool_result("read", "inspect", 100.0, true));
+        tel.emit(tool_result("grep", "locate", 40.0, false));
+        tel.emit(event(
+            "finish",
+            vec![
+                ("peak_context_tokens", ExtraField::Number(50_000.0)),
+                ("context_window", ExtraField::Number(200_000.0)),
+            ],
+        ));
+        let path = tel.flush_report("s", te("m")).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(json["ledger"]["by_tool"]["read"]["calls"], 2);
+        assert_eq!(json["ledger"]["by_tool"]["read"]["tokens_est"], 1000);
+        assert_eq!(json["ledger"]["by_tool"]["read"]["errors"], 1);
+        assert_eq!(json["ledger"]["by_category"]["locate"]["tokens_est"], 40);
+        assert_eq!(json["context"]["peak_tokens"], 50_000);
+        assert_eq!(json["context"]["peak_pct"], 0.25);
+    }
+
+    #[test]
+    fn report_splits_cache_reads_and_writes_and_carries_the_hit_ratio() {
+        let dir = tempfile::tempdir().unwrap();
+        let out: Box<dyn Write + Send> = Box::new(CapturingWriter::default());
+        let mut tel = JsonTelemetry::new(out, dir.path().to_path_buf());
+        let mut finish = event("finish", vec![("cache_hit_ratio", ExtraField::Number(0.9))]);
+        finish.input_tokens = 1_000;
+        finish.cache_read_tokens = 9_000;
+        finish.cache_write_tokens = 200;
+        tel.emit(finish);
+        let path = tel.flush_report("s", te("m")).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(json["cache"]["read"], 9_000);
+        assert_eq!(json["cache"]["write"], 200);
+        assert_eq!(json["cache"]["hit_ratio"], 0.9);
+        // The v0.6 field survives one release, as the sum.
+        assert_eq!(json["cache_tokens"], 9_200);
+    }
+
+    #[test]
+    fn a_run_with_no_tools_and_no_window_omits_both_sections() {
+        let dir = tempfile::tempdir().unwrap();
+        let out: Box<dyn Write + Send> = Box::new(CapturingWriter::default());
+        let mut tel = JsonTelemetry::new(out, dir.path().to_path_buf());
+        tel.emit(event(
+            "finish",
+            vec![
+                ("peak_context_tokens", ExtraField::Number(10.0)),
+                ("context_window", ExtraField::Null),
+            ],
+        ));
+        let path = tel.flush_report("s", te("m")).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        assert!(json.get("ledger").is_none());
+        assert_eq!(json["context"]["peak_tokens"], 10);
+        assert!(json["context"].get("peak_pct").is_none());
     }
 
     #[test]
@@ -422,7 +690,8 @@ mod tests {
             model: "m".into(),
             input_tokens: 0,
             output_tokens: 0,
-            cache_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             steps: 0,
             execution_time_ms: 0,
             session_id: "s".into(),
@@ -452,7 +721,8 @@ mod tests {
             model: "openai/gpt-4o-mini".into(),
             input_tokens: 0,
             output_tokens: 3,
-            cache_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             steps: 1,
             execution_time_ms: 42,
             session_id: "s".into(),
@@ -463,7 +733,8 @@ mod tests {
             model: "openai/gpt-4o-mini".into(),
             input_tokens: 128,
             output_tokens: 64,
-            cache_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             steps: 3,
             execution_time_ms: 1200,
             session_id: "s".into(),

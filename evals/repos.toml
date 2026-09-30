@@ -1,0 +1,33 @@
+# Fixture repositories for the evaluation corpus (PRD-CTX-EFF-003 §10.1).
+# Paths are relative to evals/. Every run gets a fresh copy.
+
+# zcode itself at the last release before this milestone (Rust, ~25k LOC).
+[[repo]]
+name = "zcode"
+kind = "git_archive"
+path = ".."
+rev = "v0.6.0"
+setup = "setup/zcode.sh"
+
+[[repo]]
+name = "go-service"
+kind = "fixture"
+path = "fixtures/go-service"
+
+[[repo]]
+name = "next-app"
+kind = "fixture"
+path = "fixtures/next-app"
+setup = "setup/next-app.sh"
+
+[[repo]]
+name = "py-lib"
+kind = "fixture"
+path = "fixtures/py-lib"
+
+# The replay self-test's repo: the same Python fixture, named separately so
+# the corpus-coverage check does not expect six tasks from it.
+[[repo]]
+name = "selftest-lib"
+kind = "fixture"
+path = "fixtures/py-lib"
