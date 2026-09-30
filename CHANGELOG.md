@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+**Context efficiency (PRD-CTX-EFF-003).** The three phases the PRD planned
+as v0.7–v0.9 ship together here: token accounting and prompt caching,
+ripgrep search and discovery filtering, output shaping and safe edits,
+automatic compaction, LSP addressing and diagnostics, the tree-sitter code
+index with its tools and repo map, `edit_symbol`, and the lazy LSP pool.
+What was measured, where the implementation departs from the task
+documents, and what still needs provider keys (the live token evaluation)
+is recorded in `docs/prd/context-efficiency/code-review.md`.
+
 ### Added — `/compact`, `zcode session compact`, `--no-compact`, `zcode ignore check` (FR-CTX-12, FR-FILTER-07)
 
 `/compact [focus]` in the TUI and `zcode session compact <id> [--focus
