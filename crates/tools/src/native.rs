@@ -42,8 +42,142 @@ pub(crate) fn parse_args(args_json: &str) -> Result<Value, ToolResult> {
     if args_json.trim().is_empty() {
         return Ok(Value::Object(Default::default()));
     }
-    serde_json::from_str(args_json)
-        .map_err(|e| tool_error(format!("arguments must be a JSON object: {e}")))
+    let strict = match serde_json::from_str::<Value>(args_json) {
+        Ok(v) => return Ok(v),
+        Err(e) => e,
+    };
+    // Smaller models slip on JSON syntax in ways whose meaning is not in
+    // doubt — `{'pattern': '*.rs'}`, `{"pattern": **/*.rs}`, a trailing
+    // comma. Refusing them costs a round trip and, since the model cannot
+    // see what it sent, often a second identical failure.
+    if let Some(v) = repair_json(args_json)
+        .and_then(|fixed| serde_json::from_str::<Value>(&fixed).ok())
+        .filter(Value::is_object)
+    {
+        return Ok(v);
+    }
+    let sent: String = args_json.chars().take(200).collect();
+    let more = if args_json.chars().count() > 200 {
+        "…"
+    } else {
+        ""
+    };
+    Err(tool_error(format!(
+        "arguments must be a JSON object: {strict}. You sent: {sent}{more} — quote every \
+         string with double quotes, e.g. {{\"pattern\": \"**/*.rs\"}}"
+    )))
+}
+
+/// Rewrite common, unambiguous JSON slips into JSON: single-quoted strings,
+/// unquoted keys, bare unquoted values (`**/*.rs`) and trailing commas.
+/// `None` when the text has no slip this knows how to mend.
+fn repair_json(text: &str) -> Option<String> {
+    let chars: Vec<char> = text.trim().chars().collect();
+    let mut out = String::with_capacity(text.len() + 8);
+    let mut changed = false;
+    let mut i = 0;
+    // What the last significant character was, to tell keys from values.
+    let mut prev = ' ';
+    let quote = |s: &str, out: &mut String| {
+        out.push('"');
+        for c in s.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                c => out.push(c),
+            }
+        }
+        out.push('"');
+    };
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            '"' => {
+                // A proper string: copy it through, escapes and all.
+                out.push(c);
+                i += 1;
+                while i < chars.len() {
+                    let d = chars[i];
+                    out.push(d);
+                    i += 1;
+                    if d == '\\' && i < chars.len() {
+                        out.push(chars[i]);
+                        i += 1;
+                    } else if d == '"' {
+                        break;
+                    }
+                }
+                prev = '"';
+            }
+            '\'' => {
+                let mut s = String::new();
+                i += 1;
+                while i < chars.len() && chars[i] != '\'' {
+                    if chars[i] == '\\' && i + 1 < chars.len() {
+                        i += 1;
+                    }
+                    s.push(chars[i]);
+                    i += 1;
+                }
+                i += 1; // closing quote
+                quote(&s, &mut out);
+                changed = true;
+                prev = '"';
+            }
+            ',' => {
+                // A trailing comma: drop it.
+                let next = chars[i + 1..].iter().find(|c| !c.is_whitespace());
+                if matches!(next, Some('}') | Some(']')) {
+                    changed = true;
+                } else {
+                    out.push(c);
+                    prev = c;
+                }
+                i += 1;
+            }
+            c if c.is_whitespace() => {
+                out.push(c);
+                i += 1;
+            }
+            '{' | '}' | '[' | ']' | ':' => {
+                out.push(c);
+                prev = c;
+                i += 1;
+            }
+            _ => {
+                // A bare token: a number or literal stays; a key or any
+                // other value is quoted. It runs to the next delimiter.
+                let in_key = matches!(prev, '{' | ',')
+                    && chars[i..].iter().position(|&d| d == ':').is_some_and(|p| {
+                        !chars[i..i + p].iter().any(|d| matches!(d, ',' | '}' | '"'))
+                    });
+                let end = chars[i..]
+                    .iter()
+                    .position(|&d| {
+                        if in_key {
+                            d == ':'
+                        } else {
+                            matches!(d, ',' | '}' | ']')
+                        }
+                    })
+                    .map_or(chars.len(), |p| i + p);
+                let token: String = chars[i..end].iter().collect();
+                let token = token.trim_end();
+                let literal = matches!(token, "true" | "false" | "null")
+                    || serde_json::from_str::<serde_json::Number>(token).is_ok();
+                if literal && !in_key {
+                    out.push_str(token);
+                } else {
+                    quote(token, &mut out);
+                    changed = true;
+                }
+                prev = '"';
+                i = end;
+            }
+        }
+    }
+    changed.then_some(out)
 }
 
 fn str_arg(args: &Value, key: &str) -> Result<String, ToolResult> {
@@ -859,6 +993,56 @@ impl Tool for SkillTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn common_json_slips_in_arguments_are_mended() {
+        let ok = |raw: &str, want: serde_json::Value| {
+            assert_eq!(parse_args(raw).expect(raw), want, "{raw}");
+        };
+        ok(
+            r#"{"pattern": ["**/*.rs"]}"#,
+            serde_json::json!({"pattern": ["**/*.rs"]}),
+        );
+        ok(
+            "{'pattern': '**/*.rs'}",
+            serde_json::json!({"pattern": "**/*.rs"}),
+        );
+        ok(
+            r#"{"pattern": **/*.rs}"#,
+            serde_json::json!({"pattern": "**/*.rs"}),
+        );
+        ok(
+            r#"{"pattern": [**/*.rs, *.go]}"#,
+            serde_json::json!({"pattern": ["**/*.rs", "*.go"]}),
+        );
+        ok(
+            r#"{pattern: "*.rs", limit: 5}"#,
+            serde_json::json!({"pattern": "*.rs", "limit": 5}),
+        );
+        ok(
+            r#"{"path": "src", "recursive": true,}"#,
+            serde_json::json!({"path": "src", "recursive": true}),
+        );
+        ok(
+            "{'q': 'it\\'s \"x\"'}",
+            serde_json::json!({"q": "it's \"x\""}),
+        );
+        ok(
+            r#"{"url": http://a/b?c=1}"#,
+            serde_json::json!({"url": "http://a/b?c=1"}),
+        );
+    }
+
+    #[test]
+    fn unmendable_arguments_are_quoted_back_to_the_model() {
+        let err = parse_args(r#"{"pattern": "**/*.rs""#)
+            .unwrap_err()
+            .error
+            .unwrap();
+        assert!(err.starts_with("arguments must be a JSON object:"), "{err}");
+        assert!(err.contains(r#"You sent: {"pattern": "**/*.rs""#), "{err}");
+        assert!(err.contains(r#"e.g. {"pattern": "**/*.rs"}"#), "{err}");
+    }
 
     fn tempdir() -> tempfile::TempDir {
         tempfile::tempdir().expect("tempdir")

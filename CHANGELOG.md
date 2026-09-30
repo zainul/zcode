@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-09-30
+
+### Fixed — tool arguments with small JSON slips were refused
+
+A model that wrote `{'pattern': '*.rs'}`, `{"pattern": **/*.rs}`, an
+unquoted key or a trailing comma got `arguments must be a JSON object:
+expected value at line 1 column 13` and, unable to see what it had sent,
+often repeated it. Native and LSP tool arguments that fail strict parsing
+are now mended when the slip is unambiguous (single quotes, bare keys, bare
+values, trailing commas); otherwise the error quotes what was sent and shows
+a correct example.
+
 ## [0.7.0] - 2026-09-30
 
 **Context efficiency (PRD-CTX-EFF-003).** The three phases the PRD planned

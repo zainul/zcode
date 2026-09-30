@@ -5,10 +5,10 @@ edition.workspace = true
 publish = false
 
 [dependencies]
-domain = { path = "../crates/domain", version = "0.7.0" }
+domain = { path = "../crates/domain", version = "0.7.1" }
 criterion = "0.5"
-infra-search = { path = "../crates/infra/search", version = "0.7.0" }
-app = { path = "../crates/app", version = "0.7.0" }
+infra-search = { path = "../crates/infra/search", version = "0.7.1" }
+app = { path = "../crates/app", version = "0.7.1" }
 
 [[bench]]
 name = "smoke"
