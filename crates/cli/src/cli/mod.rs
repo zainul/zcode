@@ -1337,9 +1337,11 @@ fn cmd_config(args: ConfigArgs) -> CliResult {
     let lsp = cfg.effective_lsp_servers();
     let detected = cfg.detected_language();
     outln!(
-        "  {:<22} {}{}",
+        "  {:<22} {} — each starts on first use, at most {} at once, stopped after {}s idle{}",
         "lsp servers",
         lsp.len(),
+        cfg.lsp_tuning.max_servers,
+        cfg.lsp_tuning.idle_shutdown_s,
         match &detected {
             Some(language) => format!("  (project looks like {language})"),
             None => String::new(),

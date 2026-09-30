@@ -437,6 +437,28 @@ pub trait LspPort {
     fn readiness(&self) -> crate::LspReadiness {
         crate::LspReadiness::Ready
     }
+
+    /// Readiness of whichever server answers for `uri` (a pool holds one
+    /// per language).
+    fn readiness_for(&self, _uri: &str) -> crate::LspReadiness {
+        self.readiness()
+    }
+
+    /// Whether a server is *running* for `uri` — asked before work that
+    /// must never start one, like diagnostics after an edit (FR-LSP-08).
+    fn serves(&self, _uri: &str) -> bool {
+        true
+    }
+
+    /// [`LspPort::diagnostics`] for one document, waiting at most `cap` for
+    /// the server to settle.
+    fn diagnostics_within(
+        &mut self,
+        uri: &str,
+        _cap: std::time::Duration,
+    ) -> Result<Box<[crate::LspDiagnostic]>, crate::BoxError> {
+        self.diagnostics(Some(uri))
+    }
 }
 
 /// A persisted agent session transcript.

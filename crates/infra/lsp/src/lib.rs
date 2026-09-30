@@ -33,6 +33,9 @@ use serde_json::{json, Value};
 
 const DEFAULT_TIMEOUT_MS: u64 = 15_000;
 
+mod pool;
+pub use pool::{LspPool, ServerSpec, Starter};
+
 #[derive(Debug)]
 pub enum LspError {
     Spawn(String),
@@ -523,6 +526,18 @@ impl LspPort for LspClient {
     fn workspace_symbols(&mut self, query: &str) -> Result<Box<[LspSymbolInfo]>, BoxError> {
         let result = self.send_request("workspace/symbol", json!({ "query": query }))?;
         Ok(parse_symbols(&result))
+    }
+
+    fn diagnostics_within(
+        &mut self,
+        uri: &str,
+        cap: Duration,
+    ) -> Result<Box<[LspDiagnostic]>, BoxError> {
+        let saved = self.settle_cap;
+        self.settle_cap = cap.min(saved);
+        let result = self.diagnostics(Some(uri));
+        self.settle_cap = saved;
+        result
     }
 
     fn readiness(&self) -> LspReadiness {

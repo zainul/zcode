@@ -109,6 +109,9 @@ pub use lsp_tools::LSP_DIAGNOSTICS;
 pub const LSP_RENAME_SYMBOL: &str = "lsp__rename_symbol";
 
 const MCP_PREFIX: &str = "mcp__";
+/// Longest an edit's result waits for the server's verdict on it
+/// (FR-LSP-08): a slow server delays the edit by at most this.
+const EDIT_DIAGNOSTICS_CAP: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Wire name for a tool exposed by an MCP server.
 pub fn mcp_tool_name(server: &str, tool: &str) -> String {
@@ -159,6 +162,9 @@ pub struct ToolRegistry {
     /// The code index, once started: told about every write so its spans
     /// stay exact (FR-INDEX-04), and read by the index tools at call time.
     index_slot: IndexSlot,
+    /// Report errors an edit introduced, when a running server covers the
+    /// file (`lsp.diagnostics_on_edit`, FR-LSP-08).
+    diagnostics_on_edit: bool,
 }
 
 impl ToolRegistry {
@@ -175,7 +181,14 @@ impl ToolRegistry {
             write_log: edit::WriteLog::default(),
             opened: std::collections::HashSet::new(),
             index_slot: IndexSlot::default(),
+            diagnostics_on_edit: false,
         }
+    }
+
+    /// Append the errors each edit introduced (FR-LSP-08).
+    pub fn with_diagnostics_on_edit(mut self, on: bool) -> Self {
+        self.diagnostics_on_edit = on;
+        self
     }
 
     /// Attach the code index.
@@ -201,18 +214,55 @@ impl ToolRegistry {
         self.write_log.clone()
     }
 
-    /// Sync one written file everywhere that keeps a view of the tree.
-    fn after_write(&mut self, path: &Path, text: &str) {
+    /// Sync one written file everywhere that keeps a view of the tree, and
+    /// return the errors the write introduced when a running language
+    /// server covers the file and `diagnostics_on_edit` is on (FR-LSP-08).
+    fn after_write(&mut self, path: &Path, text: &str) -> Vec<domain::LspDiagnostic> {
         if let Some(index) = self.index_slot.get() {
             index.notify_changed(&path.to_string_lossy());
         }
-        if let Some(lsp) = self.lsp.as_mut() {
-            let absolute = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-            let uri = file_uri(&absolute);
-            if lsp.port.open_document(&uri, text).is_ok() {
-                self.opened.insert(uri);
-            }
+        let watch = self.diagnostics_on_edit;
+        let Some(lsp) = self.lsp.as_mut() else {
+            return Vec::new();
+        };
+        let absolute = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let uri = file_uri(&absolute);
+        // Never start a server for this: only one already running is asked,
+        // and its cached report is the baseline — no wait for it.
+        let watch = watch && lsp.port.serves(&uri);
+        let before = if watch {
+            lsp.port.stored_diagnostics(&uri)
+        } else {
+            Box::new([])
+        };
+        if lsp.port.open_document(&uri, text).is_ok() {
+            self.opened.insert(uri.clone());
+        } else {
+            return Vec::new();
         }
+        if !watch {
+            return Vec::new();
+        }
+        match lsp.port.diagnostics_within(&uri, EDIT_DIAGNOSTICS_CAP) {
+            Ok(after) => lsp_tools::new_errors(&before, &after)
+                .into_iter()
+                .cloned()
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Sync every file the last call wrote; the errors they introduced.
+    fn sync_writes(&mut self) -> Vec<domain::LspDiagnostic> {
+        let written = match self.write_log.lock() {
+            Ok(mut log) => std::mem::take(&mut *log),
+            Err(_) => Vec::new(),
+        };
+        let mut errors = Vec::new();
+        for (path, text) in written {
+            errors.extend(self.after_write(&path, &text));
+        }
+        errors
     }
 
     /// The cancel flag tools read at call time.
@@ -329,7 +379,8 @@ impl ToolRegistry {
         // Registration order is wire order, and wire order is part of the
         // cached prompt prefix (FR-CACHE-02) — keep it fixed (technical plan
         // §8): discover/inspect tools first, then the ones that change things.
-        let registry = Self::new(root.clone());
+        let registry =
+            Self::new(root.clone()).with_diagnostics_on_edit(cfg.lsp_tuning.diagnostics_on_edit);
         let log = registry.write_log();
         let slot = registry.index_slot();
         #[allow(unused_mut)]
@@ -413,27 +464,30 @@ impl ToolRegistry {
             }
         }
 
-        // One language server per run: the first server that starts wins, and
-        // `effective_lsp_servers` has already sorted the project's own
-        // language to the front. Multi-server routing by file extension is a
-        // v0.3 concern.
+        // FR-LSP-10, CE-DQ20: one server per language, each started the
+        // first time a request names a file of its language, capped at
+        // `lsp.max_servers` and stopped after `lsp.idle_shutdown_s`. Nothing
+        // starts here, so a session that never asks the LSP pays nothing.
         #[cfg(feature = "lsp")]
-        for server in cfg.effective_lsp_servers().iter() {
-            match infra_lsp::LspClient::start_with_timeout(
-                &server.command,
-                &server.args,
-                &server.env,
-                &root,
-                cfg.timeout_ms,
-            ) {
-                Ok(client) => {
-                    registry = registry.with_lsp(Box::new(client));
-                    break;
-                }
-                Err(e) => registry.warn(format!(
-                    "lsp server `{}` failed to start: {e}",
-                    server.language
-                )),
+        {
+            let specs: Vec<infra_lsp::ServerSpec> = cfg
+                .effective_lsp_servers()
+                .into_iter()
+                .map(|s| infra_lsp::ServerSpec {
+                    languages: vec![infra_config::canonical_language(&s.language)],
+                    command: s.command,
+                    args: s.args,
+                    env: s.env,
+                })
+                .collect();
+            if !specs.is_empty() {
+                registry = registry.with_lsp(Box::new(infra_lsp::LspPool::new(
+                    &root,
+                    specs,
+                    cfg.lsp_tuning.max_servers as usize,
+                    std::time::Duration::from_secs(cfg.lsp_tuning.idle_shutdown_s),
+                    cfg.timeout_ms,
+                )));
             }
         }
 
@@ -520,6 +574,57 @@ impl ToolRegistry {
             let uri = Self::uri_for_path(&root, path);
             self.ensure_open(&uri);
         }
+        // FR-LSP-11: a server still indexing would sit on the request until
+        // the timeout — and so would the `workspace/symbol` lookup that
+        // resolves a named symbol. The index answers instead, labelled;
+        // without one the model is told to come back rather than left
+        // waiting. Checked before anything is sent.
+        if matches!(
+            canonical,
+            LSP_GOTO_DEFINITION | LSP_FIND_REFERENCES | LSP_HOVER
+        ) {
+            let (named_uri, name) = match &target {
+                lsp_tools::Target::Symbol { symbol, path } => (
+                    path.as_deref().map(|p| Self::uri_for_path(&root, p)),
+                    Some(symbol.clone()),
+                ),
+                lsp_tools::Target::Position { path, line, column } => {
+                    let uri = Self::uri_for_path(&root, path);
+                    let file = lsp_tools::uri_path(&uri);
+                    let text = std::fs::read_to_string(&file).unwrap_or_default();
+                    let line_text = text.lines().nth((line - 1) as usize).unwrap_or("");
+                    let col16 = lsp_tools::char_col_to_utf16(line_text, *column);
+                    let word = lsp_tools::word_at(&file, line - 1, col16);
+                    (Some(uri), word)
+                }
+            };
+            let readiness =
+                self.lsp
+                    .as_ref()
+                    .map_or(domain::LspReadiness::Ready, |l| match &named_uri {
+                        Some(u) => l.port.readiness_for(u),
+                        None => l.port.readiness(),
+                    });
+            if let domain::LspReadiness::Indexing(pct) = readiness {
+                let progress = pct.map_or(String::new(), |p| format!(": {p}%"));
+                let answer = match (self.index_slot.get(), &name) {
+                    (Some(ix), Some(n)) => {
+                        lsp_tools::index_answer(ix.as_ref(), &root, canonical, n)
+                    }
+                    _ => None,
+                };
+                return Ok(match answer {
+                    Some(text) => ToolResult::ok(&format!(
+                        "(from code index — language server still indexing{progress})\n{text}"
+                    )),
+                    None => native::tool_error(format!(
+                        "language server is still indexing{progress}; try grep or symbols, or \
+                         retry shortly"
+                    )),
+                });
+            }
+        }
+
         let uri_for = |p: &str| Self::uri_for_path(&root, p);
         let resolved = {
             let index = self.index_slot.get().cloned();
@@ -537,8 +642,8 @@ impl ToolRegistry {
             Err(e) => return Ok(native::tool_error(e)),
         };
         self.ensure_open(&uri);
-        let lsp = self.lsp.as_mut().ok_or("no language server")?;
 
+        let lsp = self.lsp.as_mut().ok_or("no language server")?;
         let result = match canonical {
             LSP_GOTO_DEFINITION => match lsp.port.goto_definition(&uri, line, column) {
                 Ok(loc) => ToolResult::ok(&lsp_tools::render_definition(&root, &loc)),
@@ -562,9 +667,37 @@ impl ToolRegistry {
                 if new_name.is_empty() {
                     return Ok(native::tool_error("missing required argument `new_name`"));
                 }
-                match lsp.port.rename_symbol(&uri, line, column, new_name) {
-                    Ok(edit) => ToolResult::ok(&lsp_tools::render_rename(&root, &edit)),
-                    Err(e) => native::tool_error(e.to_string()),
+                let apply = args.get("apply").and_then(|v| v.as_bool()).unwrap_or(false);
+                let edit = match lsp.port.rename_symbol(&uri, line, column, new_name) {
+                    Ok(edit) => edit,
+                    Err(e) => return Ok(native::tool_error(e.to_string())),
+                };
+                if !apply || edit.changes.is_empty() {
+                    ToolResult::ok(&lsp_tools::render_rename(&root, &edit))
+                } else {
+                    // FR-LSP-12: staged, then swapped in; synced like any write.
+                    match lsp_tools::apply_workspace_edit(&edit) {
+                        Ok(applied) => {
+                            let mut errors = Vec::new();
+                            for (path, text, _) in &applied.files {
+                                errors.extend(self.after_write(path, text));
+                            }
+                            let mut out =
+                                lsp_tools::render_applied_rename(&root, new_name, &applied);
+                            if !errors.is_empty() {
+                                let refs: Vec<&domain::LspDiagnostic> = errors.iter().collect();
+                                out.push('\n');
+                                out.push_str(&lsp_tools::render_new_errors(&root, &refs));
+                            }
+                            let paths = applied
+                                .files
+                                .iter()
+                                .map(|(p, _, _)| lsp_tools::shown(&root, p))
+                                .collect();
+                            ToolResult::ok(&out).with_subject(domain::Subject::FileWrites { paths })
+                        }
+                        Err(e) => native::tool_error(e),
+                    }
                 }
             }
             other => native::tool_error(format!("unknown lsp tool `{other}`")),
@@ -659,15 +792,16 @@ impl ToolRegistryPort for ToolRegistry {
         let canonical = canonical_tool_name(name);
 
         if let Some(index) = self.native_index(&canonical) {
-            let result = self.native[index].tool.call(&canonical, args_json)?;
+            let mut result = self.native[index].tool.call(&canonical, args_json)?;
             // FR-EDIT-09 / FR-LSP-09: every file any write path touched —
             // each file of an `apply_patch` included — is synced.
-            let written = match self.write_log.lock() {
-                Ok(mut log) => std::mem::take(&mut *log),
-                Err(_) => Vec::new(),
-            };
-            for (path, text) in written {
-                self.after_write(&path, &text);
+            let errors = self.sync_writes();
+            if !errors.is_empty() && result.error.is_none() {
+                let refs: Vec<&domain::LspDiagnostic> = errors.iter().collect();
+                result.content.push('\n');
+                result
+                    .content
+                    .push_str(&lsp_tools::render_new_errors(&self.root, &refs));
             }
             // FR-LSP-04: a file the agent reads is opened on the server, so
             // references and diagnostics cover it.
@@ -736,11 +870,11 @@ fn lsp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: LSP_RENAME_SYMBOL.into(),
-            description: "Compute the edits that rename a symbol across files (advice; apply \
-                          them with str_replace_editor)."
+            description: "Rename a symbol across files. By default lists the edits it would \
+                          make; with apply: true it makes them, all files or none."
                 .into(),
             params_json: format!(
-                r#"{{"type":"object","properties":{{{target},"new_name":{{"type":"string"}}}},"required":["new_name"]}}"#
+                r#"{{"type":"object","properties":{{{target},"new_name":{{"type":"string"}},"apply":{{"type":"boolean","description":"Make the edits instead of listing them"}}}},"required":["new_name"]}}"#
             ),
         },
         ToolSpec {
@@ -1136,6 +1270,309 @@ mod tests {
         fn notify_changed(&self, path: &str) {
             self.0.lock().unwrap().push(path.to_string());
         }
+    }
+
+    /// A scripted server for the pool-era behaviours.
+    #[derive(Default)]
+    struct ScriptLsp {
+        edit: Option<LspWorkspaceEdit>,
+        indexing: bool,
+        serves: bool,
+        before: Vec<domain::LspDiagnostic>,
+        after: Vec<domain::LspDiagnostic>,
+        waited: std::sync::Arc<std::sync::Mutex<u32>>,
+    }
+
+    impl LspPort for ScriptLsp {
+        fn goto_definition(&mut self, _: &str, _: u32, _: u32) -> Result<LspLocation, BoxError> {
+            Err("the server was asked".into())
+        }
+        fn find_references(
+            &mut self,
+            _: &str,
+            _: u32,
+            _: u32,
+        ) -> Result<Box<[LspLocation]>, BoxError> {
+            Err("the server was asked".into())
+        }
+        fn hover(&mut self, _: &str, _: u32, _: u32) -> Result<String, BoxError> {
+            Err("the server was asked".into())
+        }
+        fn rename_symbol(
+            &mut self,
+            _: &str,
+            _: u32,
+            _: u32,
+            _: &str,
+        ) -> Result<LspWorkspaceEdit, BoxError> {
+            self.edit.clone().ok_or_else(|| "no edit".into())
+        }
+        fn open_document(&mut self, _: &str, _: &str) -> Result<(), BoxError> {
+            Ok(())
+        }
+        fn stored_diagnostics(&self, _: &str) -> Box<[domain::LspDiagnostic]> {
+            self.before.clone().into_boxed_slice()
+        }
+        fn diagnostics_within(
+            &mut self,
+            _: &str,
+            _: std::time::Duration,
+        ) -> Result<Box<[domain::LspDiagnostic]>, BoxError> {
+            *self.waited.lock().unwrap() += 1;
+            Ok(self.after.clone().into_boxed_slice())
+        }
+        fn readiness(&self) -> domain::LspReadiness {
+            self.readiness_for("")
+        }
+        fn readiness_for(&self, _: &str) -> domain::LspReadiness {
+            if self.indexing {
+                domain::LspReadiness::Indexing(Some(43))
+            } else {
+                domain::LspReadiness::Ready
+            }
+        }
+        fn serves(&self, _: &str) -> bool {
+            self.serves
+        }
+    }
+
+    fn range(line: u32, from: u32, to: u32) -> LspRange {
+        LspRange {
+            start: LspPosition {
+                line,
+                character: from,
+            },
+            end: LspPosition {
+                line,
+                character: to,
+            },
+        }
+    }
+
+    fn error_at(uri: &str, line: u32, message: &str) -> domain::LspDiagnostic {
+        domain::LspDiagnostic {
+            uri: uri.to_string(),
+            range: range(line, 0, 1),
+            severity: 1,
+            code: Some("E0425".into()),
+            message: message.into(),
+        }
+    }
+
+    #[test]
+    fn rename_apply_rewrites_every_file_with_utf16_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.rs");
+        let b = dir.path().join("b.rs");
+        // `𝒳` is two UTF-16 units (four bytes): `foo` starts at unit 14.
+        std::fs::write(&a, "let s = \"𝒳\"; foo();\nfoo();\n").unwrap();
+        std::fs::write(&b, "fn foo() {}\n").unwrap();
+        let ua = file_uri(&a.canonicalize().unwrap());
+        let ub = file_uri(&b.canonicalize().unwrap());
+        let edit = LspWorkspaceEdit {
+            changes: Box::new([
+                LspTextEdit {
+                    uri: ua.clone(),
+                    range: range(0, 14, 17),
+                    new_text: "bar".into(),
+                },
+                LspTextEdit {
+                    uri: ua.clone(),
+                    range: range(1, 0, 3),
+                    new_text: "bar".into(),
+                },
+                LspTextEdit {
+                    uri: ub.clone(),
+                    range: range(0, 3, 6),
+                    new_text: "bar".into(),
+                },
+            ]),
+        };
+        let mut registry =
+            ToolRegistry::new(dir.path().to_path_buf()).with_lsp(Box::new(ScriptLsp {
+                edit: Some(edit),
+                ..Default::default()
+            }));
+        let res = registry
+            .call(
+                LSP_RENAME_SYMBOL,
+                r#"{"path":"b.rs","line":1,"column":4,"new_name":"bar","apply":true}"#,
+            )
+            .unwrap();
+        assert!(res.error.is_none(), "{res:?}");
+        assert_eq!(
+            std::fs::read_to_string(&a).unwrap(),
+            "let s = \"𝒳\"; bar();\nbar();\n"
+        );
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "fn bar() {}\n");
+        assert!(
+            res.content
+                .starts_with("renamed to bar: 3 occurrences in 2 files"),
+            "{}",
+            res.content
+        );
+        assert!(matches!(
+            res.subject,
+            Some(domain::Subject::FileWrites { .. })
+        ));
+    }
+
+    #[test]
+    fn a_rename_that_cannot_be_staged_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.rs");
+        std::fs::write(&a, "foo();\n").unwrap();
+        let ua = file_uri(&a.canonicalize().unwrap());
+        let edit = LspWorkspaceEdit {
+            changes: Box::new([
+                LspTextEdit {
+                    uri: ua,
+                    range: range(0, 0, 3),
+                    new_text: "bar".into(),
+                },
+                LspTextEdit {
+                    uri: file_uri(&dir.path().join("gone.rs")),
+                    range: range(0, 0, 3),
+                    new_text: "bar".into(),
+                },
+            ]),
+        };
+        let mut registry =
+            ToolRegistry::new(dir.path().to_path_buf()).with_lsp(Box::new(ScriptLsp {
+                edit: Some(edit),
+                ..Default::default()
+            }));
+        let res = registry
+            .call(
+                LSP_RENAME_SYMBOL,
+                r#"{"path":"a.rs","line":1,"column":1,"new_name":"bar","apply":true}"#,
+            )
+            .unwrap();
+        assert!(res
+            .error
+            .unwrap()
+            .starts_with("rename not applied, nothing changed"));
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "foo();\n");
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".zcode-tmp"))
+            .collect();
+        assert!(leftovers.is_empty());
+    }
+
+    #[test]
+    fn an_edit_reports_only_the_errors_it_introduced() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn a() {}\n").unwrap();
+        let uri = file_uri(&dir.path().join("a.rs").canonicalize().unwrap());
+        let waited = std::sync::Arc::new(std::sync::Mutex::new(0));
+        let registry = ToolRegistry::new(dir.path().to_path_buf()).with_diagnostics_on_edit(true);
+        let log = registry.write_log();
+        let mut registry = registry
+            .with_native(Box::new(
+                WriteTool::new(dir.path().to_path_buf()).with_write_log(log),
+            ))
+            .with_lsp(Box::new(ScriptLsp {
+                serves: true,
+                before: vec![error_at(&uri, 5, "old problem")],
+                // The old one moved two lines down; one is new.
+                after: vec![
+                    error_at(&uri, 7, "old problem"),
+                    error_at(&uri, 0, "cannot find value `x`"),
+                ],
+                waited: waited.clone(),
+                ..Default::default()
+            }));
+        let res = registry
+            .call(TOOL_WRITE, r#"{"path":"a.rs","content":"fn a() { x }\n"}"#)
+            .unwrap();
+        assert!(
+            res.content
+                .ends_with("new errors:\n  a.rs:1:1  error[E0425]  cannot find value `x`"),
+            "{}",
+            res.content
+        );
+        assert!(!res.content.contains("old problem"));
+        assert_eq!(*waited.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn no_running_server_means_no_wait_after_an_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let waited = std::sync::Arc::new(std::sync::Mutex::new(0));
+        let registry = ToolRegistry::new(dir.path().to_path_buf()).with_diagnostics_on_edit(true);
+        let log = registry.write_log();
+        let mut registry = registry
+            .with_native(Box::new(
+                WriteTool::new(dir.path().to_path_buf()).with_write_log(log),
+            ))
+            .with_lsp(Box::new(ScriptLsp {
+                serves: false,
+                waited: waited.clone(),
+                ..Default::default()
+            }));
+        let res = registry
+            .call(TOOL_WRITE, r#"{"path":"a.rs","content":"fn a() {}\n"}"#)
+            .unwrap();
+        assert!(!res.content.contains("new errors"));
+        assert_eq!(*waited.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn an_indexing_server_is_answered_for_by_the_index_or_not_waited_on() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.rs"),
+            "/// Adds.\npub fn add(a: u32) -> u32 { a }\nfn main() { add(1); }\n",
+        )
+        .unwrap();
+        let mut registry =
+            ToolRegistry::new(dir.path().to_path_buf()).with_lsp(Box::new(ScriptLsp {
+                indexing: true,
+                ..Default::default()
+            }));
+        // No index: told to come back, not left waiting.
+        let res = registry
+            .call(LSP_HOVER, r#"{"symbol":"add","path":"a.rs"}"#)
+            .unwrap();
+        assert_eq!(
+            res.error.as_deref(),
+            Some("language server is still indexing: 43%; try grep or symbols, or retry shortly")
+        );
+        // With one: answered, and labelled.
+        let search: Arc<dyn domain::SearchPort> = Arc::new(
+            infra_search::RipgrepSearch::new(dir.path(), &infra_search::FilterConfig::default())
+                .unwrap(),
+        );
+        let ix = infra_index::CodeIndex::open(infra_index::IndexOptions::new(dir.path()), search);
+        ix.build();
+        let mut registry = registry.with_code_index(ix);
+        let res = registry
+            .call(
+                LSP_GOTO_DEFINITION,
+                r#"{"path":"a.rs","line":3,"column":14}"#,
+            )
+            .unwrap();
+        assert_eq!(
+            res.content,
+            "(from code index — language server still indexing: 43%)\na.rs:2:8  pub fn add(a: u32) -> u32 { a }"
+        );
+        let res = registry.call(LSP_HOVER, r#"{"symbol":"add"}"#).unwrap();
+        assert!(
+            res.content
+                .ends_with("a.rs:2\n/// Adds.\npub fn add(a: u32) -> u32 { a }"),
+            "{res:?}"
+        );
+        let res = registry
+            .call(LSP_FIND_REFERENCES, r#"{"symbol":"add"}"#)
+            .unwrap();
+        assert!(
+            res.content
+                .ends_with("`add` occurs (by name) at:\n  a.rs:3"),
+            "{}",
+            res.content
+        );
     }
 
     #[test]

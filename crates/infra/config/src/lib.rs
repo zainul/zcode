@@ -915,27 +915,13 @@ impl Config {
                 }
             }
         }
-        // Only one server runs per session. When we can tell what the project
-        // is, run *only* a server for that language: a Go repo on a machine
-        // that also has rust-analyzer installed would otherwise start
-        // rust-analyzer, which costs a process and answers nothing. An
-        // explicitly configured server is always kept — the user asked for it.
-        let explicit: Vec<String> = self
-            .lsp_servers
-            .iter()
-            .map(|s| s.language.clone())
-            .collect();
-        match detect_project_language(&self.working_dir) {
-            Some(detected) => {
-                servers.retain(|s| {
-                    canonical_language(&s.language) == detected || explicit.contains(&s.language)
-                });
-                servers.sort_by_key(|s| canonical_language(&s.language) != detected);
-            }
-            // Nothing identifies this directory as a project of any language.
-            // Starting rust-analyzer on the off-chance costs a process and a
-            // startup failure, and can answer nothing.
-            None => servers.retain(|s| explicit.contains(&s.language)),
+        // Servers start lazily, one per language, only when a request names
+        // a file of that language (FR-LSP-10) — so keeping every installed
+        // default costs nothing until it is used, and a monorepo gets a
+        // server for each of its languages. The detected language only goes
+        // first.
+        if let Some(detected) = detect_project_language(&self.working_dir) {
+            servers.sort_by_key(|s| canonical_language(&s.language) != detected);
         }
         servers
     }
@@ -3155,21 +3141,19 @@ model = "gpt-3.5-turbo"
     }
 
     #[test]
-    fn a_default_for_another_language_is_not_started() {
-        // Regression: a Go project on a machine with rust-analyzer installed
-        // started rust-analyzer, which can answer nothing about Go.
+    fn the_projects_own_language_goes_first() {
+        // Servers start lazily (FR-LSP-10), so every installed default is
+        // kept — a Go service beside a TS frontend needs both — but the
+        // detected language is preferred.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("go.mod"), "module x").unwrap();
         let cfg = Config {
             working_dir: dir.path().to_path_buf(),
             ..Config::default()
         };
-        for server in cfg.effective_lsp_servers() {
-            assert_eq!(
-                canonical_language(&server.language),
-                "go",
-                "started a server for the wrong language"
-            );
+        let servers = cfg.effective_lsp_servers();
+        if let Some(go) = servers.iter().position(|s| s.language == "go") {
+            assert_eq!(go, 0, "{servers:?}");
         }
     }
 
@@ -3196,15 +3180,17 @@ model = "gpt-3.5-turbo"
     }
 
     #[test]
-    fn no_project_marker_starts_no_default_server() {
-        // A bare directory is not a Rust project just because rust-analyzer
-        // happens to be installed; trying it only produces a startup warning.
+    fn only_installed_defaults_are_offered() {
+        // Nothing starts until used, but a server whose binary is missing
+        // would only ever fail, so it is not offered.
         let dir = tempfile::tempdir().unwrap();
         let cfg = Config {
             working_dir: dir.path().to_path_buf(),
             ..Config::default()
         };
-        assert!(cfg.effective_lsp_servers().is_empty());
+        for server in cfg.effective_lsp_servers() {
+            assert!(which_on_path(&server.command).is_some(), "{server:?}");
+        }
     }
 
     #[test]

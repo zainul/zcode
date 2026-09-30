@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — language servers are pooled and started on demand (FR-LSP-08, 10..12)
+
+The "first server that starts wins" rule is gone. `LspPool` holds one server
+per language (JS and TS share `typescript-language-server`), starts it the
+first time a request names a file of that language, keeps at most
+`lsp.max_servers` (3) running — the least recently used makes room — and
+stops one after `lsp.idle_shutdown_s` (600 s) unused, replaying its open
+documents from disk if it is needed again. Nothing starts at launch, so
+every installed default server is now offered (the detected language goes
+first); a monorepo gets one per language. Queries without a file
+(`workspace/symbol`, all-document diagnostics) ask only running servers. A
+server that fails to start is remembered and named in the error.
+
+While a server reports indexing progress, `goto_definition`, `find_references`
+and `hover` answer from the code index, labelled `(from code index —
+language server still indexing: 43%)`, or say to retry — they no longer
+wait out the request timeout. `lsp__rename_symbol` takes `apply: true`:
+the edits are converted from UTF-16 columns to bytes, every file is staged
+to a temporary sibling, and only then are they swapped in; a staging failure
+changes nothing. After any edit (`write`, `str_replace_editor`,
+`apply_patch`, `edit_symbol`, an applied rename) to a file a running server
+covers, the result lists the errors the edit introduced — an error already
+there, moved by the edit, is not repeated — waiting at most 3 s
+(`lsp.diagnostics_on_edit`).
+
 ### Added — `edit_symbol` (FR-EDIT-01..05, 09)
 
 Edit a definition by name — `replace` (including its doc comments,

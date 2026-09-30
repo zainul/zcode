@@ -499,6 +499,281 @@ pub fn render_diagnostics(
     out
 }
 
+/// 0-based UTF-16 offset on `line` → byte offset, clamped to the line.
+/// LSP edits count UTF-16 units; slicing a Rust string needs bytes, and the
+/// two differ on any line with non-ASCII text (FR-LSP-12).
+pub fn utf16_col_to_byte(line: &str, utf16: u32) -> usize {
+    let mut units = 0u32;
+    for (i, c) in line.char_indices() {
+        if units >= utf16 {
+            return i;
+        }
+        units += c.len_utf16() as u32;
+    }
+    line.len()
+}
+
+/// Byte offset in `text` of an LSP position (0-based line, UTF-16 column),
+/// or `None` past the end of the file.
+fn position_to_byte(text: &str, line0: u32, utf16: u32) -> Option<usize> {
+    let mut start = 0usize;
+    for _ in 0..line0 {
+        start += text.get(start..)?.find('\n')? + 1;
+    }
+    let rest = text.get(start..)?;
+    let line = rest.split('\n').next().unwrap_or("");
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    Some(start + utf16_col_to_byte(line, utf16))
+}
+
+/// `text` with `edits` applied — in reverse position order, so each edit's
+/// offsets are still valid when it is applied. Overlapping edits are refused.
+pub fn apply_text_edits(text: &str, edits: &[&domain::LspTextEdit]) -> Result<String, String> {
+    let mut spans: Vec<(usize, usize, &str)> = Vec::with_capacity(edits.len());
+    for e in edits {
+        let start = position_to_byte(text, e.range.start.line, e.range.start.character)
+            .ok_or("an edit starts past the end of the file")?;
+        let end = position_to_byte(text, e.range.end.line, e.range.end.character)
+            .ok_or("an edit ends past the end of the file")?;
+        if end < start {
+            return Err("an edit ends before it starts".into());
+        }
+        spans.push((start, end, e.new_text.as_str()));
+    }
+    spans.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+    for pair in spans.windows(2) {
+        if pair[1].1 > pair[0].0 {
+            return Err("the server proposed overlapping edits".into());
+        }
+    }
+    let mut out = text.to_string();
+    for (start, end, new_text) in spans {
+        if !out.is_char_boundary(start) || !out.is_char_boundary(end) {
+            return Err("an edit does not fall on a character boundary".into());
+        }
+        out.replace_range(start..end, new_text);
+    }
+    Ok(out)
+}
+
+/// What an applied rename wrote: each file, its new text, and how many
+/// edits it took.
+pub struct AppliedRename {
+    pub files: Vec<(PathBuf, String, usize)>,
+}
+
+/// Apply a workspace edit across files (FR-LSP-12): every new content is
+/// computed and staged to a temporary sibling first; only when all of them
+/// are on disk is any file replaced. A failure while staging removes the
+/// temporaries and changes nothing.
+pub fn apply_workspace_edit(edit: &LspWorkspaceEdit) -> Result<AppliedRename, String> {
+    let mut by_file: BTreeMap<String, Vec<&domain::LspTextEdit>> = BTreeMap::new();
+    for c in edit.changes.iter() {
+        by_file.entry(c.uri.clone()).or_default().push(c);
+    }
+    let mut staged: Vec<(PathBuf, PathBuf, String, usize)> = Vec::new();
+    let cleanup = |staged: &[(PathBuf, PathBuf, String, usize)]| {
+        for (_, tmp, _, _) in staged {
+            let _ = std::fs::remove_file(tmp);
+        }
+    };
+    for (uri, edits) in &by_file {
+        let path = uri_path(uri);
+        let result = std::fs::read_to_string(&path)
+            .map_err(|e| format!("cannot read {}: {e}", path.display()))
+            .and_then(|text| {
+                apply_text_edits(&text, edits).map_err(|e| format!("{}: {e}", path.display()))
+            })
+            .and_then(|new_text| {
+                let mut tmp = path.clone().into_os_string();
+                tmp.push(".zcode-tmp");
+                let tmp = PathBuf::from(tmp);
+                std::fs::write(&tmp, &new_text)
+                    .map(|()| (tmp, new_text))
+                    .map_err(|e| format!("cannot stage {}: {e}", path.display()))
+            });
+        match result {
+            Ok((tmp, new_text)) => staged.push((path, tmp, new_text, edits.len())),
+            Err(e) => {
+                cleanup(&staged);
+                return Err(format!("rename not applied, nothing changed — {e}"));
+            }
+        }
+    }
+    let mut done: Vec<(PathBuf, String, usize)> = Vec::new();
+    for (i, (path, tmp, text, n)) in staged.iter().enumerate() {
+        if let Err(e) = std::fs::rename(tmp, path) {
+            cleanup(&staged[i..]);
+            let written: Vec<String> = done
+                .iter()
+                .map(|(p, _, _)| p.display().to_string())
+                .collect();
+            return Err(format!(
+                "rename stopped at {}: {e}; already renamed: {}",
+                path.display(),
+                if written.is_empty() {
+                    "none".into()
+                } else {
+                    written.join(", ")
+                }
+            ));
+        }
+        done.push((path.clone(), text.clone(), *n));
+    }
+    Ok(AppliedRename { files: done })
+}
+
+pub fn render_applied_rename(root: &Path, new_name: &str, applied: &AppliedRename) -> String {
+    let total: usize = applied.files.iter().map(|(_, _, n)| n).sum();
+    let mut out = format!(
+        "renamed to {new_name}: {} in {}\n",
+        count(total as u64, "occurrence", "occurrences"),
+        count(applied.files.len() as u64, "file", "files")
+    );
+    for (path, _, n) in applied.files.iter().take(30) {
+        out.push_str(&format!("  {}  ({n})\n", shown(root, path)));
+    }
+    if applied.files.len() > 30 {
+        out.push_str(&format!("  (+{} more files)\n", applied.files.len() - 30));
+    }
+    out.truncate(out.trim_end().len());
+    out
+}
+
+/// Errors in `after` that were not in `before` (FR-LSP-08). A message and
+/// code seen before within three lines is the same error moved by the edit,
+/// not a new one.
+pub fn new_errors<'a>(
+    before: &[LspDiagnostic],
+    after: &'a [LspDiagnostic],
+) -> Vec<&'a LspDiagnostic> {
+    after
+        .iter()
+        .filter(|d| d.severity == 1)
+        .filter(|d| {
+            !before.iter().any(|b| {
+                b.severity == 1
+                    && b.message == d.message
+                    && b.code == d.code
+                    && b.range.start.line.abs_diff(d.range.start.line) <= 3
+            })
+        })
+        .collect()
+}
+
+/// New errors after an edit, one line each (at most ten).
+pub fn render_new_errors(root: &Path, errors: &[&LspDiagnostic]) -> String {
+    let mut out = String::from("new errors:\n");
+    for d in errors.iter().take(10) {
+        let path = uri_path(&d.uri);
+        let text = line_of_file(&path, d.range.start.line).unwrap_or_default();
+        let col = utf16_to_char_col(&text, d.range.start.character);
+        let code = d
+            .code
+            .as_deref()
+            .map(|c| format!("[{c}]"))
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "  {}:{}:{col}  error{code}  {}\n",
+            shown(root, &path),
+            d.range.start.line + 1,
+            clip_line(d.message.lines().next().unwrap_or_default(), 200, 0)
+        ));
+    }
+    if errors.len() > 10 {
+        out.push_str(&format!(
+            "  (+{} more — lsp__diagnostics)\n",
+            errors.len() - 10
+        ));
+    }
+    out.truncate(out.trim_end().len());
+    out
+}
+
+/// The identifier under a 0-based UTF-16 position of a file.
+pub fn word_at(path: &Path, line0: u32, utf16: u32) -> Option<String> {
+    let line = line_of_file(path, line0)?;
+    let at = utf16_col_to_byte(&line, utf16);
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    let start = line[..at]
+        .char_indices()
+        .rev()
+        .take_while(|(_, c)| is_word(*c))
+        .last()
+        .map_or(at, |(i, _)| i);
+    let end = line[at..]
+        .char_indices()
+        .find(|(_, c)| !is_word(*c))
+        .map_or(line.len(), |(i, _)| at + i);
+    let word = &line[start..end];
+    (!word.is_empty()).then(|| word.to_string())
+}
+
+/// An answer from the code index while the server is still indexing
+/// (FR-LSP-11) — `None` when the index cannot answer this one.
+pub fn index_answer(
+    ix: &dyn domain::CodeIndexPort,
+    root: &Path,
+    tool: &str,
+    name: &str,
+) -> Option<String> {
+    let leaf = name.rsplit(['.', ':']).next().unwrap_or(name);
+    match tool {
+        "lsp__find_references" => {
+            let related = ix.related(name).ok()?;
+            if related.referenced_in.is_empty() {
+                return None;
+            }
+            let mut out = format!("`{leaf}` occurs (by name) at:\n");
+            for r in related.referenced_in.iter().take(MAX_ITEMS) {
+                out.push_str(&format!("  {r}\n"));
+            }
+            out.truncate(out.trim_end().len());
+            Some(out)
+        }
+        "lsp__goto_definition" | "lsp__hover" => {
+            let mut defs = ix.locate(None, name).ok()?;
+            if defs.iter().any(|d| d.kind != domain::SymbolKind::Impl) {
+                defs.retain(|d| d.kind != domain::SymbolKind::Impl);
+            }
+            if defs.is_empty() {
+                return None;
+            }
+            let mut out = String::new();
+            for d in defs.iter().take(5) {
+                if tool == "lsp__hover" {
+                    // The doc comment and signature: what hover would say
+                    // syntactically, minus the inferred types.
+                    let text = std::fs::read_to_string(root.join(&d.path)).ok()?;
+                    let head: Vec<&str> = text
+                        .lines()
+                        .skip(d.span.start_line.saturating_sub(1) as usize)
+                        .take((d.name_line + 1).saturating_sub(d.span.start_line) as usize)
+                        .map(str::trim)
+                        .collect();
+                    out.push_str(&format!(
+                        "{}:{}\n{}\n",
+                        d.path,
+                        d.name_line,
+                        head.join("\n")
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "{}:{}:{}  {}\n",
+                        d.path,
+                        d.name_line,
+                        d.name_col,
+                        clip_line(d.signature.trim(), 160, 0)
+                    ));
+                }
+            }
+            out.truncate(out.trim_end().len());
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
